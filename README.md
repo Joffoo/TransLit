@@ -5,6 +5,10 @@
 [![CSS](https://img.shields.io/badge/CSS-Vanilla-blue.svg?style=flat-square)](https://developer.mozilla.org/en-US/docs/Web/CSS)
 [![License](https://img.shields.io/badge/License-MIT-black.svg?style=flat-square)](LICENSE)
 
+<div align="center">
+<img src="docs/hero.webp" alt="TransLit — AI 驱动的文学翻译引擎" width="860">
+</div>
+
 * [中文版](#中文说明) | [English Version](#english-description)
 
 ---
