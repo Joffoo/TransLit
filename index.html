@@ -5,61 +5,8 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>TransLit | Literary Translation Engine</title>
-    <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@300;400;500;600;700&family=Geist:wght@300;400;500;600;700&family=Lora:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
-    <style>
-      body { font-family: 'Geist', sans-serif; }
-      .font-serif { font-family: 'Lora', serif; }
-      .font-mono { font-family: 'Geist Mono', monospace; }
-      
-      /* Elegant Custom Scrollbar */
-      .custom-scrollbar::-webkit-scrollbar {
-        width: 10px;
-        height: 10px;
-      }
-      .custom-scrollbar::-webkit-scrollbar-track {
-        background: transparent;
-        border-left: 1px solid rgba(0,0,0,0.05);
-      }
-      .custom-scrollbar::-webkit-scrollbar-thumb {
-        background-color: rgba(0, 0, 0, 0.2);
-        border-radius: 0px;
-      }
-      .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-        background-color: rgba(0, 0, 0, 0.5);
-      }
-      
-      /* Dark mode scrollbar for console */
-      .bg-black.custom-scrollbar::-webkit-scrollbar-track,
-      .bg-neutral-900.custom-scrollbar::-webkit-scrollbar-track {
-        border-left: 1px solid rgba(255,255,255,0.1);
-      }
-      .bg-black.custom-scrollbar::-webkit-scrollbar-thumb,
-      .bg-neutral-900.custom-scrollbar::-webkit-scrollbar-thumb {
-        background-color: rgba(255, 255, 255, 0.3);
-      }
-      .bg-black.custom-scrollbar::-webkit-scrollbar-thumb:hover,
-      .bg-neutral-900.custom-scrollbar::-webkit-scrollbar-thumb:hover {
-        background-color: rgba(255, 255, 255, 0.6);
-      }
-    </style>
-  <script type="importmap">
-{
-  "imports": {
-    "react": "https://esm.sh/react@^19.2.3",
-    "react-dom/": "https://esm.sh/react-dom@^19.2.3/",
-    "react/": "https://esm.sh/react@^19.2.3/",
-    "jszip": "https://esm.sh/jszip@^3.10.1",
-    "turndown": "https://esm.sh/turndown@^7.2.2",
-    "marked": "https://esm.sh/marked@^17.0.1",
-    "dompurify": "https://esm.sh/dompurify@^3.3.1",
-    "lucide-react": "https://esm.sh/lucide-react@^0.562.0",
-    "katex": "https://esm.sh/katex@0.16.9"
-  }
-}
-</script>
-<link rel="stylesheet" href="/index.css">
-</head>
+  </head>
   <body class="bg-white text-black h-screen overflow-hidden">
     <div id="root" class="h-full"></div>
   <script type="module" src="/index.tsx"></script>

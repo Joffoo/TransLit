@@ -32,23 +32,29 @@
   - 用户的 API Key、Base URL 等配置会缓存到浏览器的 `localStorage` 中。在点击 “Reset” 重置书籍和日志进度时，个人的 API 密钥等配置不会被清理。
 - 📖 **EPUB 解析与重新打包**
   - 基于 `jszip` 库解压并解析 EPUB，提取 `content.opf` 以及 XHTML 章节内容。
+  - 内置纯算法跨文件注脚拓扑解析器（`FootnoteResolver`），自动扫描全书注脚并内化绑定到宿主章节，支持 0-Offset 占位保护。
+  - 支持 EPUB 3 原生弹出式注脚（`<aside epub:type="footnote">`），在 Apple Books、微信读书等现代阅读器中直接激活悬浮气泡，免跳转阅读。
+  - 双阶页面智能分类器（`PageClassifier`）：本地硬规则毫秒级预判 + 轻量级 AI 辅助过渡页决策（保留原文/翻译/剔除）。
+  - 保险箱插槽与双通道上下文感知切片（`FootnotePool`）：角标封入不可变占位符，正文与关联注脚同车并发翻译，支持四级顺位容错映射与即时增量持久化。
   - 使用 `turndown` 库将 XHTML 转换为 Markdown 格式提供给大模型，保证格式、加粗、排版及注释等在翻译后得到保留。
 - 💾 **持久化 (断点续传)**
-  - 基于浏览器 `IndexedDB` 存储当前的会话状态、章节解析内容、图片资产、运行中的日志，以及生成的术语表。
+  - 基于浏览器 `IndexedDB` 存储当前的会话状态、章节解析内容、图片资产、运行中的日志，以及生成的术语表与注脚池。
   - 即使网络中断、电脑死机或页面刷新，也能断点恢复，继续之前的翻译进度。
 - 🤖 **双 Pass 翻译与校对**
-  - **分包处理**：自动按约 3000 字进行拆包。
-  - **双 Pass 润色**：除单 Pass 翻译外，支持开启 “Proofreading (校对与润色)” 双阶段处理。结合输入的翻译上下文，产出中文译文。
+  - **分包处理**：自动按约 3000 字（单 Pass）或 1800 字（双 Pass 润色）进行智能拆包。
+  - **双 Pass 润色**：除单 Pass 翻译外，支持开启 “Proofreading (校对与润色)” 双阶段处理。结合输入的翻译上下文，产出高质量中文译文。
 - 🗂️ **术语库与一致性**
   - 抽取、记录章节中的生僻词与专有实体。
   - **一致性指令**：在系统提示词层面对齐翻译结果，减少大模型在长文翻译中的“人名/术语漂移”现象。
   - 结合后文语境清理、过滤只出现一次的术语，保证术语库的紧凑。
 
-## 📖 电子书脚注预处理 (AI Agent 工作流)
+## 📖 电子书原生注脚支持（纯算法内化，无需前置预处理）
 
-如果您的 EPUB 书籍含有复杂的脚注（例如跨文件链接、非标准跳转或特殊排版），建议在翻译前使用配套的 AI Agent 技能进行预处理。
-- **Agent 预处理技能仓库**：[translit-epub-prep](https://github.com/fengyukongzhou/translit-epub-prep)
-- **洗排原理**：该技能指导 AI Agent 将跨文件的脚注抽取并挂载到对应正文段落下方，重构为标准的 EPUB3 同页脚注格式。TransLit 会将其转换为 Markdown 脚注进行翻译，翻译后保留双向跳转链接。
+在最新版本中，TransLit 已内置跨文件注脚拓扑图解析与 EPUB 3 原生弹出式注脚生成能力，**无需借助任何外部 AI 前置脚本处理注脚**：
+- **纯算法内化**：全书解包即时构建拓扑图，将原本存放在 `notes.xhtml` 或 `endnotes.xhtml` 中的跨文件注脚自动内化绑定至各自正文章节（带章节命名空间防碰撞）。
+- **0-Offset 占位保护**：原独立注脚文件写入友好提示占位，保留骨架，100% 避免破坏 `content.opf` 清单和 `toc.ncx` / `nav.xhtml` 目录结构。
+- **EPUB 3 原生气泡交互**：正文角标渲染为标准 `<a epub:type="noteref">`，章末生成 `<aside epub:type="footnote">`，微信读书和 Apple Books 均可点击直接弹出浮窗。
+- *(可选兼容)* 对于早期制作非标准的遗留书籍，仍可参考外部技能脚本 [translit-epub-prep](https://github.com/fengyukongzhou/translit-epub-prep) 进行辅助洗排。
 
 ## 🎨 设计美学：Swiss Monochrome
 
@@ -85,16 +91,19 @@ npm run dev
 ```
 TransLit/
 ├── components/
-│   ├── FileUpload.tsx      # 电子书拖拽上传组件
-│   └── SettingsPanel.tsx   # API 与翻译策略配置面板
+│   ├── FileUpload.tsx         # 电子书拖拽上传组件
+│   └── SettingsPanel.tsx      # API 与翻译策略配置面板
 ├── services/
-│   ├── epubService.ts      # 负责 EPUB 解压、Markdown 转换与重新封包
-│   ├── geminiService.ts    # API 调用，处理分包、翻译与校对流程
-│   └── persistenceService.ts # IndexedDB 持久化读写服务
-├── App.tsx                 # 主程序框架，控制核心状态流转与双面板布局
-├── index.html              # HTML 骨架，配置全局 Geist Mono 字体与滚动条样式
-├── logo.svg                # 软盘矢量 Logo
-└── package.json            # 项目依赖声明
+│   ├── epubService.ts         # 负责 EPUB 解压、Markdown 转换与重新封包
+│   ├── footnoteResolver.ts    # 纯算法跨文件注脚拓扑解析与 0-Offset 占位保护
+│   ├── pageClassifier.ts      # 双阶页面智能分类器（本地硬规则 + 轻量 AI）
+│   ├── footnotePool.ts        # 保险箱插槽、双通道切片与四级顺位容错映射
+│   ├── geminiService.ts       # API 调用，处理分包、翻译与校对流程
+│   └── persistenceService.ts  # IndexedDB 持久化读写服务
+├── App.tsx                    # 主程序框架，控制核心状态流转与双面板布局
+├── index.html                 # HTML 骨架，配置全局 Geist Mono 字体与滚动条样式
+├── logo.svg                   # 软盘矢量 Logo
+└── package.json               # 项目依赖声明
 ```
 
 ---
@@ -116,25 +125,29 @@ For the author's thoughts on TransLit's development and the evolution of AI tran
 - 🔌 **BYOK (Bring Your Own Key) Mode**
   - No server-side setup required; API calls are sent from the browser.
   - User settings (API Key, Base URL, etc.) are cached in the browser's `localStorage`. Resetting the translation progress will not clear your API keys.
-- 📖 **EPUB Parsing & Re-packaging**
-  - Unzips and parses EPUB using the `jszip` library to extract XHTML chapters and metadata.
-  - Converts XHTML to Markdown using `turndown` before sending it to LLMs, ensuring formatting (bold, links, lists, notes) is preserved in the translated output.
+- 📖 **EPUB Parsing & Native EPUB 3 Footnotes**
+  - Unzips and parses EPUB using `jszip` to extract XHTML chapters and metadata.
+  - **Deterministic Footnote Resolver**: Automatically scans cross-file footnotes, clones and internalizes them with chapter namespaces, and preserves 0-Offset placeholders for spine and NCX/Nav integrity.
+  - **Native EPUB 3 Popup Footnotes**: Renders `<aside epub:type="footnote">` popups, enabling native floating bubble interactions in Apple Books, WeChat Read, etc.
+  - **Two-Stage Page Classifier**: Zero-latency local rules + lightweight AI for transition pages (keep original / translate / skip).
+  - **Context-Aware Dual-Channel Chunker**: Protects citations via opaque slots (`__FN_REF_{id}__`) and feeds body text and notes side-by-side with 4-level fallback mapping.
 - 💾 **Persistence (Resumable Progress)**
-  - Stores session states, chapter extractions, images, logs, and generated glossary terms in the browser's `IndexedDB`.
+  - Stores session states, chapter extractions, images, logs, generated glossary terms, and translated footnote pools in `IndexedDB`.
   - Resumes translation progress after network disconnections, browser crashes, or page reloads.
 - 🤖 **Two-Pass Translation & Proofreading**
-  - **Chunk Splitter**: Splits chapters into chunks of ~3000 words.
-  - **Two-Pass Polish**: Supports an optional "Proofreading" stage following the initial translation pass to deliver Chinese translations.
+  - **Chunk Splitter**: Splits chapters into ~3000 words (single-pass) or ~1800 words (two-pass polish).
+  - **Two-Pass Polish**: Supports an optional "Proofreading" stage following the initial translation pass.
 - 🗂️ **Glossary & Consistency**
   - Extracts and logs rare words and proper nouns during translation.
-  - **Consistency Rule**: Applies consistency rules at the system prompt level to reduce the "term drift" issue (e.g., inconsistent character names) in LLM long-context translation.
-  - Evaluates terms against future text, filtering out redundant glossary records.
+  - **Consistency Rule**: Applies consistency rules at the system prompt level to reduce term drift.
 
-## 📖 EPUB Footnote Preprocessing (AI Agent Workflow)
+## 📖 EPUB Native Footnote Support (Zero Preprocessing Required)
 
-If your EPUB book contains complex footnotes (e.g., cross-file links, non-standard redirects, or irregular typesetting), we recommend preprocessing it using our AI Agent Skill before translating.
-- **Agent Preprocessing Repository**: [translit-epub-prep](https://github.com/fengyukongzhou/translit-epub-prep)
-- **How it works**: The Skill instructs the AI Agent to extract cross-file footnotes and append them to the bottom of the referring chapters, restructuring them into standard EPUB3 same-page footnotes. TransLit then converts these into Markdown footnotes during translation, maintaining bidirectional jumps.
+TransLit now features a fully deterministic, in-browser footnote resolution pipeline:
+- **Pure Algorithm Resolution**: Builds full-book topology upon unpacking, binding external notes (`notes.xhtml`, `endnotes.xhtml`) to referring chapters with chapter namespaces.
+- **0-Offset Placeholder Guarantee**: Drained note files are retained as friendly placeholders, preserving `content.opf` and navigation tree integrity.
+- **EPUB 3 Popup Footnotes**: Translates into native `<a epub:type="noteref">` and `<aside epub:type="footnote">` tags.
+- *(Legacy fallback)*: External preprocessing via [translit-epub-prep](https://github.com/fengyukongzhou/translit-epub-prep) remains available for non-standard books.
 
 ## 🎨 Design Philosophy: Swiss Monochrome
 

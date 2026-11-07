@@ -52,5 +52,12 @@ design-demos/
 
 # EPUB files
 *.epub
-
 *.zip
+
+# Temporary unpack & debug artifacts
+temp_epub/
+fix_html_footnotes.js
+fix_titles.py
+pack_epub.js
+test_fuse.js
+skills-lock.json

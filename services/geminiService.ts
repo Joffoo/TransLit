@@ -1,5 +1,5 @@
 
-import { AppConfig } from "../types";
+import { AppConfig, FootnoteNode } from "../types";
 import { 
     TRANSLATION_PROMPT_NOTES, 
     TRANSLATION_PROMPT_GLOSSARY_PRINCIPLES, 
@@ -12,15 +12,56 @@ import {
     FMT_ONE_STEP_NO_GLOSSARY
 } from "../prompts";
 import { parseGlossaryStr, glossaryToOutputStr } from "../utils/glossaryUtils";
+import {
+  FootnotePool,
+  TranslatedFootnote,
+  extractFootnoteSlots,
+  validateAndRepairSlots
+} from "./footnotePool";
+import { LightweightPagePayload, LightweightAiVerdict } from "./pageClassifier";
 import Fuse from 'fuse.js';
 
 export class AiService {
   // Safe chunk size to avoid context limits (approx 3000 chars)
   private CHUNK_SIZE = 3000;
   private config: AppConfig;
+  private defaultFootnotePool = new FootnotePool();
 
   constructor(config: AppConfig) {
     this.config = config;
+  }
+
+  /**
+   * Stage 2 Lightweight AI Page Classifier:
+   * Sends only `{ title, wordCount, snippet: text.slice(0, 200) }` to classify transition pages.
+   */
+  async classifyPageSnippet(payload: LightweightPagePayload): Promise<LightweightAiVerdict> {
+    const safePayload: LightweightPagePayload = {
+      title: payload.title,
+      wordCount: payload.wordCount,
+      snippet: (payload.snippet || '').slice(0, 200)
+    };
+    const systemPrompt =
+      'You are an EPUB book structure classifier. Respond ONLY in JSON: {"category":"front_matter|back_matter|copyright|content","disposition":"translate|skip|keep_original","reason":"short reason"}';
+    const userPrompt = JSON.stringify(safePayload);
+    const result = await this.generate(userPrompt, systemPrompt, 0.1);
+    try {
+      const jsonMatch = result.translation.match(/\{[\s\S]*\}/);
+      const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : result.translation);
+      return {
+        category: parsed.category || 'front_matter',
+        disposition: parsed.disposition || 'translate',
+        reason: parsed.reason || 'Classified by lightweight AI',
+        confidence: 0.9
+      };
+    } catch {
+      return {
+        category: 'front_matter',
+        disposition: 'translate',
+        reason: 'Fallback to translate',
+        confidence: 0.7
+      };
+    }
   }
 
   /**
@@ -164,18 +205,73 @@ export class AiService {
     let clean = text.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
 
     // 2. Try to extract from <translation> and <glossary> tags
-    const translationMatch = clean.match(/<translation>([\s\S]*?)<\/translation>/i);
+    let translationMatch = clean.match(/<translation>([\s\S]*?)<\/translation>/i);
     const glossaryMatch = clean.match(/<glossary>([\s\S]*?)<\/glossary>/i);
+
+    if (!translationMatch) {
+      // Robustness: Handle unclosed <translation> tag if LLM output was truncated
+      const unclosedMatch = clean.match(/<translation>([\s\S]*)$/i);
+      if (unclosedMatch) {
+        let content = unclosedMatch[1];
+        if (glossaryMatch) {
+          content = content.replace(/<glossary>[\s\S]*$/i, '');
+        }
+        translationMatch = [unclosedMatch[0], content];
+      } else {
+        // Robustness: If <translation> completely missing in two-step response, fallback to <translation_draft>
+        const draftMatch = clean.match(/<translation_draft>([\s\S]*?)(?:<\/translation_draft>|$)/i);
+        if (draftMatch) {
+          translationMatch = draftMatch;
+        }
+      }
+    }
 
     if (translationMatch) {
       let translation = translationMatch[1].trim();
       
-      // Post-process: Remove common step headers that models might include inside the tag
-      // Matches things like: ### 第二步: ..., [第二步：...], **第二步** etc.
-      translation = translation.replace(/^(?:#+\s*|\*+|\[)?第二步[:：\s]*[^]*\n/i, '').trim();
+      // Post-process: Remove leaked step 1 draft if model dumped both passes inside <translation>
+      translation = translation.replace(/^(?:#+\s*|\*+|\[)?第一步[:：\s]*[\s\S]*?(?:#+\s*|\*+|\[)?第二步[:：\s]*[^\n]*\n/i, '').trim();
+      // Post-process: Remove common step 2 headers that models might include inside the tag
+      // Critical: Must use [^\n]* to only strip the heading line, never [^]* which would wipe all subsequent paragraphs
+      translation = translation.replace(/^(?:#+\s*|\*+|\[)?第二步[:：\s]*[^\n]*\n/i, '').trim();
       // Also catch the specific user-reported string if it persists
       translation = translation.replace(/^\[第二步：最终审校润色后的内容\]\s*\n?/i, '').trim();
       
+      // Salvage any footnote definitions placed inside <translation_draft> or outside </translation>
+      const salvagedMap = new Map<string, string>();
+
+      // 1. Tag-based footnote definitions: [FN_DEF:...] or 【FN_DEF:...】 (supports optional closing tag)
+      const fnDefRegex = /(?:\[|【)\s*FN_DEF[:：]\s*([^\]】]+?)\s*(?:\]|】)([\s\S]*?)(?:(?:\[|【)\s*[\/／]\s*FN_DEF\s*(?:\]|】)|(?=(?:\[|【)\s*FN_DEF[:：])|(?:<\/translation(?:_draft)?>)|$)/gi;
+      let fnMatch: RegExpExecArray | null;
+      while ((fnMatch = fnDefRegex.exec(clean)) !== null) {
+        const fnId = fnMatch[1].trim();
+        const fnBody = fnMatch[2].trim();
+        const escapedId = fnId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const alreadyInTranslation = new RegExp(`(?:\\[|【)\\s*FN_DEF[:：]\\s*${escapedId}\\s*(?:\\]|】)`, 'i').test(translation);
+        if (!alreadyInTranslation && fnBody) {
+          salvagedMap.set(fnId.toLowerCase(), `[FN_DEF:${fnId}]\n${fnBody}\n[/FN_DEF]`);
+        }
+      }
+
+      // 2. Standard markdown footnote definitions: [^...]: ... (supports Chinese brackets and multiline)
+      const mdDefRegex = /(?:^|\n)((?:\[|【|〔)\s*\^\s*(?:fn-)?([^\]】〕]+?)\s*(?:\]|】|〕)[:：][ \t]*([\s\S]*?)(?=(?:\n(?:\[|【|〔)\s*\^\s*(?:fn-)?)|(?:\n\n(?!\s{2,}))|(?:<\/translation(?:_draft)?>)|$))/g;
+      let mdMatch: RegExpExecArray | null;
+      while ((mdMatch = mdDefRegex.exec(clean)) !== null) {
+        const fullMdBlock = mdMatch[1].trim();
+        const mdId = mdMatch[2].trim();
+        const escapedId = mdId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const alreadyInTranslation =
+          new RegExp(`(?:^|\\n)(?:\\[|【|〔)\\s*\\^\\s*(?:fn-)?${escapedId}\\s*(?:\\]|】|〕)[:：]`, 'i').test(translation) ||
+          new RegExp(`(?:\\[|【)\\s*FN_DEF[:：]\\s*${escapedId}\\s*(?:\\]|】)`, 'i').test(translation);
+        if (!alreadyInTranslation && fullMdBlock) {
+          salvagedMap.set(mdId.toLowerCase(), fullMdBlock);
+        }
+      }
+
+      if (salvagedMap.size > 0) {
+        translation = `${translation}\n\n${Array.from(salvagedMap.values()).join('\n\n')}`;
+      }
+
       const glossary = glossaryMatch ? glossaryMatch[1].trim() : undefined;
       return { translation, glossary };
     }
@@ -204,8 +300,8 @@ export class AiService {
         if (!this.config.apiKey) throw new Error("API Key is required.");
         if (!this.config.baseUrl) throw new Error("Base URL is required.");
 
-        let url = `${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`;
-        
+        const url = `${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`;
+
         const body = {
             model: this.config.modelName,
             messages: [
@@ -215,12 +311,19 @@ export class AiService {
             temperature: temperature
         };
 
-        const response = await fetch(url, {
+        // In dev mode, route through the local Vite proxy to bypass browser CORS restrictions.
+        // The proxy middleware reads X-Target-Url and forwards the request server-side.
+        // In production, fetch directly to the API endpoint as before.
+        const headers: Record<string, string> = {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${this.config.apiKey}`
+        };
+        const fetchUrl = import.meta.env.DEV ? '/__api_proxy' : url;
+        if (import.meta.env.DEV) headers["X-Target-Url"] = url;
+
+        const response = await fetch(fetchUrl, {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${this.config.apiKey}`
-            },
+            headers,
             body: JSON.stringify(body)
         });
 
@@ -265,204 +368,134 @@ export class AiService {
   }
 
   /**
-   * Filters a glossary map based on whether terms appear in the text.
-   * Uses prefix/suffix substring matching for CJK keys and word-splitting
-   * for multi-word English keys, so partial name references (e.g., given name
-   * only when full name is in glossary) are correctly matched.
-   * @param minOccurrences Minimum number of times the term must appear to be kept.
+   * Filters candidate terms in deltaGlossary by searching posterior text.
+   * 1. Strips out terms already present in currentGlossary (avoids duplicate trigger).
+   * 2. If posteriorText is empty (e.g. final chapter), keeps all remaining terms (last chapter safety).
+   * 3. Performs fast O(N) substring and prefix/word checks with .toLowerCase().
    */
-  public filterGlossaryByInclusion(glossaryMap: Record<string, string>, text: string, minOccurrences: number = 1): Record<string, string> {
-    const filteredRecord: Record<string, string> = {};
-    const lowerText = text.toLowerCase();
-    const entries = Object.entries(glossaryMap);
+  private filterDeltaByPosterior(
+    deltaGlossaryText: string, 
+    currentGlossaryText: string, 
+    posteriorText: string
+  ): { filteredText: string; originalCount: number; filteredCount: number } {
+    if (!deltaGlossaryText) return { filteredText: "", originalCount: 0, filteredCount: 0 };
 
-    // Extract all words for Fuse.js
-    const textWords = text.match(/\p{L}+/gu) || [];
-    const fuse = new Fuse(textWords, {
-      includeScore: true,
-      threshold: 0.3,
-      ignoreLocation: true
-    });
-
-    entries.forEach(([key, value]) => {
-      // Detect CJK scripts (Chinese, Japanese Kanji/Hiragana/Katakana, Korean Hangul)
-      // These scripts don't use spaces between words, so \b word boundaries won't work.
-      const isCJK = /[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/.test(key);
-      const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      
-      let count = 0;
-      if (isCJK) {
-        // Substring inclusion for CJK (no word boundaries needed)
-        const lowerKey = key.toLowerCase();
-        count = lowerText.split(lowerKey).length - 1;
-
-        // Substring fallback: check if any prefix or suffix (≥2 chars) of
-        // the key appears in the text. This catches partial name references
-        // e.g., "太郎" matching glossary key "山田太郎".
-        if (count === 0 && key.length >= 3) {
-          const lowerKeyFull = key.toLowerCase();
-          for (let len = 2; len < lowerKeyFull.length; len++) {
-            // Check prefixes of this length
-            const prefix = lowerKeyFull.substring(0, len);
-            if (lowerText.includes(prefix)) {
-              count = 1;
-              console.log(`[Glossary] 🔗 Term "${key}" matched via prefix "${prefix}".`);
-              break;
-            }
-            // Check suffixes of this length
-            const suffix = lowerKeyFull.substring(lowerKeyFull.length - len);
-            if (lowerText.includes(suffix)) {
-              count = 1;
-              console.log(`[Glossary] 🔗 Term "${key}" matched via suffix "${suffix}".`);
-              break;
-            }
-          }
-        }
-      } else {
-        const keyLength = key.length;
-        if (keyLength <= 3) {
-          // Strict regex matching for very short words to prevent over-matching (e.g., 'to' matching 'tool')
-          try {
-            const regex = new RegExp(`\\b${escapedKey}\\b`, 'gi');
-            const matches = lowerText.match(regex);
-            count = matches ? matches.length : 0;
-          } catch (e) {
-            const lowerKey = key.toLowerCase();
-            count = lowerText.split(lowerKey).length - 1;
-          }
-        } else {
-          // Fuzzy search for inflected proper nouns and longer words
-          const results = fuse.search(key);
-          count = results.length;
-        }
-
-        // Word-splitting fallback for multi-word English keys:
-        // e.g., "Pale King" → check "Pale" and "King" individually.
-        if (count === 0) {
-          const words = key.split(/\s+/).filter(w => w.length >= 3);
-          if (words.length > 1) {
-            for (const word of words) {
-              try {
-                const wordEscaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                const regex = new RegExp(`\\b${wordEscaped}\\b`, 'gi');
-                if (regex.test(lowerText)) {
-                  count = 1;
-                  console.log(`[Glossary] 🔗 Term "${key}" matched via word "${word}".`);
-                  break;
-                }
-              } catch (e) {
-                // Skip this word on regex error
-              }
-            }
-          }
-        }
-      }
-
-      if (count >= minOccurrences) {
-        if (count > 0 && !filteredRecord[key]) {
-          console.log(`[Glossary] ✅ Term "${key}" kept (found ${count} times).`);
-        }
-        filteredRecord[key] = value;
-      } else {
-        console.log(`[Glossary] 🗑️ Term "${key}" dropped (found ${count} times, need ${minOccurrences}).`);
-      }
-    });
-
-    return filteredRecord;
-  }
-
-  /**
-   * Performs a two-step cleanup: 
-   * 1. Automatic filtering based on text inclusion (min 2 occurrences).
-   * 2. AI-based optimization for redundancy and quality.
-   * @param referenceText The text to check against (usually posterior text).
-   */
-  async smartCleanupGlossary(glossaryText: string, referenceText: string): Promise<string> {
-    console.log(`[Smart Cleanup] Starting two-step cleanup (Threshold: 2+ occurrences in future text)...`);
-    
-    // Step 1: Automatic Filter
-    const initialMap = parseGlossaryStr(glossaryText);
-    const initialCount = Object.keys(initialMap).length;
-    
-    // Manual cleanup uses minOccurrences = 1 as per user request to unify logic
-    console.log(`[Smart Cleanup] Step 1: Filtering terms that appear less than 1 time in reference text...`);
-    const autoFilteredMap = this.filterGlossaryByInclusion(initialMap, referenceText, 1);
-    const autoFilteredCount = Object.keys(autoFilteredMap).length;
-    console.log(`[Smart Cleanup] Step 1 complete. Kept ${autoFilteredCount}/${initialCount} terms.`);
-    
-    const intermediateText = glossaryToOutputStr(autoFilteredMap);
-    if (autoFilteredCount === 0) return "";
-
-    // Step 2: AI Optimization
-    console.log(`[Smart Cleanup] Step 2: AI optimization for quality and redundancy...`);
-    try {
-        const optimizedText = await this.optimizeGlossary(intermediateText);
-        const finalMap = parseGlossaryStr(optimizedText);
-        console.log(`[Smart Cleanup] Step 2 complete. AI refined it to ${Object.keys(finalMap).length} terms.`);
-        return optimizedText;
-    } catch (error) {
-        console.warn(`[Smart Cleanup] Step 2 (AI) failed, returning automatically filtered results.`, error);
-        return intermediateText;
-    }
-  }
-
-  /**
-   * Filters the delta glossary to only include terms that appear in the posterior text
-   * or are already present in the current glossary.
-   */
-  private filterDeltaGlossary(delta: string, current: string, posteriorText: string): { filtered: string, originalCount: number, filteredCount: number } {
-    if (!delta) return { filtered: "", originalCount: 0, filteredCount: 0 };
-    if (!posteriorText) {
-        const map = parseGlossaryStr(delta);
-        const count = Object.keys(map).length;
-        return { filtered: delta, originalCount: count, filteredCount: count };
-    }
-    
-    const deltaMap = parseGlossaryStr(delta);
-    const currentMap = parseGlossaryStr(current);
+    const deltaMap = parseGlossaryStr(deltaGlossaryText);
+    const currentMap = parseGlossaryStr(currentGlossaryText);
     
     const deltaEntries = Object.entries(deltaMap);
     const originalCount = deltaEntries.length;
+    if (originalCount === 0) return { filteredText: "", originalCount: 0, filteredCount: 0 };
 
-    if (originalCount > 0) {
-      console.log(`[Glossary Filter] AI suggested ${originalCount} potential terms. Checking against future text...`);
-    }
-
-    const filteredMap = this.filterGlossaryByInclusion(deltaMap, posteriorText);
-    
-    // Ensure we keep terms that are already in the current glossary for consistency
-    Object.entries(deltaMap).forEach(([key, value]) => {
-      if (currentMap[key]) {
-        filteredMap[key] = value;
+    // 1. Exclude terms already in currentGlossary
+    const newCandidates: [string, string][] = [];
+    deltaEntries.forEach(([key, val]) => {
+      if (!currentMap[key]) {
+        newCandidates.push([key, val]);
       }
     });
 
-    const filteredCount = Object.keys(filteredMap).length;
-    if (originalCount > 0) {
-      console.log(`[Glossary Filter] Result: Kept ${filteredCount} out of ${originalCount} suggested terms.`);
+    // 2. Final Chapter Safety: if no posterior text, keep all new candidates
+    const trimmedPosterior = posteriorText ? posteriorText.trim() : "";
+    if (!trimmedPosterior) {
+      const filteredMap: Record<string, string> = {};
+      newCandidates.forEach(([k, v]) => filteredMap[k] = v);
+      return {
+        filteredText: glossaryToOutputStr(filteredMap),
+        originalCount,
+        filteredCount: newCandidates.length
+      };
     }
 
+    // 3. Fast O(N) Substring & Fallback Check
+    const lowerPosterior = trimmedPosterior.toLowerCase();
+    const keptMap: Record<string, string> = {};
+
+    newCandidates.forEach(([key, val]) => {
+      const lowerKey = key.toLowerCase();
+
+      // Direct Substring Check (covers CJK prefix/suffix & English singular in plural)
+      if (lowerPosterior.includes(lowerKey)) {
+        keptMap[key] = val;
+        console.log(`[Glossary Filter] ✅ Term "${key}" kept (found in posterior text).`);
+        return;
+      }
+
+      // Reverse Deformation Check (Prefix fallback for keys of length >= 4)
+      if (lowerKey.length >= 4) {
+        const prefix = lowerKey.substring(0, lowerKey.length - 1);
+        if (lowerPosterior.includes(prefix)) {
+          keptMap[key] = val;
+          console.log(`[Glossary Filter] ✅ Term "${key}" kept via prefix "${prefix}".`);
+          return;
+        }
+      }
+
+      // Multi-word splitting fallback for English phrases (e.g. "Alexander Pierce")
+      const words = key.split(/\s+/).filter(w => w.length >= 4);
+      if (words.length > 1) {
+        for (const word of words) {
+          if (lowerPosterior.includes(word.toLowerCase())) {
+            keptMap[key] = val;
+            console.log(`[Glossary Filter] ✅ Term "${key}" kept via component word "${word}".`);
+            return;
+          }
+        }
+      }
+
+      console.log(`[Glossary Filter] 🗑️ Term "${key}" dropped (not found in posterior text).`);
+    });
+
+    const filteredCount = Object.keys(keptMap).length;
     return {
-        filtered: glossaryToOutputStr(filteredMap),
-        originalCount,
-        filteredCount
+      filteredText: glossaryToOutputStr(keptMap),
+      originalCount,
+      filteredCount
     };
+  }
+
+  /**
+   * Performs AI-based optimization for redundancy and quality.
+   */
+  async smartCleanupGlossary(glossaryText: string, referenceText: string): Promise<string> {
+    console.log(`[Smart Cleanup] Starting AI optimization...`);
+    try {
+        const optimizedText = await this.optimizeGlossary(glossaryText);
+        const finalMap = parseGlossaryStr(optimizedText);
+        console.log(`[Smart Cleanup] Optimization complete. Refined to ${Object.keys(finalMap).length} terms.`);
+        return optimizedText;
+    } catch (error) {
+        console.warn(`[Smart Cleanup] Optimization failed, returning original.`, error);
+        return glossaryText;
+    }
   }
 
   async translateContent(
     content: string, 
     targetLanguage: string, 
     systemInstruction: string,
-    onProgress?: (current: number, total: number, chunkResult: string, updatedGlossary?: string, isFallback?: boolean, stats?: { originalCount: number, filteredCount: number }) => Promise<void>,
+    onProgress?: (
+      current: number,
+      total: number,
+      chunkResult: string,
+      updatedGlossary?: string,
+      isFallback?: boolean,
+      stats?: { originalCount: number; filteredCount: number },
+      chunkFootnotes?: Record<string, string>
+    ) => Promise<void | string>,
     existingChunks: string[] = [],
     indicesToRetry: number[] = [],
     initialGlossary: string = "",
-    fullPosteriorText: string = ""
-  ): Promise<{ content: string; glossary: string }> {
+    fullPosteriorText: string = "",
+    internalizedFootnotes: Record<string, FootnoteNode> = {},
+    footnotePool?: FootnotePool
+  ): Promise<{ content: string; glossary: string; translatedFootnotes: Record<string, string> }> {
     
+    const activePool = footnotePool || this.defaultFootnotePool;
     const customChunkSize = this.config.enableProofreading ? 1800 : this.CHUNK_SIZE;
     const chunks = this.splitTextIntoChunks(content, customChunkSize);
     const translatedChunks: string[] = [...existingChunks];
+    const chapterTranslatedFootnotes: Record<string, string> = {};
 
     // Ensure array is large enough
     while (translatedChunks.length < chunks.length) {
@@ -504,12 +537,7 @@ export class AiService {
         let glossaryPrompt = "";
         if (this.config.enableGlossary) {
             if (currentGlossary) {
-                const fullMap = parseGlossaryStr(currentGlossary);
-                const relevantMap = this.filterGlossaryByInclusion(fullMap, chunk);
-                const relevantGlossary = glossaryToOutputStr(relevantMap);
-                glossaryPrompt = relevantGlossary 
-                    ? `\n\nCURRENT GLOSSARY:\n${relevantGlossary}`
-                    : "\n\nCURRENT GLOSSARY: (Empty)";
+                glossaryPrompt = `\n\nCURRENT GLOSSARY:\n${currentGlossary}`;
             } else {
                 glossaryPrompt = "\n\nCURRENT GLOSSARY: (Empty)";
             }
@@ -519,21 +547,95 @@ export class AiService {
             ? `${baseSystemInstruction}\n\n[System Note: This is part ${i + 1} of ${chunks.length} of the chapter. Maintain strict terminology and stylistic consistency with previous parts.]${glossaryPrompt}`
             : `${baseSystemInstruction}${glossaryPrompt}`;
 
-        const prompt = `Translate the following Markdown content into ${targetLanguage}. \n\nCONTENT:\n${chunk}`;
+        // Inspect __FN_REF_{id}__ slots in this chunk and prepare dual-channel footnotes via FootnotePool
+        const slotIds = Array.from(new Set(extractFootnoteSlots(chunk)));
+        const pendingFootnotes: FootnoteNode[] = [];
+        const referenceOnlyFootnotes: TranslatedFootnote[] = [];
+        const chunkFootnotes: Record<string, string> = {};
+
+        for (const fnId of slotIds) {
+            const cleanId = fnId.replace(/^fn-/, '');
+            const fnNode = internalizedFootnotes[cleanId] || internalizedFootnotes[fnId] || internalizedFootnotes[`fn-${cleanId}`];
+            if (!fnNode) continue;
+
+            const cached = activePool.getTranslatedFootnote(fnId, fnNode.key);
+            if (cached) {
+                referenceOnlyFootnotes.push(cached);
+                chapterTranslatedFootnotes[fnId] = cached.translatedText;
+                chunkFootnotes[fnId] = cached.translatedText;
+                continue;
+            }
+
+            if (activePool.isOversizedFootnote(fnNode)) {
+                const shunted = await activePool.translateOversizedFootnote(
+                    fnNode,
+                    async (subPayload: string) => {
+                        const subRes = await this.generate(
+                            `Translate the following footnote segment into ${targetLanguage}.\n\nCONTENT:\n${subPayload}`,
+                            chunkInstruction,
+                            0.3
+                        );
+                        return subRes.translation;
+                    }
+                );
+                referenceOnlyFootnotes.push(shunted);
+                chapterTranslatedFootnotes[fnId] = shunted.translatedText;
+                chunkFootnotes[fnId] = shunted.translatedText;
+                continue;
+            }
+
+            pendingFootnotes.push(fnNode);
+        }
+
+        const effectiveChunkPayload = activePool.formatDualChannelPayload(
+            chunk,
+            pendingFootnotes,
+            referenceOnlyFootnotes
+        );
+
+        const prompt = `Translate the following Markdown content into ${targetLanguage}. \n\nCONTENT:\n${effectiveChunkPayload}`;
 
         try {
             const result = await this.generate(prompt, chunkInstruction, 0.3);
-            translatedChunks[i] = result.translation;
+            const parsedDual = activePool.parseDualChannelResponse(
+                result.translation,
+                chunk,
+                pendingFootnotes
+            );
+
+            for (const fnNode of pendingFootnotes) {
+                const cleanId = (fnNode.namespaceId || fnNode.originalId).replace(/^fn-/, '');
+                const trText = parsedDual.translatedFootnotes[cleanId] || fnNode.plainText;
+                activePool.setTranslatedFootnote({
+                    footnoteId: cleanId,
+                    canonicalKey: fnNode.key,
+                    originalText: fnNode.plainText,
+                    translatedText: trText,
+                    translatedParagraphs: trText
+                        .split(/\n{2,}/)
+                        .map((p) => p.trim())
+                        .filter(Boolean),
+                    wasOversizedShunted: false
+                });
+                chapterTranslatedFootnotes[cleanId] = trText;
+                chunkFootnotes[cleanId] = trText;
+            }
+
+            const finalChunkText =
+                pendingFootnotes.length > 0 || referenceOnlyFootnotes.length > 0
+                    ? parsedDual.translatedBody
+                    : validateAndRepairSlots(chunk, result.translation).repairedText;
+
+            translatedChunks[i] = finalChunkText;
             let deltaGlossary = result.glossary || "";
             let stats = { originalCount: 0, filteredCount: 0 };
             
-            // AUTOMATIC FILTERING: If term won't appear in future, don't pollute the glossary
             if (this.config.enableGlossary && deltaGlossary) {
                 const chapterPosterior = chunks.slice(i + 1).join('\n');
                 const combinedPosterior = chapterPosterior + '\n' + fullPosteriorText;
-                const filterResult = this.filterDeltaGlossary(deltaGlossary, currentGlossary, combinedPosterior);
-                deltaGlossary = filterResult.filtered;
-                stats = { originalCount: filterResult.originalCount, filteredCount: filterResult.filteredCount };
+                const filterRes = this.filterDeltaByPosterior(deltaGlossary, currentGlossary, combinedPosterior);
+                deltaGlossary = filterRes.filteredText;
+                stats = { originalCount: filterRes.originalCount, filteredCount: filterRes.filteredCount };
             }
 
             if (deltaGlossary) {
@@ -541,8 +643,10 @@ export class AiService {
             }
             
             if (onProgress) {
-                // We pass deltaGlossary to onProgress so UI/DB update can see the new terms
-                await onProgress(i + 1, chunks.length, result.translation, deltaGlossary, false, stats);
+                const syncedGlossary = await onProgress(i + 1, chunks.length, finalChunkText, deltaGlossary, false, stats, chunkFootnotes);
+                if (typeof syncedGlossary === 'string') {
+                    currentGlossary = syncedGlossary;
+                }
             }
         } catch (error) {
 
@@ -577,7 +681,8 @@ export class AiService {
 
     return { 
         content: translatedChunks.join('\n\n'),
-        glossary: currentGlossary
+        glossary: currentGlossary,
+        translatedFootnotes: chapterTranslatedFootnotes
     };
   }
 

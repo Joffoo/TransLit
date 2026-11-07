@@ -13,6 +13,8 @@ import logoUrl from './logo.svg';
 import { EpubService } from './services/epubService';
 import { AiService } from './services/geminiService';
 import { PersistenceService } from './services/persistenceService';
+import { FootnotePool } from './services/footnotePool';
+import { PageClassifier } from './services/pageClassifier';
 import { AppStatus, AppConfig, Chapter, ProcessingLog, SessionState } from './types';
 import { RECOMMENDED_TRANSLATION_PROMPT, TWO_STEP_BASE_PROMPT } from './prompts';
 import { parseGlossaryStr, glossaryToOutputStr, parseGlossaryValue } from './utils/glossaryUtils';
@@ -153,6 +155,8 @@ const App: React.FC = () => {
   
   const epubService = useRef(new EpubService());
   const persistenceService = useRef(new PersistenceService());
+  const footnotePoolRef = useRef(new FootnotePool());
+  const pageClassifierRef = useRef(new PageClassifier());
   const logsEndRef = useRef<HTMLDivElement>(null);
   const isPauseRequested = useRef(false);
   
@@ -206,6 +210,10 @@ const App: React.FC = () => {
                  opfPathRef.current = session.opfPath;
                  opfDirRef.current = session.opfDir;
                  cssFilesRef.current = session.cssFiles;
+                 
+                 // Restore footnote pool
+                 footnotePoolRef.current = new FootnotePool();
+                 footnotePoolRef.current.restoreFromChapters(chaptersRef.current);
                  
                  // Restore glossary
                 const savedGlossary = await persistenceService.current.loadGlossary();
@@ -447,6 +455,7 @@ const App: React.FC = () => {
         chaptersRef.current = extractedChapters;
         setChapters(extractedChapters); // Sync state for UI
         coverPathRef.current = coverPath;
+        footnotePoolRef.current = new FootnotePool();
 
         // Persist initial data
         await persistenceService.current.saveChapters(extractedChapters);
@@ -465,9 +474,31 @@ const App: React.FC = () => {
             cssFiles
         });
 
+        const totalInternalizedNotes = extractedChapters.reduce(
+            (sum, c) => sum + Object.keys(c.internalizedFootnotes || {}).length,
+            0
+        );
+        const fnSourceCount = extractedChapters.filter(c => c.isFootnoteSource).length;
         addLog(`Extracted ${extractedChapters.length} chapters and ${Object.keys(images).length} images.`, "success");
+        if (totalInternalizedNotes > 0) {
+            addLog(`Internalized ${totalInternalizedNotes} cross-file/same-page footnotes (${fnSourceCount} source file(s) protected with 0-Offset).`, "info");
+        }
         if (coverPath) {
             addLog(`Cover image detected.`, 'info');
+        }
+
+        // Stage 2: Async lightweight AI classification for ambiguous transition pages
+        if (config.apiKey && config.baseUrl && extractedChapters.some(c => c.classification?.category === 'ambiguous')) {
+            const aiClassifier = new AiService(config);
+            pageClassifierRef.current.classifyAmbiguousPagesAi(
+                extractedChapters,
+                (payload) => aiClassifier.classifyPageSnippet(payload),
+                (updatedCh, idx) => {
+                    chaptersRef.current[idx] = updatedCh;
+                    setChapters([...chaptersRef.current]);
+                    persistenceService.current.updateChapter(updatedCh).catch(() => {});
+                }
+            ).catch(() => {});
         }
         
         // Auto-switch to chapters view so user sees the content
@@ -566,8 +597,9 @@ const App: React.FC = () => {
     }
 
     // --- Translation ---
-    if (chapter.translatedMarkdown && forceTranslateIndices.length === 0) {
-        // Already translated, just return the starting master glossary
+    const needsProofread = config.enableProofreading && !chapter.proofreadMarkdown;
+    if (chapter.translatedMarkdown && !needsProofread && forceTranslateIndices.length === 0) {
+        // Already translated (and proofread if required), just return the starting master glossary
         // Do NOT overwrite it with chapter.glossary, which would wipe manual edits!
         return startGlossary;
     } else {
@@ -597,7 +629,7 @@ const App: React.FC = () => {
             chapter.markdown, 
             'Chinese (Simplified)', 
             effectiveSystemInstruction,
-            async (current, total, chunkResult, updatedGlossary, isFallback, stats) => {
+            async (current, total, chunkResult, updatedGlossary, isFallback, stats, chunkFootnotes) => {
                 activeChapterIndexRef.current = index;
                 activeChunkIndexRef.current = current;
 
@@ -655,6 +687,14 @@ const App: React.FC = () => {
                   }
               }
               
+              // Incrementally persist chunk footnotes into chapter state
+              if (chunkFootnotes && Object.keys(chunkFootnotes).length > 0) {
+                  chapter.translatedFootnotes = {
+                      ...(chapter.translatedFootnotes || {}),
+                      ...chunkFootnotes
+                  };
+              }
+
               if (chapter.translatedChunks) {
                   chapter.translatedChunks![current - 1] = chunkResult;
                   if (updatedGlossary) {
@@ -669,9 +709,15 @@ const App: React.FC = () => {
           chapter.translatedChunks,
           forceTranslateIndices,
           initialGlossaryForChapter,
-          chapters.slice(index + 1).map(c => c.markdown).join('\n')
+          chapters.slice(index + 1).map(c => c.markdown).join('\n'),
+          chapter.internalizedFootnotes || {},
+          footnotePoolRef.current
         );
         chapter.translatedMarkdown = result.content;
+        chapter.translatedFootnotes = {
+            ...(chapter.translatedFootnotes || {}),
+            ...(result.translatedFootnotes || {})
+        };
         chapter.glossary = result.glossary;
         
         currentGlossary = result.glossary;
@@ -681,6 +727,10 @@ const App: React.FC = () => {
             chapter.proofreadMarkdown = result.content;
             chapter.proofreadChunks = [...(chapter.translatedChunks || [])];
             chapter.fallbackProofreadChunks = [...(chapter.fallbackChunks || [])];
+        } else {
+            chapter.proofreadMarkdown = undefined;
+            chapter.proofreadChunks = undefined;
+            chapter.fallbackProofreadChunks = undefined;
         }
 
         updated = true;
@@ -699,12 +749,16 @@ const App: React.FC = () => {
         const aiService = new AiService(config);
         const chapters = chaptersRef.current;
         const chapter = chapters[index];
+        footnotePoolRef.current.restoreFromChapters(chapters);
 
         // If chapter is skip or reference, we just run processChapter to ensure its state is synced
         // and it bypasses the chunk splitting logic which might fail or be unnecessary
         if (!chapter.isSkippable && !chapter.isReference) {
             // Use AI split to recover original chunk structure
-            const sourceChunks = aiService.splitTextIntoChunks(chapter.markdown);
+            const sourceChunks = aiService.splitTextIntoChunks(
+                chapter.markdown,
+                config.enableProofreading ? 1800 : undefined
+            );
             
             // Sync local fallbacks with detection if needed
             const explicit = chapter.fallbackChunks || [];
@@ -845,11 +899,19 @@ const App: React.FC = () => {
   }
 
   const toggleChapterSkip = async (index: number) => {
+    const target = chaptersRef.current[index];
+    if (target?.isFootnoteSource || target?.isSystemProtected) {
+        addLog(`"${target.title}" is a protected system footnote source (0-Offset placeholder on export) and cannot be deleted.`, 'info');
+        return;
+    }
     const updatedChapters = [...chaptersRef.current];
     updatedChapters[index] = { 
         ...updatedChapters[index], 
         isSkippable: !updatedChapters[index].isSkippable,
-        isReference: false // Mutually exclusive for simplicity
+        isReference: false, // Mutually exclusive for simplicity
+        classification: updatedChapters[index].classification
+            ? { ...updatedChapters[index].classification!, stage: 'user_override' }
+            : undefined
     };
     chaptersRef.current = updatedChapters;
     setChapters(updatedChapters);
@@ -863,11 +925,19 @@ const App: React.FC = () => {
   };
 
   const toggleChapterReference = async (index: number) => {
+    const target = chaptersRef.current[index];
+    if (target?.isFootnoteSource || target?.isSystemProtected) {
+        addLog(`"${target.title}" is already managed as a system footnote source.`, 'info');
+        return;
+    }
     const updatedChapters = [...chaptersRef.current];
     updatedChapters[index] = { 
         ...updatedChapters[index], 
         isReference: !updatedChapters[index].isReference,
-        isSkippable: false // Mutually exclusive
+        isSkippable: false, // Mutually exclusive
+        classification: updatedChapters[index].classification
+            ? { ...updatedChapters[index].classification!, stage: 'user_override' }
+            : undefined
     };
     chaptersRef.current = updatedChapters;
     setChapters(updatedChapters);
@@ -892,9 +962,9 @@ const App: React.FC = () => {
     addLog(`Recompiling EPUB...`, "process");
     
     try {
-        const chaptersToPack = chaptersList.filter(c => !c.isSkippable);
+        const chaptersToPack = chaptersList.filter(c => !c.isSkippable || c.isFootnoteSource);
         const excludeFileNames = chaptersList
-            .filter(c => c.isSkippable)
+            .filter(c => c.isSkippable && !c.isFootnoteSource)
             .map(c => c.fileName);
 
         // Try to get the original ZIP: IndexedDB cache first, then currentFile as fallback
@@ -1064,6 +1134,7 @@ const App: React.FC = () => {
       setLiveGlossary(runningGlossary);
 
       isPauseRequested.current = false; // Reset pause flag
+      footnotePoolRef.current.restoreFromChapters(chaptersRef.current);
       setStatus(AppStatus.TRANSLATING);
 
       for (let i = 0; i < chaptersRef.current.length; i++) {
@@ -1465,7 +1536,10 @@ const App: React.FC = () => {
                     {
                         chapters.map((chapter, idx) => {
                             const ai = new AiService(config);
-                            const sourceChunks = ai.splitTextIntoChunks(chapter.markdown || '');
+                            const sourceChunks = ai.splitTextIntoChunks(
+                                chapter.markdown || '',
+                                config.enableProofreading ? 1800 : undefined
+                            );
                             
                             // Detection Logic (Robust for old data)
                             // We only use heuristic detection if explicit fallback indices are missing (undefined)
@@ -1534,8 +1608,12 @@ const App: React.FC = () => {
                                                     </div>
                                                 )}
                                             </div>
-                                            <div className="flex gap-2 mt-1.5 item-center">
-                                                {isSkipped ? (
+                                            <div className="flex flex-wrap gap-2 mt-1.5 item-center">
+                                                {chapter.isFootnoteSource ? (
+                                                    <span className="text-[9px] font-mono uppercase tracking-widest text-white bg-neutral-800 px-1.5 py-0.5 rounded-none border border-white/40" title={chapter.classification?.reason || 'Standalone footnote source protected with 0-Offset placeholder'}>
+                                                        System Footnote Source • 0-Offset
+                                                    </span>
+                                                ) : isSkipped ? (
                                                      <span className="text-[9px] font-mono uppercase tracking-widest text-neutral-600 bg-black px-1.5 py-0.5 rounded-none border border-white/10">Removed</span>
                                                 ) : (
                                                     <>
@@ -1557,12 +1635,26 @@ const App: React.FC = () => {
                                                         )}
                                                     </>
                                                 )}
+                                                {chapter.internalizedFootnotes && Object.keys(chapter.internalizedFootnotes).length > 0 && (
+                                                    <span className="text-[9px] font-mono uppercase tracking-widest text-neutral-300 bg-black px-1.5 py-0.5 rounded-none border border-white/30">
+                                                        {Object.keys(chapter.internalizedFootnotes).length} Footnotes Internalized
+                                                    </span>
+                                                )}
+                                                {chapter.classification && !chapter.isFootnoteSource && (
+                                                    <span className="text-[9px] font-mono uppercase tracking-widest text-neutral-400 bg-black px-1.5 py-0.5 rounded-none border border-white/15" title={chapter.classification.reason}>
+                                                        {chapter.classification.stage === 'lightweight_ai' ? 'AI' : chapter.classification.stage === 'user_override' ? 'User' : 'Rule'}: {chapter.classification.category}
+                                                    </span>
+                                                )}
                                             </div>
                                         </div>
                                     </div>
 
                                     <div className="flex items-center gap-2">
-                                        {!isSkipped && (
+                                        {chapter.isFootnoteSource ? (
+                                            <span className="text-[10px] font-mono uppercase tracking-widest text-neutral-400 bg-neutral-900 border border-white/20 px-2.5 py-1 rounded-none">
+                                                Locked
+                                            </span>
+                                        ) : !isSkipped ? (
                                             <div className="flex gap-1 mr-2 opacity-0 group-hover:opacity-100 transition-opacity">
                                                 <button 
                                                     onClick={() => setPreviewChapter(chapter)}
@@ -1586,8 +1678,7 @@ const App: React.FC = () => {
                                                     <Ban className="w-3.5 h-3.5" />
                                                 </button>
                                             </div>
-                                        )}
-                                        {isSkipped && (
+                                        ) : (
                                             <button 
                                                 onClick={() => toggleChapterSkip(idx)}
                                                 className="mr-3 p-1.5 rounded-none border border-white/20 bg-black text-neutral-400 hover:text-white hover:bg-neutral-800 transition-all"
@@ -1596,7 +1687,7 @@ const App: React.FC = () => {
                                                 <RefreshCw className="w-3.5 h-3.5" />
                                             </button>
                                         )}
-                                        {!isSkipped && (
+                                        {!isSkipped && !chapter.isFootnoteSource && (
                                             <div className="flex gap-2">
                                                 {(hasFallbacks || status === AppStatus.IDLE || status === AppStatus.COMPLETED || status === AppStatus.ERROR) && (
                                                     <button 
