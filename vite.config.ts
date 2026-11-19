@@ -1,5 +1,5 @@
 import path from 'path';
-import { defineConfig, loadEnv } from 'vite';
+import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import type { Plugin } from 'vite';
 import type { IncomingMessage, ServerResponse } from 'http';
@@ -22,6 +22,20 @@ function apiProxyPlugin(): Plugin {
           return;
         }
 
+        let parsedUrl: URL;
+        try {
+          parsedUrl = new URL(targetUrl);
+        } catch {
+          res.writeHead(400);
+          res.end('Invalid X-Target-Url header');
+          return;
+        }
+        if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+          res.writeHead(400);
+          res.end('Unsupported X-Target-Url protocol');
+          return;
+        }
+
         // Collect request body
         const chunks: Buffer[] = [];
         for await (const chunk of req) chunks.push(chunk as Buffer);
@@ -36,13 +50,15 @@ function apiProxyPlugin(): Plugin {
         }
 
         try {
-          const apiRes = await fetch(targetUrl, {
+          const apiRes = await fetch(parsedUrl.toString(), {
             method: req.method ?? 'POST',
             headers: forwardHeaders,
             body: body.length > 0 ? body : undefined,
           });
 
-          res.writeHead(apiRes.status, { 'content-type': 'application/json' });
+          res.writeHead(apiRes.status, {
+            'content-type': apiRes.headers.get('content-type') || 'application/json',
+          });
           const text = await apiRes.text();
           res.end(text);
         } catch (err: any) {
@@ -54,18 +70,24 @@ function apiProxyPlugin(): Plugin {
   };
 }
 
-export default defineConfig(({ mode }) => {
-    const env = loadEnv(mode, '.', '');
+export default defineConfig(() => {
     return {
       server: {
         port: 3000,
-        host: '0.0.0.0',
+        host: '127.0.0.1',
+      },
+      build: {
+        rollupOptions: {
+          output: {
+            manualChunks: {
+              'react-vendor': ['react', 'react-dom'],
+              'epub-vendor': ['jszip', 'marked', 'katex', 'franc-min'],
+              'ui-vendor': ['react-markdown', 'lucide-react'],
+            },
+          },
+        },
       },
       plugins: [react(), apiProxyPlugin()],
-      define: {
-        'process.env.API_KEY': JSON.stringify(env.GEMINI_API_KEY),
-        'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY)
-      },
       resolve: {
         alias: {
           '@': path.resolve(__dirname, '.'),

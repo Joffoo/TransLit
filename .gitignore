@@ -18,8 +18,11 @@ out/
 build/
 
 # Local env files
+.env
 .env.local
 .env.*.local
+*.env
+*.env.*
 
 # TypeScript
 *.tsbuildinfo

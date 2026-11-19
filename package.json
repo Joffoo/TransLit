@@ -1,33 +1,31 @@
 {
-  "name": "ai-epub-translator",
+  "name": "translit",
   "private": true,
-  "version": "0.0.0",
+  "version": "2.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "lint": "tsc --noEmit",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "npx tsx tests/run_all.ts"
   },
   "dependencies": {
-    "dompurify": "^3.3.1",
-    "fuse.js": "^7.4.2",
-    "jsdom": "^29.1.1",
+    "franc-min": "^6.2.0",
     "jszip": "^3.10.1",
     "katex": "0.16.9",
     "lucide-react": "^0.562.0",
     "marked": "^17.0.1",
-    "marked-footnote": "^1.4.0",
-    "motion": "^12.38.0",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
-    "react-markdown": "^10.1.0",
-    "turndown": "^7.2.2"
+    "react-markdown": "^10.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
     "@vitejs/plugin-react": "^5.0.0",
     "autoprefixer": "^10.6.1",
+    "jsdom": "^29.1.1",
+    "playwright-core": "^1.65.0",
     "postcss": "^8.5.29",
     "tailwindcss": "^3.4.19",
     "typescript": "~5.8.2",

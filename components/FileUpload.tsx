@@ -17,9 +17,10 @@ const FileUpload: React.FC<FileUploadProps> = ({ onFileSelect, disabled }) => {
         setError(null);
         onFileSelect(file);
       } else {
-        setError("Please upload a valid .epub file");
+        setError("请上传有效的 .epub 电子书文件");
       }
     }
+    event.target.value = '';
   };
 
   const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
@@ -65,7 +66,7 @@ const FileUpload: React.FC<FileUploadProps> = ({ onFileSelect, disabled }) => {
         setError(null);
         onFileSelect(file);
       } else {
-        setError("Please upload a valid .epub file");
+        setError("请上传有效的 .epub 电子书文件");
       }
     }
   };
@@ -106,10 +107,10 @@ const FileUpload: React.FC<FileUploadProps> = ({ onFileSelect, disabled }) => {
         
         <div className="flex flex-col items-center text-center">
           <h3 className={`font-mono uppercase tracking-widest text-lg font-medium transition-colors ${isDragging ? 'text-black' : 'text-black'}`}>
-            {isDragging ? "Drop Manuscript Here" : "Upload Manuscript"}
+            {isDragging ? "释放立即上传" : "上传 EPUB 电子书"}
           </h3>
           <p className={`text-sm mt-1.5 font-mono transition-colors ${isDragging ? 'text-black' : 'text-neutral-500'}`}>
-            {isDragging ? "Release to begin processing" : "Drag & drop your EPUB file, or click to browse"}
+            {isDragging ? "松开鼠标开始解析" : "点击选择或拖拽 EPUB 文件到此处"}
           </p>
           {error && (
             <p className="text-sm mt-3 text-white font-mono bg-black px-3 py-1 rounded-none border border-black">

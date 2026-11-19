@@ -1,6 +1,0 @@
-{
-  "name": "TransLit 2.0",
-  "description": "A browser-based workflow to translate EPUB books. Converts XHTML to Markdown for translation, proofreads, and recompiles to EPUB.",
-  "requestFramePermissions": [],
-  "majorCapabilities": []
-}

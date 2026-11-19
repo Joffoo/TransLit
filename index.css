@@ -44,3 +44,74 @@ body {
 .bg-neutral-900.custom-scrollbar::-webkit-scrollbar-thumb:hover {
   background-color: rgba(255, 255, 255, 0.6);
 }
+
+/* Heti (赫蹏) + W3C CLREQ Chinese Typography for Studio Preview Workbench */
+.heti-prose {
+  font-family: "Heti Song", "Songti SC", "STSong", "Source Han Serif SC", "Noto Serif CJK SC", "SimSun", "Lora", Georgia, serif;
+  line-break: strict;
+  word-break: normal;
+  overflow-wrap: break-word;
+  hanging-punctuation: allow-end;
+  text-spacing-trim: space-first;
+  text-autospace: normal;
+  -webkit-font-smoothing: antialiased;
+}
+
+.heti-prose p {
+  font-family: "Heti Song", "Songti SC", "STSong", "Source Han Serif SC", "Noto Serif CJK SC", "SimSun", serif;
+  text-align: justify;
+  text-justify: inter-ideograph;
+  line-break: strict;
+  hanging-punctuation: allow-end;
+  text-spacing-trim: space-first;
+  text-autospace: normal;
+  text-indent: 2em;
+}
+
+.heti-prose h1,
+.heti-prose h2,
+.heti-prose h3,
+.heti-prose h4 {
+  font-family: "Heti Hei", "PingFang SC", "Source Han Sans CN", "Noto Sans CJK SC", sans-serif;
+  color: #2e5b60;
+  text-indent: 0;
+  line-height: 1.5;
+}
+
+.heti-prose em,
+.heti-prose i {
+  font-style: normal;
+  font-family: "KaiTi", "STKaiti", "FangSong", "fs2", serif;
+}
+
+.heti-prose blockquote {
+  font-style: normal;
+  font-family: "KaiTi", "STKaiti", "FangSong", "fs2", serif;
+  color: #412938;
+  border-left: 3px solid #a2906a;
+  background-color: rgba(162, 144, 106, 0.05);
+  padding: 0.5rem 0.9rem;
+}
+
+.heti-prose blockquote p {
+  font-family: inherit;
+  text-indent: 2em;
+}
+
+.heti-prose sup,
+.heti-prose sub {
+  line-height: 0;
+  font-size: 0.75em;
+  vertical-align: baseline;
+  position: relative;
+}
+
+.heti-prose sup {
+  top: -0.45em;
+}
+
+.heti-prose u {
+  text-decoration: underline;
+  text-underline-offset: 0.25em;
+  text-decoration-thickness: 1px;
+}

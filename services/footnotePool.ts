@@ -1,6 +1,6 @@
-import TurndownService from 'turndown';
 import { FootnoteNode } from '../types';
 import { parseHtmlDocument } from '../utils/domAdapter';
+import { DomMutationEngine } from './domMutationEngine';
 
 export const FOOTNOTE_SLOT_PROMPT_CONSTRAINT =
   '请严格保留形如 __FN_REF_{id}__ 的占位符，严禁翻译、增删或篡改其拼写与大小写。';
@@ -51,7 +51,7 @@ export function createFootnoteSlot(id: string): string {
 }
 
 export function extractFootnoteSlots(text: string): string[] {
-  const matches = [...text.matchAll(/__FN_REF_([A-Za-z0-9-]+?)__/g)];
+  const matches = [...text.matchAll(/__FN_REF_([A-Za-z0-9_-]+?)__/g)];
   return matches.map((m) => m[1]);
 }
 
@@ -110,7 +110,7 @@ export function validateAndRepairSlots(
 
   // Step 1: Normalize mangled slot syntax (case changes, spaces around underscores, fullwidth underscores)
   let repaired = translatedText.replace(
-    /[_＿]{1,2}\s*fn\s*[_＿]\s*ref\s*[_＿]\s*([A-Za-z0-9-]+?)\s*[_＿]{1,2}/gi,
+    /[_＿]{1,2}\s*fn\s*[_＿]\s*ref\s*[_＿]\s*((?:[A-Za-z0-9-]|_(?=[A-Za-z0-9-]))+)\s*[_＿]{1,2}/gi,
     (_, rawId) => `__FN_REF_${String(rawId).trim().replace(/^[_＿]+|[_＿]+$/g, '')}__`
   );
 
@@ -127,7 +127,7 @@ export function validateAndRepairSlots(
   // Normalize if LLM emitted natural-number slots like __FN_REF_1__ instead of __FN_REF_28-1__
   if (remainingNeeded.length > 0) {
     repaired = repaired.replace(
-      /__FN_REF_([A-Za-z0-9-]+?)__/g,
+      /__FN_REF_([A-Za-z0-9_-]+?)__/g,
       (fullMatch, rawId) => {
         const candidate = String(rawId).trim();
         if (expectedIds.includes(candidate)) {
@@ -244,63 +244,56 @@ export class FootnotePool {
   private poolByCanonicalKey = new Map<string, TranslatedFootnote>();
   private maxChunkChars: number;
   private oversizedThresholdChars: number;
-  private turndown: TurndownService;
+  private domMutationEngine = new DomMutationEngine();
 
   constructor(options: FootnotePoolOptions = {}) {
     this.maxChunkChars = options.maxChunkChars || 2600;
     this.oversizedThresholdChars = options.oversizedFootnoteThresholdChars || 1200;
-    this.turndown = this.createSlottingTurndownService();
   }
 
-  private createSlottingTurndownService(): TurndownService {
-    const td = new TurndownService({
-      headingStyle: 'atx',
-      codeBlockStyle: 'fenced'
-    });
+  private serializeElementWithFootnoteSlots(el: Element): string {
+    const clone = el.cloneNode(true) as Element;
+    const links = Array.from(clone.querySelectorAll('a'));
+    const doc = clone.ownerDocument;
+    for (const a of links) {
+      const epubType = a.getAttribute('epub:type') || '';
+      const cls = a.getAttribute('class') || '';
+      const href = a.getAttribute('href') || '';
+      const dataFnId = a.getAttribute('data-fn-id');
+      const isNoteref =
+        epubType.split(/\s+/).includes('noteref') ||
+        cls.split(/\s+/).includes('noteref') ||
+        Boolean(dataFnId) ||
+        href.startsWith('#fn-');
 
-    td.addRule('slotted-noteref', {
-      filter: (node: any) => {
-        if (node.nodeName !== 'A') return false;
-        const epubType = node.getAttribute('epub:type') || '';
-        const cls = node.getAttribute('class') || '';
-        const href = node.getAttribute('href') || '';
-        return (
-          epubType === 'noteref' ||
-          cls.split(/\s+/).includes('noteref') ||
-          Boolean(node.getAttribute('data-fn-id')) ||
-          href.startsWith('#fn-')
-        );
-      },
-      replacement: (_content: string, node: any) => {
-        const dataFnId = node.getAttribute('data-fn-id');
-        if (dataFnId) {
-          return createFootnoteSlot(dataFnId);
-        }
-        const href = node.getAttribute('href') || '';
-        if (href.startsWith('#')) {
-          const rawId = href.slice(1).replace(/^fn-/, '');
-          return createFootnoteSlot(rawId);
-        }
-        return _content;
+      if (!isNoteref) continue;
+
+      let rawId = dataFnId || '';
+      if (!rawId && href.startsWith('#')) {
+        rawId = href.slice(1).replace(/^fn-/, '');
       }
-    });
+      if (!rawId) continue;
 
-    td.addRule('flattenHeader', {
-      filter: ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'],
-      replacement: (content: string, node: any) => {
-        const hLevel = Number(node.nodeName.charAt(1));
-        const hashes = '#'.repeat(hLevel);
-        const cleanContent = content.replace(/\n/g, ' ').replace(/\s+/g, ' ').trim();
-        return `\n\n${hashes} ${cleanContent}\n\n`;
+      const slotText = createFootnoteSlot(rawId);
+      if (doc && a.parentNode) {
+        a.parentNode.replaceChild(doc.createTextNode(slotText), a);
+      } else {
+        a.textContent = slotText;
       }
-    });
+    }
 
-    return td;
+    const normalized = (clone.textContent || '').replace(/\s+/g, ' ').trim();
+    if (!normalized) return '';
+    if (/^H[1-6]$/i.test(el.tagName)) {
+      const hLevel = Number(el.tagName.charAt(1));
+      return `${'#'.repeat(hLevel)} ${normalized}`;
+    }
+    return normalized;
   }
 
   public estimateTokens(text: string): number {
     if (!text) return 0;
-    const cjk = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
+    const cjk = (text.match(/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g) || []).length;
     const nonCjkChars = text.length - cjk;
     return Math.ceil(cjk * 1.5 + nonCjkChars / 4);
   }
@@ -376,7 +369,7 @@ export class FootnotePool {
   }
 
   /**
-   * Parses chapter XHTML into top-level block elements (`p`, `blockquote`, `table`, `h1-h6`, `ul`, `ol`, `pre`),
+   * Parses chapter XHTML into leaf DOM block elements (`p`, `td`, `h1-h6`, `li`, `blockquote`, etc.),
    * replacing in-text footnote anchors with opaque `__FN_REF_{id}__` slots and recording
    * referenced footnote IDs per block.
    */
@@ -384,6 +377,20 @@ export class FootnotePool {
     chapterHtml: string,
     internalizedFootnotes: Record<string, FootnoteNode> = {}
   ): ChapterBlock[] {
+    const extraction = this.domMutationEngine.extractTranslatablePayload(
+      chapterHtml,
+      internalizedFootnotes
+    );
+    if (extraction.blocks.length > 0) {
+      return extraction.blocks.map((b, idx) => ({
+        index: idx,
+        tagName: b.tagName,
+        slottedMarkdown: b.slottedText,
+        footnoteIds: b.footnoteIds,
+        estimatedTokens: this.estimateTokens(b.slottedText)
+      }));
+    }
+
     const doc = parseHtmlDocument(chapterHtml);
     const body = doc.body;
     if (!body) return [];
@@ -405,16 +412,11 @@ export class FootnotePool {
         return;
       }
 
-      const outerHtml = el.outerHTML;
-      const slottedMd = this.turndown.turndown(outerHtml).trim();
+      const slottedMd = this.serializeElementWithFootnoteSlots(el);
       if (!slottedMd) return;
 
       const slotIds = extractFootnoteSlots(slottedMd);
-      const uniqueIds = Array.from(
-        new Set(
-          slotIds.filter((id) => internalizedFootnotes[id] !== undefined || true)
-        )
-      );
+      const uniqueIds = Array.from(new Set(slotIds));
 
       blocks.push({
         index: blocks.length,

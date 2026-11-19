@@ -1,0 +1,114 @@
+import assert from 'node:assert/strict';
+import { DomMutationEngine, parseEpubCssProfiles } from '../services/domMutationEngine';
+import { EpubService, buildAdaptiveChineseTypographyCss } from '../services/epubService';
+
+async function runTests() {
+  const engine = new DomMutationEngine();
+
+  // Slice 1 (Seam 1): Mid-paragraph pagebreak spans and empty anchors must be stripped from payloadText
+  {
+    const xhtml = `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<body>
+  <p class="CO" id="ch1"><span aria-label="3" epub:type="pagebreak" id="pg_3" role="doc-pagebreak"/>A bus came which was going to the ferry, but because I <span aria-label="4" epub:type="pagebreak" id="pg_4" role="doc-pagebreak"/>hesitated before getting on, he drove angrily away.<a id="anchor_5"></a></p>
+</body>
+</html>`;
+
+    const result = engine.extractTranslatablePayload(xhtml);
+    assert.equal(result.blocks.length, 1);
+    const payload = result.blocks[0].slottedText;
+    assert.ok(!payload.includes('doc-pagebreak'), `Expected pagebreak span stripped, got: ${payload}`);
+    assert.ok(!payload.includes('<span'), `Expected no raw empty span in payload, got: ${payload}`);
+    assert.ok(!payload.includes('<a id="anchor_5"'), `Expected empty anchor stripped, got: ${payload}`);
+    assert.ok(
+      payload.includes('because I hesitated before getting on'),
+      `Expected clean sentence without tag interruption, got: ${payload}`
+    );
+    console.log('[OK] Slice 1: Mid-paragraph pagebreak/empty anchor stripping');
+  }
+
+  // Slice 2 (Seam 2): Orphan [^id] without backing definition must NOT emit empty <aside> or noteref links
+  {
+    const xhtml = `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<body>
+  <p class="CO" id="ch1">A bus came which was going to the ferry, but because I hesitated before getting on, he drove angrily away.</p>
+</body>
+</html>`;
+
+    const hallucinatedTranslation = '来了一辆去渡轮的公交车，因为我在上车前[^1]犹豫了[^2]，他生气地开走。';
+    const mutatedBilingual = engine.mutateDomInPlace(xhtml, hallucinatedTranslation, {
+      internalizedFootnotes: {},
+      translatedFootnotes: {},
+      bilingualMode: 'source_first'
+    });
+
+    assert.ok(!mutatedBilingual.includes('<aside'), `Expected no empty <aside> in bilingual output, got:\n${mutatedBilingual}`);
+    assert.ok(!mutatedBilingual.includes('epub:type="noteref"'), `Expected no noteref link for orphan [^1], got:\n${mutatedBilingual}`);
+    assert.ok(!mutatedBilingual.includes('[^1]') && !mutatedBilingual.includes('[^2]'), `Expected orphan [^id] stripped, got:\n${mutatedBilingual}`);
+
+    const epubService = new EpubService();
+    const renderedFallback = await epubService.renderBilingualChapterEpub3Html(
+      hallucinatedTranslation,
+      {},
+      {},
+      'A bus came which was going to the ferry.',
+      'source_first'
+    );
+    assert.ok(!renderedFallback.includes('<aside'), `Expected no empty <aside> in renderBilingualChapterEpub3Html, got:\n${renderedFallback}`);
+    assert.ok(!renderedFallback.includes('epub:type="noteref"'), `Expected no noteref in renderBilingualChapterEpub3Html, got:\n${renderedFallback}`);
+
+    console.log('[OK] Slice 2: Orphan [^id] suppressed (no empty <aside> or noteref)');
+  }
+
+  // Slice 3 (Seam 3): Chapter-opener body class (margin-top >= 2em, text-indent: 0, normal weight, font-size < 1.15em)
+  // must NOT be added to CSS headingSelectors, while genuine short headings still get data-translit-role="h1~h4"
+  {
+    const sampleCss = `
+      p.CO { font-size: 0.892em; font-weight: normal; margin-top: 5em; text-indent: 0em; text-align: justify; }
+      p.chap-big { font-size: 1.45em; font-weight: normal; text-indent: 0em; }
+    `;
+    const generatedCss = buildAdaptiveChineseTypographyCss([sampleCss]);
+
+    // Extract the heading rule block
+    const headingRuleMatch = generatedCss.match(/\/\*\s*Semantic Headings & Publisher Pseudo-Headings\s*\*\/\s*([\s\S]*?)\{/);
+    assert.ok(headingRuleMatch, 'Expected heading rule block in generated CSS');
+    const headingSelectorBlock = headingRuleMatch[1];
+
+    assert.ok(
+      !headingSelectorBlock.includes('.CO'),
+      `Expected .CO NOT to be in headingSelectors, got:\n${headingSelectorBlock}`
+    );
+    assert.ok(
+      headingSelectorBlock.includes('.chap-big'),
+      `Expected .chap-big (font-size >= 1.15em) to remain in headingSelectors`
+    );
+    assert.ok(
+      generatedCss.includes(':not(.CO)'),
+      `Expected .CO to remain protected in noIndentClasses (:not(.CO))`
+    );
+
+    // Verify DOM node-level stamping still promotes a short centered/large heading while keeping long p.CO as body
+    const profiles = parseEpubCssProfiles([sampleCss]);
+    const chapterHtml = `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+  <p style="font-size: 1.4em; font-weight: bold; text-align: center;">Part One</p>
+  <p class="CO">A book about how difficult it is to change, why we don’t want to, and what is going on in our brain. A book can be about more than one thing.</p>
+</body>
+</html>`;
+    const mutated = engine.mutateDomInPlace(chapterHtml, '第一部分\n\n一本关于改变有多难的书。', {
+      cssProfiles: profiles,
+      bilingualMode: 'none'
+    });
+    assert.ok(mutated.includes('data-translit-role="h1"') || mutated.includes('data-translit-role="h2"'), 'Expected short heading to get data-translit-role="h1/h2"');
+    assert.ok(mutated.includes('<p class="CO" data-translit-role="body">'), `Expected long p.CO to get data-translit-role="body", got:\n${mutated}`);
+
+    console.log('[OK] Slice 3: Body class p.CO not misclassified as heading in CSS or DOM');
+  }
+}
+
+runTests().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

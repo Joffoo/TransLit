@@ -1,17 +1,16 @@
 
-import { AppConfig, FootnoteNode } from "../types";
+import { AppConfig, FootnoteNode, TokenUsage } from "../types";
 import { 
     TRANSLATION_PROMPT_NOTES, 
     TRANSLATION_PROMPT_GLOSSARY_PRINCIPLES, 
     GLOSSARY_OPTIMIZER_ALL_PROMPT,
     GLOSSARY_OPTIMIZER_INCREMENTAL_PROMPT,
-    TWO_STEP_BASE_PROMPT,
     FMT_ONE_STEP_GLOSSARY,
     FMT_TWO_STEP_GLOSSARY,
     FMT_TWO_STEP_NO_GLOSSARY,
     FMT_ONE_STEP_NO_GLOSSARY
 } from "../prompts";
-import { parseGlossaryStr, glossaryToOutputStr } from "../utils/glossaryUtils";
+import { parseGlossaryStr, glossaryToOutputStr, filterGlossaryDeltaByPosterior, reconcileGlossaryDrift, GlossaryDriftFix } from "../utils/glossaryUtils";
 import {
   FootnotePool,
   TranslatedFootnote,
@@ -19,16 +18,100 @@ import {
   validateAndRepairSlots
 } from "./footnotePool";
 import { LightweightPagePayload, LightweightAiVerdict } from "./pageClassifier";
-import Fuse from 'fuse.js';
+
+/**
+ * Splits text into manageable chunks respecting paragraph and line boundaries.
+ */
+export function splitTextIntoChunks(text: string, customSize: number = 3000): string[] {
+  const size = customSize > 0 ? customSize : 3000;
+  if (!text || text.length <= size) return [text];
+
+  const chunks: string[] = [];
+  let currentChunk = '';
+
+  const paragraphs = text.split(/\n\n/);
+
+  for (const paragraph of paragraphs) {
+    if ((currentChunk.length + paragraph.length + 2) > size) {
+      if (currentChunk) {
+        chunks.push(currentChunk);
+        currentChunk = '';
+      }
+
+      if (paragraph.length > size) {
+        const lines = paragraph.split('\n');
+        let currentLineChunk = '';
+
+        for (const line of lines) {
+          if ((currentLineChunk.length + line.length + 1) > size) {
+            if (currentLineChunk) {
+              chunks.push(currentLineChunk);
+              currentLineChunk = '';
+            }
+            if (line.length > size) {
+              let remaining = line;
+              while (remaining.length > 0) {
+                chunks.push(remaining.substring(0, size));
+                remaining = remaining.substring(size);
+              }
+            } else {
+              currentLineChunk = line;
+            }
+          } else {
+            currentLineChunk += (currentLineChunk ? '\n' : '') + line;
+          }
+        }
+        if (currentLineChunk) chunks.push(currentLineChunk);
+      } else {
+        currentChunk = paragraph;
+      }
+    } else {
+      currentChunk += (currentChunk ? '\n\n' : '') + paragraph;
+    }
+  }
+
+  if (currentChunk) {
+    chunks.push(currentChunk);
+  }
+
+  return chunks;
+}
+
+export function extractTokenUsage(data: any): TokenUsage | undefined {
+  const u = data?.usage;
+  if (!u || typeof u !== 'object') return undefined;
+
+  const promptTokens = Number(u.prompt_tokens ?? u.input_tokens ?? 0) || 0;
+  const cachedTokens = Number(
+    u.prompt_tokens_details?.cached_tokens ??
+    u.prompt_cache_hit_tokens ??
+    u.cache_read_input_tokens ??
+    u.cached_content_token_count ??
+    0
+  ) || 0;
+  const completionTokens = Number(u.completion_tokens ?? u.output_tokens ?? 0) || 0;
+  const reasoningTokens = Number(u.completion_tokens_details?.reasoning_tokens ?? 0) || 0;
+  const totalTokens = Number(u.total_tokens ?? (promptTokens + completionTokens)) || 0;
+
+  return {
+    promptTokens,
+    cachedTokens,
+    completionTokens,
+    reasoningTokens,
+    totalTokens
+  };
+}
 
 export class AiService {
   // Safe chunk size to avoid context limits (approx 3000 chars)
   private CHUNK_SIZE = 3000;
   private config: AppConfig;
   private defaultFootnotePool = new FootnotePool();
+  private onUsage?: (usage: TokenUsage) => void;
 
-  constructor(config: AppConfig) {
+  constructor(config: AppConfig, onUsage?: (usage: TokenUsage) => void) {
     this.config = config;
+    this.onUsage = onUsage;
   }
 
   /**
@@ -78,11 +161,12 @@ export class AiService {
   }
 
   /**
-   * Cleans newly added terms against a master glossary.
+   * Cleans newly added terms by filtering out generic words and noise.
+   * Exact/case-insensitive deduplication against master glossary is handled locally.
    */
-  async optimizeIncrementalGlossary(newTermsText: string, masterGlossaryText: string): Promise<string> {
+  async optimizeIncrementalGlossary(newTermsText: string, _masterGlossaryText?: string): Promise<string> {
       try {
-          const prompt = `MASTER GLOSSARY:\n${masterGlossaryText || "(Empty)"}\n\nNEW CANDIDATES:\n${newTermsText}`;
+          const prompt = `NEW CANDIDATES:\n${newTermsText}`;
           const result = await this.generate(prompt, GLOSSARY_OPTIMIZER_INCREMENTAL_PROMPT, 0.2);
           return result.translation;
       } catch (error) {
@@ -106,13 +190,28 @@ export class AiService {
           throw error;
       }
       
-      const errString = String(error) + (typeof error === 'object' ? JSON.stringify(error) : '');
-      const isRateLimit = errString.includes('429');
-      const isAuthError = errString.includes('401') || errString.includes('403');
+      const status = typeof error?.status === 'number' ? error.status : undefined;
+      let errDetail = '';
+      try {
+        errDetail = typeof error === 'object' ? JSON.stringify(error) : '';
+      } catch {
+        errDetail = '';
+      }
+      const errString = `${error?.message || String(error)} ${errDetail}`;
+      const isAuthError =
+        status === 401 ||
+        status === 403 ||
+        /\b(?:API Error|HTTP|status)\s*[:=]?\s*(?:401|403)\b/i.test(errString);
 
       if (isAuthError) throw error; // Never retry auth errors
 
-      const isEmptyOrBadRequest = errString.includes('400') || errString.includes('empty response');
+      const isRateLimit =
+        status === 429 ||
+        /\b(?:API Error|HTTP|status)\s*[:=]?\s*429\b/i.test(errString);
+      const isEmptyOrBadRequest =
+        status === 400 ||
+        /\b(?:API Error|HTTP|status)\s*[:=]?\s*400\b/i.test(errString) ||
+        errString.toLowerCase().includes('empty response');
       
       // Allow exactly 1 retry for empty responses or 400 errors.
       // Since default retries is 3, if retries <= 2, we've already retried once.
@@ -139,59 +238,7 @@ export class AiService {
    * Splits text into manageable chunks.
    */
   public splitTextIntoChunks(text: string, customSize?: number): string[] {
-    const size = customSize || this.CHUNK_SIZE;
-    if (!text || text.length <= size) return [text];
-
-    const chunks: string[] = [];
-    let currentChunk = '';
-    
-    const paragraphs = text.split(/\n\n/);
-
-    for (const paragraph of paragraphs) {
-      if ((currentChunk.length + paragraph.length + 2) > size) {
-        if (currentChunk) {
-          chunks.push(currentChunk);
-          currentChunk = '';
-        }
-
-        if (paragraph.length > size) {
-           const lines = paragraph.split('\n');
-           let currentLineChunk = '';
-           
-           for (const line of lines) {
-             if ((currentLineChunk.length + line.length + 1) > size) {
-                if (currentLineChunk) {
-                    chunks.push(currentLineChunk);
-                    currentLineChunk = '';
-                }
-                if (line.length > size) {
-                    let remaining = line;
-                    while (remaining.length > 0) {
-                        chunks.push(remaining.substring(0, size));
-                        remaining = remaining.substring(size);
-                    }
-                } else {
-                    currentLineChunk = line;
-                }
-             } else {
-                currentLineChunk += (currentLineChunk ? '\n' : '') + line;
-             }
-           }
-           if (currentLineChunk) chunks.push(currentLineChunk);
-
-        } else {
-           currentChunk = paragraph;
-        }
-      } else {
-        currentChunk += (currentChunk ? '\n\n' : '') + paragraph;
-      }
-    }
-    
-    if (currentChunk) {
-      chunks.push(currentChunk);
-    }
-
-    return chunks;
+    return splitTextIntoChunks(text, customSize || this.CHUNK_SIZE);
   }
 
   /**
@@ -295,7 +342,7 @@ export class AiService {
       prompt: string, 
       systemInstruction: string, 
       temperature: number = 0.3
-  ): Promise<{ translation: string; glossary?: string }> {
+  ): Promise<{ translation: string; glossary?: string; usage?: TokenUsage }> {
       const operation = async () => {
         if (!this.config.apiKey) throw new Error("API Key is required.");
         if (!this.config.baseUrl) throw new Error("Base URL is required.");
@@ -318,8 +365,9 @@ export class AiService {
             "Content-Type": "application/json",
             "Authorization": `Bearer ${this.config.apiKey}`
         };
-        const fetchUrl = import.meta.env.DEV ? '/__api_proxy' : url;
-        if (import.meta.env.DEV) headers["X-Target-Url"] = url;
+        const isViteDev = Boolean(import.meta.env?.DEV);
+        const fetchUrl = isViteDev ? '/__api_proxy' : url;
+        if (isViteDev) headers["X-Target-Url"] = url;
 
         const response = await fetch(fetchUrl, {
             method: "POST",
@@ -329,7 +377,9 @@ export class AiService {
 
         if (!response.ok) {
             const errText = await response.text();
-            throw new Error(`API Error ${response.status}: ${errText}`);
+            const err = new Error(`API Error ${response.status}: ${errText}`);
+            (err as any).status = response.status;
+            throw err;
         }
 
         const data = await response.json();
@@ -338,11 +388,51 @@ export class AiService {
         if (!content) {
              throw new Error("Received empty response from API");
         }
-        
-        return this.parseResponse(content);
+
+        const usage = extractTokenUsage(data);
+        if (usage && this.onUsage) {
+          this.onUsage(usage);
+        }
+
+        return { ...this.parseResponse(content), usage };
       };
 
       return this.retry(operation);
+  }
+
+  /**
+   * Fetches available model IDs from an OpenAI-compatible GET /models endpoint.
+   */
+  async fetchModels(): Promise<string[]> {
+    if (!this.config.apiKey) throw new Error("API Key is required.");
+    if (!this.config.baseUrl) throw new Error("Base URL is required.");
+
+    const url = `${this.config.baseUrl.replace(/\/$/, '')}/models`;
+    const headers: Record<string, string> = {
+      "Authorization": `Bearer ${this.config.apiKey}`
+    };
+    const isViteDev = Boolean(import.meta.env?.DEV);
+    const fetchUrl = isViteDev ? '/__api_proxy' : url;
+    if (isViteDev) headers["X-Target-Url"] = url;
+
+    const response = await fetch(fetchUrl, { method: "GET", headers });
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`API Error ${response.status}: ${errText}`);
+    }
+
+    const data = await response.json();
+    const list: any[] = Array.isArray(data?.data)
+      ? data.data
+      : Array.isArray(data)
+        ? data
+        : [];
+
+    const ids = list
+      .map((item) => (typeof item === 'string' ? item : item?.id))
+      .filter((id): id is string => typeof id === 'string' && id.trim().length > 0);
+
+    return Array.from(new Set(ids)).sort((a, b) => a.localeCompare(b));
   }
 
   /**
@@ -363,111 +453,34 @@ export class AiService {
   private mergeGlossary(base: string, delta: string): string {
     const baseMap = parseGlossaryStr(base);
     const deltaMap = parseGlossaryStr(delta);
-    const merged = { ...baseMap, ...deltaMap };
+    // Preserve established base entries & insertion order (append-only for Prefix Caching)
+    const merged: Record<string, string> = { ...baseMap };
+    const seenLower = new Set(Object.keys(baseMap).map(k => k.toLowerCase()));
+    for (const [k, v] of Object.entries(deltaMap)) {
+      const lower = k.toLowerCase();
+      if (!seenLower.has(lower)) {
+        seenLower.add(lower);
+        merged[k] = v;
+      }
+    }
     return glossaryToOutputStr(merged);
   }
 
   /**
    * Filters candidate terms in deltaGlossary by searching posterior text.
-   * 1. Strips out terms already present in currentGlossary (avoids duplicate trigger).
-   * 2. If posteriorText is empty (e.g. final chapter), keeps all remaining terms (last chapter safety).
-   * 3. Performs fast O(N) substring and prefix/word checks with .toLowerCase().
+   * Delegates to filterGlossaryDeltaByPosterior for case-insensitive deduplication,
+   * word-boundary matching, morphological variants, and pre-lowercased text reuse.
    */
   private filterDeltaByPosterior(
-    deltaGlossaryText: string, 
-    currentGlossaryText: string, 
-    posteriorText: string
+    deltaGlossaryText: string,
+    currentGlossaryText: string,
+    posteriorTextOrPrecomputed: string | { lowerTexts: string[] }
   ): { filteredText: string; originalCount: number; filteredCount: number } {
-    if (!deltaGlossaryText) return { filteredText: "", originalCount: 0, filteredCount: 0 };
-
-    const deltaMap = parseGlossaryStr(deltaGlossaryText);
-    const currentMap = parseGlossaryStr(currentGlossaryText);
-    
-    const deltaEntries = Object.entries(deltaMap);
-    const originalCount = deltaEntries.length;
-    if (originalCount === 0) return { filteredText: "", originalCount: 0, filteredCount: 0 };
-
-    // 1. Exclude terms already in currentGlossary
-    const newCandidates: [string, string][] = [];
-    deltaEntries.forEach(([key, val]) => {
-      if (!currentMap[key]) {
-        newCandidates.push([key, val]);
-      }
-    });
-
-    // 2. Final Chapter Safety: if no posterior text, keep all new candidates
-    const trimmedPosterior = posteriorText ? posteriorText.trim() : "";
-    if (!trimmedPosterior) {
-      const filteredMap: Record<string, string> = {};
-      newCandidates.forEach(([k, v]) => filteredMap[k] = v);
-      return {
-        filteredText: glossaryToOutputStr(filteredMap),
-        originalCount,
-        filteredCount: newCandidates.length
-      };
-    }
-
-    // 3. Fast O(N) Substring & Fallback Check
-    const lowerPosterior = trimmedPosterior.toLowerCase();
-    const keptMap: Record<string, string> = {};
-
-    newCandidates.forEach(([key, val]) => {
-      const lowerKey = key.toLowerCase();
-
-      // Direct Substring Check (covers CJK prefix/suffix & English singular in plural)
-      if (lowerPosterior.includes(lowerKey)) {
-        keptMap[key] = val;
-        console.log(`[Glossary Filter] ✅ Term "${key}" kept (found in posterior text).`);
-        return;
-      }
-
-      // Reverse Deformation Check (Prefix fallback for keys of length >= 4)
-      if (lowerKey.length >= 4) {
-        const prefix = lowerKey.substring(0, lowerKey.length - 1);
-        if (lowerPosterior.includes(prefix)) {
-          keptMap[key] = val;
-          console.log(`[Glossary Filter] ✅ Term "${key}" kept via prefix "${prefix}".`);
-          return;
-        }
-      }
-
-      // Multi-word splitting fallback for English phrases (e.g. "Alexander Pierce")
-      const words = key.split(/\s+/).filter(w => w.length >= 4);
-      if (words.length > 1) {
-        for (const word of words) {
-          if (lowerPosterior.includes(word.toLowerCase())) {
-            keptMap[key] = val;
-            console.log(`[Glossary Filter] ✅ Term "${key}" kept via component word "${word}".`);
-            return;
-          }
-        }
-      }
-
-      console.log(`[Glossary Filter] 🗑️ Term "${key}" dropped (not found in posterior text).`);
-    });
-
-    const filteredCount = Object.keys(keptMap).length;
-    return {
-      filteredText: glossaryToOutputStr(keptMap),
-      originalCount,
-      filteredCount
-    };
-  }
-
-  /**
-   * Performs AI-based optimization for redundancy and quality.
-   */
-  async smartCleanupGlossary(glossaryText: string, referenceText: string): Promise<string> {
-    console.log(`[Smart Cleanup] Starting AI optimization...`);
-    try {
-        const optimizedText = await this.optimizeGlossary(glossaryText);
-        const finalMap = parseGlossaryStr(optimizedText);
-        console.log(`[Smart Cleanup] Optimization complete. Refined to ${Object.keys(finalMap).length} terms.`);
-        return optimizedText;
-    } catch (error) {
-        console.warn(`[Smart Cleanup] Optimization failed, returning original.`, error);
-        return glossaryText;
-    }
+    return filterGlossaryDeltaByPosterior(
+      deltaGlossaryText,
+      currentGlossaryText,
+      posteriorTextOrPrecomputed
+    );
   }
 
   async translateContent(
@@ -481,7 +494,8 @@ export class AiService {
       updatedGlossary?: string,
       isFallback?: boolean,
       stats?: { originalCount: number; filteredCount: number },
-      chunkFootnotes?: Record<string, string>
+      chunkFootnotes?: Record<string, string>,
+      chunkUsage?: TokenUsage
     ) => Promise<void | string>,
     existingChunks: string[] = [],
     indicesToRetry: number[] = [],
@@ -489,13 +503,16 @@ export class AiService {
     fullPosteriorText: string = "",
     internalizedFootnotes: Record<string, FootnoteNode> = {},
     footnotePool?: FootnotePool
-  ): Promise<{ content: string; glossary: string; translatedFootnotes: Record<string, string> }> {
+  ): Promise<{ content: string; glossary: string; translatedFootnotes: Record<string, string>; driftFixes: GlossaryDriftFix[] }> {
     
     const activePool = footnotePool || this.defaultFootnotePool;
     const customChunkSize = this.config.enableProofreading ? 1800 : this.CHUNK_SIZE;
     const chunks = this.splitTextIntoChunks(content, customChunkSize);
+    const lowerChunks = chunks.map(c => c.toLowerCase());
+    const lowerFullPosterior = fullPosteriorText ? fullPosteriorText.trim().toLowerCase() : "";
     const translatedChunks: string[] = [...existingChunks];
     const chapterTranslatedFootnotes: Record<string, string> = {};
+    const chapterDriftFixes: GlossaryDriftFix[] = [];
 
     // Ensure array is large enough
     while (translatedChunks.length < chunks.length) {
@@ -543,9 +560,8 @@ export class AiService {
             }
         }
 
-        const chunkInstruction = chunks.length > 1
-            ? `${baseSystemInstruction}\n\n[System Note: This is part ${i + 1} of ${chunks.length} of the chapter. Maintain strict terminology and stylistic consistency with previous parts.]${glossaryPrompt}`
-            : `${baseSystemInstruction}${glossaryPrompt}`;
+        // Keep system prompt prefix stable (append-only glossary) for API Prefix Caching
+        const chunkInstruction = `${baseSystemInstruction}${glossaryPrompt}`;
 
         // Inspect __FN_REF_{id}__ slots in this chunk and prepare dual-channel footnotes via FootnotePool
         const slotIds = Array.from(new Set(extractFootnoteSlots(chunk)));
@@ -593,7 +609,11 @@ export class AiService {
             referenceOnlyFootnotes
         );
 
-        const prompt = `Translate the following Markdown content into ${targetLanguage}. \n\nCONTENT:\n${effectiveChunkPayload}`;
+        const chunkPartNote = chunks.length > 1
+            ? `[Note: This is part ${i + 1} of ${chunks.length} of the chapter. Maintain strict terminology and stylistic consistency with previous parts.]\n\n`
+            : '';
+
+        const prompt = `${chunkPartNote}Translate the following text into ${targetLanguage}. Return clean paragraph prose without markdown headings or blockquote markers.\n\nCONTENT:\n${effectiveChunkPayload}`;
 
         try {
             const result = await this.generate(prompt, chunkInstruction, 0.3);
@@ -621,29 +641,53 @@ export class AiService {
                 chunkFootnotes[cleanId] = trText;
             }
 
-            const finalChunkText =
+            let finalChunkText =
                 pendingFootnotes.length > 0 || referenceOnlyFootnotes.length > 0
                     ? parsedDual.translatedBody
                     : validateAndRepairSlots(chunk, result.translation).repairedText;
 
-            translatedChunks[i] = finalChunkText;
             let deltaGlossary = result.glossary || "";
             let stats = { originalCount: 0, filteredCount: 0 };
             
             if (this.config.enableGlossary && deltaGlossary) {
-                const chapterPosterior = chunks.slice(i + 1).join('\n');
-                const combinedPosterior = chapterPosterior + '\n' + fullPosteriorText;
-                const filterRes = this.filterDeltaByPosterior(deltaGlossary, currentGlossary, combinedPosterior);
+                const driftRes = reconcileGlossaryDrift(finalChunkText, deltaGlossary, currentGlossary, chunkFootnotes);
+                if (driftRes.fixes.length > 0) {
+                    finalChunkText = driftRes.fixedText;
+                    for (const [fnId, fixedNoteText] of Object.entries(chunkFootnotes)) {
+                        chapterTranslatedFootnotes[fnId] = fixedNoteText;
+                        const fnNode = internalizedFootnotes[fnId] || internalizedFootnotes[`fn-${fnId}`];
+                        const existingPoolEntry = activePool.getTranslatedFootnote(fnId, fnNode?.key);
+                        activePool.setTranslatedFootnote({
+                            footnoteId: fnId,
+                            canonicalKey: existingPoolEntry?.canonicalKey || fnNode?.key,
+                            originalText: existingPoolEntry?.originalText || fnNode?.plainText || fixedNoteText,
+                            translatedText: fixedNoteText,
+                            translatedParagraphs: fixedNoteText
+                                .split(/\n{2,}/)
+                                .map((p) => p.trim())
+                                .filter(Boolean),
+                            wasOversizedShunted: existingPoolEntry?.wasOversizedShunted || false
+                        });
+                    }
+                    chapterDriftFixes.push(...driftRes.fixes);
+                }
+
+                const lowerChapterPosterior = lowerChunks.slice(i + 1).join('\n');
+                const filterRes = this.filterDeltaByPosterior(deltaGlossary, currentGlossary, {
+                    lowerTexts: [lowerChapterPosterior, lowerFullPosterior]
+                });
                 deltaGlossary = filterRes.filteredText;
                 stats = { originalCount: filterRes.originalCount, filteredCount: filterRes.filteredCount };
             }
+
+            translatedChunks[i] = finalChunkText;
 
             if (deltaGlossary) {
                 currentGlossary = this.mergeGlossary(currentGlossary, deltaGlossary);
             }
             
             if (onProgress) {
-                const syncedGlossary = await onProgress(i + 1, chunks.length, finalChunkText, deltaGlossary, false, stats, chunkFootnotes);
+                const syncedGlossary = await onProgress(i + 1, chunks.length, finalChunkText, deltaGlossary, false, stats, chunkFootnotes, result.usage);
                 if (typeof syncedGlossary === 'string') {
                     currentGlossary = syncedGlossary;
                 }
@@ -682,67 +726,8 @@ export class AiService {
     return { 
         content: translatedChunks.join('\n\n'),
         glossary: currentGlossary,
-        translatedFootnotes: chapterTranslatedFootnotes
+        translatedFootnotes: chapterTranslatedFootnotes,
+        driftFixes: chapterDriftFixes
     };
-  }
-
-  async proofreadContent(
-    content: string, 
-    instruction: string,
-    onProgress?: (current: number, total: number, chunkResult: string, isFallback?: boolean) => Promise<void>,
-    existingChunks: string[] = [],
-    indicesToRetry: number[] = []
-  ): Promise<string> {
-    
-    const chunks = this.splitTextIntoChunks(content);
-    const proofreadChunks: string[] = [...existingChunks];
-
-    while (proofreadChunks.length < chunks.length) {
-        proofreadChunks.push("");
-    }
-
-    const proofreadChunk = async (i: number) => {
-        if (i > 0) {
-            await new Promise(resolve => setTimeout(resolve, 500));
-        }
-
-        const chunk = chunks[i];
-        const prompt = `Check the following Markdown content. ${instruction}\n\nCONTENT:\n${chunk}`;
-        
-        try {
-            const result = await this.generate(prompt, "You are a specialized proofreading assistant. Return ONLY the proofread Markdown.", 0.1);
-            proofreadChunks[i] = result.translation; // result is now an object
-            
-            if (onProgress) {
-                await onProgress(i + 1, chunks.length, result.translation);
-            }
-        } catch (error) {
-            if (error instanceof Error && error.message === "PAUSE_SIGNAL") {
-                throw error;
-            }
-            console.error(`Error proofreading chunk ${i + 1}/${chunks.length}:`, error);
-            proofreadChunks[i] = chunk;
-            if (onProgress) {
-                await onProgress(i + 1, chunks.length, chunk, true);
-            }
-        }
-    };
-
-    const startIndex = existingChunks.length > 0 ? existingChunks.findIndex(c => !c) : 0;
-    const start = startIndex === -1 ? existingChunks.length : startIndex;
-
-    for (let i = start; i < chunks.length; i++) {
-        if (i >= existingChunks.length || !existingChunks[i]) {
-            await proofreadChunk(i);
-        }
-    }
-
-    for (const i of indicesToRetry) {
-        if (i < chunks.length) {
-            await proofreadChunk(i);
-        }
-    }
-
-    return proofreadChunks.join('\n\n');
   }
 }

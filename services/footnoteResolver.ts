@@ -21,10 +21,10 @@ export interface FootnoteResolutionResult {
   zeroOffsetPlaceholders: Record<string, string>; // keyed by normalizedFilePath
 }
 
-const FOOTNOTE_ATTR_PATTERN = /(?:^|[\s_-])(fn|footnote|footnotes|endnote|endnotes|rearnote|note|noteref|doc-footnote|doc-endnote|doc-endnotes|doc-noteref|fnlist)(?:$|[\s_-]|\d)/i;
 const FOOTNOTE_CONTAINER_ATTR_PATTERN = /(?:^|[\s_-])(fn|footnote|footnotes|endnote|endnotes|rearnote|doc-footnote|doc-endnote|doc-endnotes|fnlist)(?:$|[\s_-]|\d)/i;
-const FOOTNOTE_ID_PREFIX_PATTERN = /^(fn|footnote|endnote|rearnote|note|en|nt|ftn)[-_:]?\d+[a-z]?$/i;
-const NON_FOOTNOTE_ID_PATTERN = /(backlink|backref|fnref|noteref|ref|page|pg|fig|img|tbl|table|idx|index|desc|longdesc|det|chap|chapter|sec|section|part|hd|heading|toc|nav|cover)/i;
+const FOOTNOTE_ID_PREFIX_PATTERN = /^(fn|footnote|endnote|rearnote|note|en|nt|ftn)[-_:]?(\d+|(?=[mdclxvi])m*(c[md]|d?c*)(x[cl]|l?x*)(i[xv]|v?i*))[a-z]?$/i;
+const PURE_STRUCTURAL_ID_PATTERN = /^(page|pg|fig|img|tbl|table|idx|index|ind|desc|longdesc|det|chap|chapter|sec|section|part|hd|heading|toc|nav|cover)[-_:]?\d*$/i;
+const BACKLINK_ID_PATTERN = /(backlink|backref|fnref|noteref|_rnt|rnt-)/i;
 const FOOTNOTE_FILE_PATTERN = /(?:^|\/|[a-z0-9_-]*[_-])(notes?|endnotes?|footnotes?|_?fn\d*)(?:[_-]split[_-]\d+|[-_]?\d*)\.(xhtml|html|xml|htm)$/i;
 const HEADING_OR_SEPARATOR_TAGS = new Set(['H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'HR', 'NAV', 'SECTION']);
 const STRUCTURAL_CONTAINER_TAGS = new Set([
@@ -67,13 +67,16 @@ export class FootnoteResolver {
       : Object.keys(normalizedFiles)
     ).filter((f) => normalizedFiles[f] !== undefined);
 
+    const docCache = new Map<string, Document>();
+
     // Step 1: Collect all incoming anchor targets across all files
-    const incomingLinkTargets = this.collectIncomingTargets(normalizedFiles);
+    const incomingLinkTargets = this.collectIncomingTargets(normalizedFiles, docCache);
 
     // Step 2: Scan all files to build the global footnote topology index
     const { topology, extractedElementsByFile } = this.scanTopologyWithElements(
       normalizedFiles,
-      incomingLinkTargets
+      incomingLinkTargets,
+      docCache
     );
 
     // Step 3: Internalize footnote references in each chapter first so we know
@@ -99,7 +102,8 @@ export class FootnoteResolver {
       normalizedFiles,
       topology,
       extractedElementsByFile,
-      incomingLinkTargets
+      incomingLinkTargets,
+      docCache
     );
 
     // Mark drained standalone footnote source chapters accordingly
@@ -123,7 +127,8 @@ export class FootnoteResolver {
       if (originalHtml) {
         zeroOffsetPlaceholders[sourceFile] = this.createZeroOffsetPlaceholder(
           originalHtml,
-          sourceFile
+          sourceFile,
+          docCache.get(sourceFile)
         );
       }
     }
@@ -136,6 +141,21 @@ export class FootnoteResolver {
     };
   }
 
+  private getParsedDoc(
+    filePath: string,
+    html: string,
+    docCache?: Map<string, Document>
+  ): Document {
+    if (docCache) {
+      const cached = docCache.get(filePath);
+      if (cached) return cached;
+      const parsed = parseHtmlDocument(html);
+      docCache.set(filePath, parsed);
+      return parsed;
+    }
+    return parseHtmlDocument(html);
+  }
+
   /**
    * Scans all XHTML files and returns the global footnote topology index:
    * Map<fileRelativePath + '#' + id, FootnoteNode>
@@ -145,8 +165,9 @@ export class FootnoteResolver {
     for (const [rawPath, content] of Object.entries(files)) {
       normalizedFiles[normalizeEpubFilePath(rawPath)] = content;
     }
-    const incomingLinkTargets = this.collectIncomingTargets(normalizedFiles);
-    return this.scanTopologyWithElements(normalizedFiles, incomingLinkTargets).topology;
+    const docCache = new Map<string, Document>();
+    const incomingLinkTargets = this.collectIncomingTargets(normalizedFiles, docCache);
+    return this.scanTopologyWithElements(normalizedFiles, incomingLinkTargets, docCache).topology;
   }
 
   private isNavigationOrIndexDoc(doc: Document, filePath: string): boolean {
@@ -161,11 +182,17 @@ export class FootnoteResolver {
     ) {
       return true;
     }
+    // Detect Calibre or custom EPUB index structures (e.g. <small>INDEX</small>, <div id="ind" class="chapter">)
+    const hText = (doc.querySelector('h1, h2, h3, small, .bm-title1a')?.textContent || '').trim().toLowerCase();
+    if (/^(index|索引|索 引)$/i.test(hText) || doc.querySelector('div#ind.chapter, #ind.chapter')) {
+      return true;
+    }
     return false;
   }
 
   private isFootnoteId(id: string): boolean {
-    if (!id || NON_FOOTNOTE_ID_PATTERN.test(id)) return false;
+    if (!id) return false;
+    if (BACKLINK_ID_PATTERN.test(id) || PURE_STRUCTURAL_ID_PATTERN.test(id)) return false;
     return FOOTNOTE_ID_PREFIX_PATTERN.test(id);
   }
 
@@ -187,7 +214,8 @@ export class FootnoteResolver {
   }
 
   private collectIncomingTargets(
-    normalizedFiles: Record<string, string>
+    normalizedFiles: Record<string, string>,
+    docCache?: Map<string, Document>
   ): Map<string, Set<string>> {
     // Map<targetKey (file#id), Set<sourceFile>>
     const targets = new Map<string, Set<string>>();
@@ -197,7 +225,7 @@ export class FootnoteResolver {
         // Links inside standalone notes/endnotes files pointing to chapters are backlinks, not incoming footnote citations
         continue;
       }
-      const doc = parseHtmlDocument(html);
+      const doc = this.getParsedDoc(filePath, html, docCache);
       if (this.isNavigationOrIndexDoc(doc, filePath)) {
         continue;
       }
@@ -216,7 +244,7 @@ export class FootnoteResolver {
         if (!href || !href.includes('#')) continue;
         const { filePath: targetFile, hash } = resolveRelativeEpubHref(filePath, href);
         if (!targetFile || !hash) continue;
-        if (NON_FOOTNOTE_ID_PATTERN.test(hash)) continue;
+        if (BACKLINK_ID_PATTERN.test(hash)) continue;
         if (/longdesc\.(xhtml|html|htm|xml)$/i.test(targetFile)) continue;
 
         const key = `${targetFile}#${hash}`;
@@ -232,7 +260,8 @@ export class FootnoteResolver {
 
   private scanTopologyWithElements(
     normalizedFiles: Record<string, string>,
-    incomingLinkTargets: Map<string, Set<string>>
+    incomingLinkTargets: Map<string, Set<string>>,
+    docCache?: Map<string, Document>
   ): {
     topology: Map<string, FootnoteNode>;
     extractedElementsByFile: Map<string, Set<Element>>;
@@ -241,7 +270,7 @@ export class FootnoteResolver {
     const extractedElementsByFile = new Map<string, Set<Element>>();
 
     for (const [filePath, html] of Object.entries(normalizedFiles)) {
-      const doc = parseHtmlDocument(html);
+      const doc = this.getParsedDoc(filePath, html, docCache);
       if (this.isNavigationOrIndexDoc(doc, filePath)) {
         extractedElementsByFile.set(filePath, new Set());
         continue;
@@ -345,13 +374,23 @@ export class FootnoteResolver {
     if (HEADING_OR_SEPARATOR_TAGS.has(el.tagName) || STRUCTURAL_CONTAINER_TAGS.has(el.tagName)) {
       return false;
     }
-    if (NON_FOOTNOTE_ID_PATTERN.test(id)) {
+    if (BACKLINK_ID_PATTERN.test(id) || PURE_STRUCTURAL_ID_PATTERN.test(id)) {
+      return false;
+    }
+
+    // Never treat whole chapter wrapper divs, section containers, or index containers as footnote candidates
+    const className = el.getAttribute('class') || '';
+    if (
+      el.tagName === 'DIV' &&
+      (el.classList.contains('chapter') ||
+        /\b(chapter|part|section|index|notes)\b/i.test(className) ||
+        /^(ind|notes|ch\d+|part\d+)$/i.test(id))
+    ) {
       return false;
     }
 
     // Never treat an in-text noteref link or pagebreak marker as a footnote definition
     const epubType = el.getAttribute('epub:type') || el.getAttribute('role') || '';
-    const className = el.getAttribute('class') || '';
     if (
       /\b(noteref|doc-noteref|pagebreak|doc-pagebreak)\b/i.test(epubType) ||
       /\b(noteref|pagebreak)\b/i.test(className)
@@ -437,8 +476,8 @@ export class FootnoteResolver {
       if (
         /backlink|backref|doc-backlink/i.test(cls) ||
         /backlink|doc-backlink/i.test(role) ||
-        /^(↩|↑|↵|«|‹|\(?\[?\d+\]?\)?\.?|\*+|†|‡|§|back|return)$/i.test(text) ||
-        /#(fnref|noteref|ref|back|r\d)/i.test(href)
+        /^(↩|↑|↵|«|‹|\(?\[?(\d+|[ivxlcdm]+)\]?\)?\.?|\*+|†|‡|§|back|return)$/i.test(text) ||
+        /#(fnref|noteref|ref|back|_?rnt|r\d)/i.test(href)
       ) {
         return true;
       }
@@ -530,8 +569,13 @@ export class FootnoteResolver {
         break;
       }
 
-      // Only collect continuation block elements (<p>, <blockquote>, etc.)
-      if (sibling.tagName === 'P' || sibling.tagName === 'BLOCKQUOTE' || sibling.tagName === 'DIV') {
+      // Hard boundary: single footnote definition should not greedily swallow more than 5 continuation paragraphs
+      if (paragraphs.length >= 6) {
+        break;
+      }
+
+      // Only collect continuation block elements (<p>, <blockquote>, etc. NEVER raw structural <div>)
+      if (sibling.tagName === 'P' || sibling.tagName === 'BLOCKQUOTE') {
         const cleanedSib = this.cleanFootnoteParagraphNode(sibling);
         if (cleanedSib.text) {
           paragraphs.push(cleanedSib.text);
@@ -642,10 +686,11 @@ export class FootnoteResolver {
     const citationOccurrenceCount = new Map<string, number>();
     let uniqueCounter = 0;
 
-    // Collect same-page footnote definition IDs and their resolved definition blocks
-    // so we don't rewrite backlink anchors inside footnote definitions themselves
+    // Collect same-page footnote definition IDs and their resolved multi-paragraph blocks
+    // so we don't rewrite backlink anchors inside footnote definitions themselves and remove all continuation paragraphs
     const samePageFootnoteIds = new Set<string>();
     const samePageFootnoteBlocks = new Set<Element>();
+    const samePageCandidateMap = new Map<Element, string>();
     for (const [, node] of topology.entries()) {
       if (node.sourceFile === normalizedChapterFile) {
         samePageFootnoteIds.add(node.originalId);
@@ -653,10 +698,16 @@ export class FootnoteResolver {
         if (defEl) {
           const blockEl = this.resolveFootnoteStartBlock(defEl);
           if (!STRUCTURAL_CONTAINER_TAGS.has(blockEl.tagName)) {
-            samePageFootnoteBlocks.add(blockEl);
+            samePageCandidateMap.set(blockEl, node.originalId);
           }
         }
       }
+    }
+    const samePageBlocksByOrigId = new Map<string, Element[]>();
+    for (const [blockEl, origId] of samePageCandidateMap.entries()) {
+      const { consumed } = this.extractMultiParagraphFootnote(blockEl, origId, samePageCandidateMap);
+      samePageBlocksByOrigId.set(origId, consumed);
+      consumed.forEach((el) => samePageFootnoteBlocks.add(el));
     }
 
     const links = Array.from(doc.body?.querySelectorAll('a[href]') || []);
@@ -722,18 +773,32 @@ export class FootnoteResolver {
     }
 
     // If the chapter had same-page footnote definitions that were internalized,
-    // remove the original footnote definition DOM elements from the body so they
-    // aren't duplicated as body paragraphs during Markdown conversion
+    // remove all blocks belonging to internalized definitions (including multi-paragraph continuations)
+    // so they aren't duplicated as body paragraphs during extraction
     if (samePageFootnoteIds.size > 0 && Object.keys(internalizedFootnotes).length > 0) {
+      const internalizedOrigIds = new Set(
+        Object.values(internalizedFootnotes).map((n) => n.originalId)
+      );
       for (const origId of samePageFootnoteIds) {
-        const defEl = doc.getElementById(origId);
-        if (defEl) {
-          const blockEl = this.resolveFootnoteStartBlock(defEl);
-          // Do not remove if blockEl contains the noteref link itself!
-          if (!blockEl.querySelector('a[epub\\:type="noteref"], a.noteref')) {
-            const parentContainer = blockEl.parentElement;
-            blockEl.remove();
-            this.cleanupEmptyFootnoteContainers(parentContainer);
+        if (!internalizedOrigIds.has(origId)) continue;
+        const blocksToRemove = samePageBlocksByOrigId.get(origId);
+        if (blocksToRemove && blocksToRemove.length > 0) {
+          for (const blockEl of blocksToRemove) {
+            if (!blockEl.querySelector('a[epub\\:type="noteref"], a.noteref')) {
+              const parentContainer = blockEl.parentElement;
+              blockEl.remove();
+              this.cleanupEmptyFootnoteContainers(parentContainer);
+            }
+          }
+        } else {
+          const defEl = doc.getElementById(origId);
+          if (defEl) {
+            const blockEl = this.resolveFootnoteStartBlock(defEl);
+            if (!blockEl.querySelector('a[epub\\:type="noteref"], a.noteref')) {
+              const parentContainer = blockEl.parentElement;
+              blockEl.remove();
+              this.cleanupEmptyFootnoteContainers(parentContainer);
+            }
           }
         }
       }
@@ -805,7 +870,8 @@ export class FootnoteResolver {
     normalizedFiles: Record<string, string>,
     topology: Map<string, FootnoteNode>,
     extractedElementsByFile: Map<string, Set<Element>>,
-    incomingLinkTargets: Map<string, Set<string>>
+    incomingLinkTargets: Map<string, Set<string>>,
+    docCache?: Map<string, Document>
   ): Set<string> {
     const footnoteSourceFiles = new Set<string>();
 
@@ -843,7 +909,7 @@ export class FootnoteResolver {
       const html = normalizedFiles[filePath];
       if (!html) continue;
 
-      const doc = parseHtmlDocument(html);
+      const doc = this.getParsedDoc(filePath, html, docCache);
       const cloneBody = doc.body?.cloneNode(true) as HTMLElement | undefined;
       if (!cloneBody) continue;
 
@@ -865,10 +931,31 @@ export class FootnoteResolver {
       const isDedicatedFileName = FOOTNOTE_FILE_PATTERN.test(filePath);
 
       const remainingText = (cloneBody.textContent || '').replace(/\s+/g, ' ').trim();
+
+      // HARD DEFENSE LINE (Defense-in-depth):
+      // A file with substantial readable content (> 300 characters remaining) is an actual chapter
+      // (introduction, preface, or text section). It MUST NEVER be classified as a standalone footnote source,
+      // and MUST NEVER be replaced with a 0-Offset placeholder on export!
+      if (remainingText.length > 300) {
+        continue;
+      }
+
+      const headings = Array.from(doc.querySelectorAll('h1, h2, h3, small, .top, .title2, title'))
+        .map((el) => (el.textContent || '').trim());
+      const isNotesHeading = headings.some((h) =>
+        /^(translator[’'s\s]*)?(notes?|endnotes?|footnotes?|注释|尾注|注)$/i.test(h)
+      );
+      const isDedicatedNoteFile = isDedicatedFileName || isNotesHeading;
+
+      const isHighDensityFootnoteFile =
+        consumedCount / totalBodyBlocks >= 0.85 &&
+        nodes.length >= 3 &&
+        remainingText.length < 50;
+
       if (
-        (isDedicatedFileName && crossFileReferencedCount >= nodes.length * 0.5) ||
-        remainingText.length < 80 ||
-        consumedCount / totalBodyBlocks >= 0.7
+        (isDedicatedNoteFile && crossFileReferencedCount >= nodes.length * 0.5) ||
+        (isDedicatedNoteFile && remainingText.length < 80) ||
+        isHighDensityFootnoteFile
       ) {
         footnoteSourceFiles.add(filePath);
       }
@@ -877,26 +964,49 @@ export class FootnoteResolver {
     return footnoteSourceFiles;
   }
 
+  private escapeXml(unsafe: string): string {
+    return String(unsafe).replace(/[<>&'"]/g, (c) => {
+      switch (c) {
+        case '<':
+          return '&lt;';
+        case '>':
+          return '&gt;';
+        case '&':
+          return '&amp;';
+        case "'":
+          return '&apos;';
+        case '"':
+          return '&quot;';
+        default:
+          return c;
+      }
+    });
+  }
+
   /**
    * Generates a 0-Offset XHTML placeholder for a drained standalone footnote file.
    * Preserves valid XHTML structure and any root/heading IDs so content.opf (Manifest/Spine)
    * and navigation files (toc.ncx / nav.xhtml) never encounter missing files or dead anchors.
    */
-  public createZeroOffsetPlaceholder(originalXhtml: string, fileName?: string): string {
-    const doc = parseHtmlDocument(originalXhtml);
+  public createZeroOffsetPlaceholder(
+    originalXhtml: string,
+    _fileName?: string,
+    cachedDoc?: Document
+  ): string {
+    const doc = cachedDoc || parseHtmlDocument(originalXhtml);
     const titleText =
       doc.querySelector('title')?.textContent?.trim() ||
       doc.querySelector('h1, h2, h3')?.textContent?.trim() ||
       'Notes';
+    const safeTitle = this.escapeXml(titleText);
 
     // Preserve any anchor IDs that might be referenced directly by toc.ncx or nav.xhtml
     const topElementWithId = doc.body?.querySelector('h1[id], h2[id], div[id], section[id]');
-    const preservedIdAttr = topElementWithId?.getAttribute('id')
-      ? ` id="${topElementWithId.getAttribute('id')}"`
-      : '';
+    const rawId = topElementWithId?.getAttribute('id');
+    const preservedIdAttr = rawId ? ` id="${this.escapeXml(rawId)}"` : '';
 
     const placeholderBody = `<div class="translit-zero-offset-placeholder" data-zero-offset="true"${preservedIdAttr}>
-  <h1>${titleText}</h1>
+  <h1>${safeTitle}</h1>
   <p class="zero-offset-notice">本书所有注释均已自动整合内化至对应正文章节。在阅读正文时点击角标编号，即可直接唤起交互式悬浮气泡查阅注释内容。</p>
 </div>`;
 
@@ -911,7 +1021,7 @@ export class FootnoteResolver {
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
 <head>
-  <title>${titleText}</title>
+  <title>${safeTitle}</title>
 </head>
 <body>
 ${placeholderBody}

@@ -69,6 +69,18 @@ export interface ProcessingLog {
   type: 'info' | 'success' | 'error' | 'process';
 }
 
+export interface TokenUsage {
+  promptTokens: number;
+  cachedTokens: number;
+  completionTokens: number;
+  reasoningTokens: number;
+  totalTokens: number;
+}
+
+export interface TokenUsageStats extends TokenUsage {
+  requestCount: number;
+}
+
 export interface SessionState {
   status: AppStatus;
   config: AppConfig;
@@ -79,6 +91,8 @@ export interface SessionState {
   opfPath?: string;
   opfDir?: string;
   cssFiles?: string[];
+  cssContents?: string[];
+  tokenStats?: TokenUsageStats;
 }
 
 export enum AppStatus {
@@ -107,3 +121,19 @@ export interface AppConfig {
   smartSkip: boolean; // Toggle for skipping non-content pages
   enableGlossary: boolean; // Toggle for terminology system
 }
+
+export interface ApiProfile {
+  id: string;
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+  modelName: string;
+  updatedAt: number;
+}
+
+export interface ApiProfileStore {
+  activeProfileId: string | null;
+  profiles: ApiProfile[];
+}
+
+export type BilingualMode = 'none' | 'target_only' | 'source_first' | 'target_first';

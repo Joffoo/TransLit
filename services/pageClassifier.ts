@@ -5,6 +5,7 @@ import {
   PageDisposition
 } from '../types';
 import { parseHtmlDocument, normalizeEpubFilePath } from '../utils/domAdapter';
+import { isChapterNonTranslatable } from '../utils/chapterUtils';
 
 export interface LightweightPagePayload {
   title: string;
@@ -29,7 +30,6 @@ const PUBLISHER_PROMO_KEYWORDS = /\b(join\s+our\s+mailing\s+list|sign\s+up\s+to\
 const PUBLISHER_PROMO_FILE = /(signup|recommendpage|newsletter|adcard|buylink)/i;
 
 const TOC_TITLE_OR_FILE = /^(toc|table\s+of\s+contents|contents)(?:$|[\s_-]|\.)/i;
-const FOOTNOTE_TITLE_OR_FILE = /^(notes?|endnotes?|footnotes?)(?:$|[\s_-]|\d|\.)/i;
 const INDEX_OR_LONGDESC_FILE = /^(index|longdesc)\.(xhtml|html|htm|xml)$/i;
 
 const AMBIGUOUS_TRANSITION_KEYWORDS = /\b(dedication|epigraph|foreword|preface|acknowledgm?ents?|praise\s+for|acclaim\s+for|also\s+by|about\s+the\s+author|appendix|glossary|bibliography|references|works\s+cited|editor'?s?\s+note|introduction|afterword|prologue|epilogue)\b/i;
@@ -155,7 +155,7 @@ export class PageClassifier {
       AMBIGUOUS_TRANSITION_KEYWORDS.test(lowerTitle) ||
       AMBIGUOUS_TRANSITION_KEYWORDS.test(baseFileName) ||
       AMBIGUOUS_TRANSITION_KEYWORDS.test(headingText) ||
-      (wordCount > 0 && wordCount < 180 && (chapter.index <= 3 || false));
+      (wordCount > 0 && wordCount < 180 && chapter.index <= 3);
 
     if (isTransitionCandidate && wordCount < 1500) {
       const isBackRef = /\b(bibliography|references|works\s+cited|index)\b/i.test(
@@ -193,48 +193,57 @@ export class PageClassifier {
     onChapterUpdated?: (chapter: Chapter, index: number) => void
   ): Promise<Chapter[]> {
     const updatedChapters = [...chapters];
+    const ambiguousIndices: number[] = [];
 
-    const tasks = updatedChapters.map(async (ch, idx) => {
-      if (!ch.classification || ch.classification.category !== 'ambiguous') {
-        return;
-      }
-      if (ch.classification.stage === 'user_override' || ch.isSystemProtected) {
-        return;
-      }
+    for (let idx = 0; idx < updatedChapters.length; idx++) {
+      const ch = updatedChapters[idx];
+      if (!ch.classification || ch.classification.category !== 'ambiguous') continue;
+      if (ch.classification.stage === 'user_override' || ch.isSystemProtected) continue;
+      ambiguousIndices.push(idx);
+    }
 
-      const payload = this.buildLightweightPayload(ch);
-      try {
-        const verdict = await aiClassifier(payload);
-        // Re-check that user hasn't overridden while async request was in flight
-        if (
-          updatedChapters[idx].classification?.stage === 'user_override' ||
-          updatedChapters[idx].isSystemProtected
-        ) {
-          return;
+    if (ambiguousIndices.length === 0) return updatedChapters;
+
+    let cursor = 0;
+    const workerCount = Math.min(3, ambiguousIndices.length);
+
+    const runWorker = async () => {
+      while (cursor < ambiguousIndices.length) {
+        const idx = ambiguousIndices[cursor++];
+        const ch = updatedChapters[idx];
+        const payload = this.buildLightweightPayload(ch);
+        try {
+          const verdict = await aiClassifier(payload);
+          if (
+            updatedChapters[idx].classification?.stage === 'user_override' ||
+            updatedChapters[idx].isSystemProtected
+          ) {
+            continue;
+          }
+
+          const nextClassification: PageClassification = {
+            category: verdict.category,
+            disposition: verdict.disposition,
+            reason: verdict.reason,
+            stage: 'lightweight_ai',
+            confidence: verdict.confidence ?? 0.9
+          };
+
+          updatedChapters[idx] = this.applyClassificationToChapter(
+            updatedChapters[idx],
+            nextClassification
+          );
+
+          if (onChapterUpdated) {
+            onChapterUpdated(updatedChapters[idx], idx);
+          }
+        } catch {
+          // Keep Stage 1 fallback recommendation on AI error
         }
-
-        const nextClassification: PageClassification = {
-          category: verdict.category,
-          disposition: verdict.disposition,
-          reason: verdict.reason,
-          stage: 'lightweight_ai',
-          confidence: verdict.confidence ?? 0.9
-        };
-
-        updatedChapters[idx] = this.applyClassificationToChapter(
-          updatedChapters[idx],
-          nextClassification
-        );
-
-        if (onChapterUpdated) {
-          onChapterUpdated(updatedChapters[idx], idx);
-        }
-      } catch {
-        // Keep Stage 1 fallback recommendation on AI error
       }
-    });
+    };
 
-    await Promise.all(tasks);
+    await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
     return updatedChapters;
   }
 
@@ -258,23 +267,11 @@ export class PageClassifier {
    * A footnote's translation status strictly follows the body chapter into which
    * it was internalized, completely decoupled from the standalone footnote source file's state.
    */
-  public shouldTranslateChapterFootnotes(hostChapter: Chapter): boolean {
-    if (hostChapter.isFootnoteSource) {
-      return false;
-    }
-    if (hostChapter.isSkippable || hostChapter.isReference) {
-      return false;
-    }
-    const disposition = hostChapter.classification?.disposition;
-    if (
-      disposition === 'skip' ||
-      disposition === 'keep_original' ||
-      disposition === 'system_toc' ||
-      disposition === 'system_footnote_source'
-    ) {
-      return false;
-    }
-    return true;
+  public shouldTranslateChapterFootnotes(
+    hostChapter: Chapter,
+    smartSkip: boolean = true
+  ): boolean {
+    return !isChapterNonTranslatable(hostChapter, smartSkip);
   }
 
   public applyClassificationToChapter(
@@ -356,27 +353,12 @@ export class PageClassifier {
     return false;
   }
 
-  private isDomFootnoteSource(
-    body: HTMLElement | null | undefined,
-    lowerTitle: string,
-    baseFileName: string
-  ): boolean {
-    if (!body) return false;
-    const hasTitleMatch =
-      FOOTNOTE_TITLE_OR_FILE.test(lowerTitle) ||
-      FOOTNOTE_TITLE_OR_FILE.test(baseFileName);
-    const footnoteNodes = body.querySelectorAll(
-      '[epub\\:type="footnote"], [epub\\:type="endnote"], [epub\\:type="rearnote"], .footnote, .footnotes, .endnotes, [id^="fn"], [id^="note"]'
-    );
-    return hasTitleMatch && footnoteNodes.length > 0;
-  }
-
   private countWords(text: string): number {
     if (!text) return 0;
-    const cjkMatches = text.match(/[\u4e00-\u9fa5]/g);
+    const cjkMatches = text.match(/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g);
     const cjkCount = cjkMatches ? cjkMatches.length : 0;
     const nonCjkWords = text
-      .replace(/[\u4e00-\u9fa5]/g, ' ')
+      .replace(/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g, ' ')
       .trim()
       .split(/\s+/)
       .filter(Boolean).length;

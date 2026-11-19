@@ -1,5 +1,5 @@
 
-import { AppConfig, AppStatus, Chapter, ProcessingLog, SessionState } from '../types';
+import { Chapter, ProcessingLog, SessionState } from '../types';
 
 const DB_NAME = 'epub_translator_db';
 const DB_VERSION = 3;
@@ -14,14 +14,19 @@ const STORES = {
 
 export class PersistenceService {
   private db: IDBDatabase | null = null;
+  private initPromise: Promise<void> | null = null;
 
   async init(): Promise<void> {
     if (this.db) return;
+    if (this.initPromise) return this.initPromise;
 
-    return new Promise((resolve, reject) => {
+    this.initPromise = new Promise<void>((resolve, reject) => {
       const request = indexedDB.open(DB_NAME, DB_VERSION);
 
-      request.onerror = () => reject(request.error);
+      request.onerror = () => {
+        this.initPromise = null;
+        reject(request.error);
+      };
       
       request.onupgradeneeded = (event) => {
         const db = (event.target as IDBOpenDBRequest).result;
@@ -51,12 +56,20 @@ export class PersistenceService {
         resolve();
       };
     });
+
+    return this.initPromise;
+  }
+
+  private getTransaction(
+    storeNames: string | string[],
+    mode: IDBTransactionMode = 'readonly'
+  ): IDBTransaction {
+    if (!this.db) throw new Error("Database not initialized");
+    return this.db.transaction(storeNames, mode);
   }
 
   private getStore(storeName: string, mode: IDBTransactionMode = 'readonly'): IDBObjectStore {
-    if (!this.db) throw new Error("Database not initialized");
-    const transaction = this.db.transaction(storeName, mode);
-    return transaction.objectStore(storeName);
+    return this.getTransaction(storeName, mode).objectStore(storeName);
   }
 
   // --- Session Metadata ---
@@ -106,7 +119,7 @@ export class PersistenceService {
 
   async saveChapters(chapters: Chapter[]): Promise<void> {
     return new Promise((resolve, reject) => {
-      const transaction = this.db!.transaction(STORES.CHAPTERS, 'readwrite');
+      const transaction = this.getTransaction(STORES.CHAPTERS, 'readwrite');
       const store = transaction.objectStore(STORES.CHAPTERS);
       
       // Clear existing chapters first to avoid stale data
@@ -155,7 +168,7 @@ export class PersistenceService {
 
   async saveImages(images: Record<string, Blob>): Promise<void> {
     return new Promise((resolve, reject) => {
-      const transaction = this.db!.transaction(STORES.IMAGES, 'readwrite');
+      const transaction = this.getTransaction(STORES.IMAGES, 'readwrite');
       const store = transaction.objectStore(STORES.IMAGES);
       
       store.clear();
@@ -171,34 +184,22 @@ export class PersistenceService {
 
   async loadImages(): Promise<Record<string, Blob>> {
     return new Promise((resolve, reject) => {
-      const store = this.getStore(STORES.IMAGES);
-      const request = store.getAllKeys();
-      
-      request.onsuccess = async () => {
-        const keys = request.result as string[];
-        const images: Record<string, Blob> = {};
-        
-        // Load all images (might be heavy, but necessary for reconstruction)
-        // Optimization: Could load on demand, but for now load all.
-        let loaded = 0;
-        if (keys.length === 0) {
-            resolve({});
-            return;
+      const transaction = this.getTransaction(STORES.IMAGES, 'readonly');
+      const store = transaction.objectStore(STORES.IMAGES);
+      const images: Record<string, Blob> = {};
+      const request = store.openCursor();
+
+      request.onsuccess = (event) => {
+        const cursor = (event.target as IDBRequest<IDBCursorWithValue | null>).result;
+        if (cursor) {
+          images[String(cursor.key)] = cursor.value as Blob;
+          cursor.continue();
         }
-
-        const transaction = this.db!.transaction(STORES.IMAGES, 'readonly');
-        const imgStore = transaction.objectStore(STORES.IMAGES);
-
-        keys.forEach(key => {
-            const imgReq = imgStore.get(key);
-            imgReq.onsuccess = () => {
-                images[key] = imgReq.result;
-                loaded++;
-                if (loaded === keys.length) resolve(images);
-            };
-        });
       };
+
       request.onerror = () => reject(request.error);
+      transaction.oncomplete = () => resolve(images);
+      transaction.onerror = () => reject(transaction.error);
     });
   }
 
@@ -246,7 +247,7 @@ export class PersistenceService {
         const entries = Object.entries(terms);
         if (entries.length === 0) return resolve(0);
 
-        const transaction = this.db!.transaction(STORES.GLOSSARY, 'readwrite');
+        const transaction = this.getTransaction(STORES.GLOSSARY, 'readwrite');
         const store = transaction.objectStore(STORES.GLOSSARY);
         
         let addedCount = 0;
@@ -268,38 +269,28 @@ export class PersistenceService {
 
   async loadGlossary(): Promise<Record<string, string>> {
      return new Promise((resolve, reject) => {
-        const store = this.getStore(STORES.GLOSSARY);
-        const request = store.getAllKeys();
-        
-        request.onsuccess = () => {
-            const keys = request.result as string[];
-            const glossary: Record<string, string> = {};
-            
-            if (keys.length === 0) {
-                resolve({});
-                return;
-            }
+        const transaction = this.getTransaction(STORES.GLOSSARY, 'readonly');
+        const store = transaction.objectStore(STORES.GLOSSARY);
+        const glossary: Record<string, string> = {};
+        const request = store.openCursor();
 
-            const transaction = this.db!.transaction(STORES.GLOSSARY, 'readonly');
-            const gStore = transaction.objectStore(STORES.GLOSSARY);
-
-            let loaded = 0;
-            keys.forEach(key => {
-                const req = gStore.get(key);
-                req.onsuccess = () => {
-                    glossary[key] = req.result;
-                    loaded++;
-                    if (loaded === keys.length) resolve(glossary);
-                };
-            });
+        request.onsuccess = (event) => {
+          const cursor = (event.target as IDBRequest<IDBCursorWithValue | null>).result;
+          if (cursor) {
+            glossary[String(cursor.key)] = cursor.value as string;
+            cursor.continue();
+          }
         };
+
         request.onerror = () => reject(request.error);
+        transaction.oncomplete = () => resolve(glossary);
+        transaction.onerror = () => reject(transaction.error);
      });
   }
 
   async replaceGlossary(terms: Record<string, string>): Promise<void> {
     return new Promise((resolve, reject) => {
-        const transaction = this.db!.transaction(STORES.GLOSSARY, 'readwrite');
+        const transaction = this.getTransaction(STORES.GLOSSARY, 'readwrite');
         const store = transaction.objectStore(STORES.GLOSSARY);
         
         store.clear();
@@ -314,7 +305,7 @@ export class PersistenceService {
 
   async saveOriginalZip(data: ArrayBuffer): Promise<void> {
     return new Promise((resolve, reject) => {
-      const transaction = this.db!.transaction(STORES.ORIGINAL_ZIP, 'readwrite');
+      const transaction = this.getTransaction(STORES.ORIGINAL_ZIP, 'readwrite');
       const store = transaction.objectStore(STORES.ORIGINAL_ZIP);
       const request = store.put(data, 'archive');
       request.onsuccess = () => resolve();
