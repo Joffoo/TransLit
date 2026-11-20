@@ -102,6 +102,147 @@ export function extractTokenUsage(data: any): TokenUsage | undefined {
   };
 }
 
+/**
+ * Builds candidate API endpoint URLs from a user-configured baseUrl.
+ * - Strips trailing slashes and accidental `/chat/completions` or `/models` suffixes.
+ * - Normalizes scheme-less hostnames (`http://` for localhost/127.0.0.1, `https://` otherwise).
+ * - When given a bare origin without a path (e.g. `https://origincoder.com/`), tries
+ *   standard OpenAI `/v1/<endpoint>` first and falls back to `/<endpoint>`.
+ * - When given a custom sub-path without a version segment (e.g. `https://openrouter.ai/api`),
+ *   tries `<path>/<endpoint>` first and falls back to `<path>/v1/<endpoint>`.
+ */
+export function buildApiEndpointCandidates(
+  rawBaseUrl: string,
+  endpoint: 'chat/completions' | 'models'
+): string[] {
+  let cleanBase = rawBaseUrl
+    .trim()
+    .replace(/\/+$/, '')
+    .replace(/\/(chat\/completions|models)$/i, '')
+    .replace(/\/+$/, '');
+
+  if (!cleanBase) return [];
+
+  if (!/^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//.test(cleanBase) && !cleanBase.startsWith('/')) {
+    const isLocal = /^(?:localhost|127\.\d+\.\d+\.\d+|\[::1\])(?::\d+)?(?:\/|$)/i.test(cleanBase);
+    cleanBase = `${isLocal ? 'http' : 'https'}://${cleanBase}`;
+  }
+
+  let pathname = '';
+  try {
+    const parsed = new URL(cleanBase);
+    pathname = parsed.pathname.replace(/\/+$/, '');
+  } catch {
+    return [`${cleanBase}/${endpoint}`];
+  }
+
+  if (!pathname) {
+    return [`${cleanBase}/v1/${endpoint}`, `${cleanBase}/${endpoint}`];
+  }
+
+  if (/\/(?:v\d+[a-z0-9]*|openai)$/i.test(pathname)) {
+    return [`${cleanBase}/${endpoint}`];
+  }
+
+  return [`${cleanBase}/${endpoint}`, `${cleanBase}/v1/${endpoint}`];
+}
+
+/**
+ * Returns true when running in a browser HTTP(S) origin where the same-origin
+ * `/__api_proxy` endpoint (Vite dev/preview, Cloudflare Workers, or Cloudflare Pages)
+ * can be used to bypass browser CORS restrictions.
+ */
+export function canUseSameOriginApiProxy(): boolean {
+  if (typeof window === 'undefined' || !window.location) return false;
+  const proto = window.location.protocol;
+  return proto === 'http:' || proto === 'https:';
+}
+
+export async function fetchViaProxyOrDirect(
+  targetUrl: string,
+  init: RequestInit
+): Promise<Response> {
+  if (!canUseSameOriginApiProxy()) {
+    return fetch(targetUrl, init);
+  }
+
+  const normalizedHeaders = new Headers(init.headers);
+  normalizedHeaders.set('X-Target-Url', targetUrl);
+  const proxyHeaders: Record<string, string> = {};
+  normalizedHeaders.forEach((value, key) => {
+    proxyHeaders[key] = value;
+  });
+
+  try {
+    const proxyRes = await fetch('/__api_proxy', {
+      ...init,
+      headers: proxyHeaders,
+    });
+    if (proxyRes.headers.get('x-translit-proxy') === '1') {
+      return proxyRes;
+    }
+
+    // Any response without `x-translit-proxy: 1` means `/__api_proxy` is not mounted
+    // on this static-only host (returning 404/405/403/501 or SPA fallback HTML).
+    // Fall back to direct browser fetch.
+    return await fetch(targetUrl, init);
+  } catch {
+    return await fetch(targetUrl, init);
+  }
+}
+
+export async function requestJsonFromCandidates(
+  rawBaseUrl: string,
+  endpoint: 'chat/completions' | 'models',
+  init: RequestInit
+): Promise<any> {
+  const candidates = buildApiEndpointCandidates(rawBaseUrl, endpoint);
+  if (candidates.length === 0) {
+    throw new Error('Base URL is required.');
+  }
+
+  let lastError: Error | null = null;
+
+  for (let i = 0; i < candidates.length; i++) {
+    const candidateUrl = candidates[i];
+    const hasNextCandidate = i < candidates.length - 1;
+    const response = await fetchViaProxyOrDirect(candidateUrl, init);
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+
+    if (!response.ok) {
+      const errText = await response.text();
+      const err = new Error(`API Error ${response.status}: ${errText}`);
+      (err as any).status = response.status;
+      const isHtmlError =
+        contentType.includes('text/html') || /^\s*<(?:!doctype|html)\b/i.test(errText);
+      const isRouteMismatchStatus =
+        response.status === 404 || response.status === 405 || response.status === 501;
+      if (hasNextCandidate && (isRouteMismatchStatus || isHtmlError)) {
+        lastError = err;
+        continue;
+      }
+      throw err;
+    }
+
+    const rawText = await response.text();
+    try {
+      return JSON.parse(rawText);
+    } catch {
+      const snippet = rawText.trim().slice(0, 160);
+      const nonJsonErr = new Error(
+        `API returned non-JSON response (${contentType || 'unknown content-type'}): ${snippet}`
+      );
+      if (hasNextCandidate) {
+        lastError = nonJsonErr;
+        continue;
+      }
+      throw nonJsonErr;
+    }
+  }
+
+  throw lastError || new Error('API request failed');
+}
+
 export class AiService {
   // Safe chunk size to avoid context limits (approx 3000 chars)
   private CHUNK_SIZE = 3000;
@@ -198,12 +339,14 @@ export class AiService {
         errDetail = '';
       }
       const errString = `${error?.message || String(error)} ${errDetail}`;
-      const isAuthError =
+      const isNonRetryableError =
         status === 401 ||
         status === 403 ||
-        /\b(?:API Error|HTTP|status)\s*[:=]?\s*(?:401|403)\b/i.test(errString);
+        status === 404 ||
+        status === 405 ||
+        /\b(?:API Error|HTTP|status)\s*[:=]?\s*(?:401|403|404|405)\b/i.test(errString);
 
-      if (isAuthError) throw error; // Never retry auth errors
+      if (isNonRetryableError) throw error; // Never retry auth or route-not-found errors
 
       const isRateLimit =
         status === 429 ||
@@ -347,8 +490,6 @@ export class AiService {
         if (!this.config.apiKey) throw new Error("API Key is required.");
         if (!this.config.baseUrl) throw new Error("Base URL is required.");
 
-        const url = `${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`;
-
         const body = {
             model: this.config.modelName,
             messages: [
@@ -358,31 +499,20 @@ export class AiService {
             temperature: temperature
         };
 
-        // In dev mode, route through the local Vite proxy to bypass browser CORS restrictions.
-        // The proxy middleware reads X-Target-Url and forwards the request server-side.
-        // In production, fetch directly to the API endpoint as before.
         const headers: Record<string, string> = {
             "Content-Type": "application/json",
             "Authorization": `Bearer ${this.config.apiKey}`
         };
-        const isViteDev = Boolean(import.meta.env?.DEV);
-        const fetchUrl = isViteDev ? '/__api_proxy' : url;
-        if (isViteDev) headers["X-Target-Url"] = url;
 
-        const response = await fetch(fetchUrl, {
+        const data = await requestJsonFromCandidates(
+          this.config.baseUrl,
+          'chat/completions',
+          {
             method: "POST",
             headers,
             body: JSON.stringify(body)
-        });
-
-        if (!response.ok) {
-            const errText = await response.text();
-            const err = new Error(`API Error ${response.status}: ${errText}`);
-            (err as any).status = response.status;
-            throw err;
-        }
-
-        const data = await response.json();
+          }
+        );
         const content = data.choices?.[0]?.message?.content;
 
         if (!content) {
@@ -407,21 +537,15 @@ export class AiService {
     if (!this.config.apiKey) throw new Error("API Key is required.");
     if (!this.config.baseUrl) throw new Error("Base URL is required.");
 
-    const url = `${this.config.baseUrl.replace(/\/$/, '')}/models`;
     const headers: Record<string, string> = {
       "Authorization": `Bearer ${this.config.apiKey}`
     };
-    const isViteDev = Boolean(import.meta.env?.DEV);
-    const fetchUrl = isViteDev ? '/__api_proxy' : url;
-    if (isViteDev) headers["X-Target-Url"] = url;
 
-    const response = await fetch(fetchUrl, { method: "GET", headers });
-    if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`API Error ${response.status}: ${errText}`);
-    }
-
-    const data = await response.json();
+    const data = await requestJsonFromCandidates(
+      this.config.baseUrl,
+      'models',
+      { method: "GET", headers }
+    );
     const list: any[] = Array.isArray(data?.data)
       ? data.data
       : Array.isArray(data)

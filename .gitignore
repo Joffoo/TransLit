@@ -16,6 +16,7 @@ dist/
 dist-ssr/
 out/
 build/
+.wrangler/
 
 # Local env files
 .env

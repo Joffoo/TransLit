@@ -40,7 +40,7 @@
 
 - 🔌 **BYOK 与多 API Profile 管理**
   - 支持在浏览器 `localStorage` 中管理多套 OpenAI 兼容接口档案（如 DeepSeek、NVIDIA NIM、OpenAI、兼容中转等），支持一键拉取可用模型列表、测试接口连通性与切换配置，点击重置进度不会清除个人接口档案。
-  - 开发环境内置仅监听本机 `127.0.0.1` 的轻量 CORS 代理中间件（`/__api_proxy`），限制仅允许 `http:` / `https:` 协议以方便本地调试跨源模型接口。
+  - 内置同源轻量 CORS 代理（`/__api_proxy`），同时支持本地 Vite 开发/预览中间件、Cloudflare Workers（[wrangler.jsonc](wrangler.jsonc) + [cloudflare/worker.ts](cloudflare/worker.ts)）与 Cloudflare Pages Functions（[functions/__api_proxy.ts](functions/__api_proxy.ts)），并自动兼容省略 `/v1` 的裸域名接口地址；在纯静态托管环境下自动回退为浏览器直连。
 - 🧬 **原位 DOM 变异引擎**（`DomMutationEngine`）
   - 彻底告别传统 Markdown 扁平化往返转换造成的层级丢失：解包后直接识别原书 XHTML 叶子块（包括伪标题类如 `.sec1-titlea`、章首排版表格、引文与内联标签），译后**原位回写**至原始 DOM 骨架，实现零结构差异与跨行对齐（支持 DP 动态规划段落合并/拆分融合）。
   - 预览工坊通过独立组件 [EpubFinishedPreview.tsx](components/EpubFinishedPreview.tsx) 在 `sandbox="allow-same-origin"` 隔离沙箱 `iframe` 中实时渲染成书排版与交互式注脚浮窗。
@@ -85,7 +85,7 @@ npm run dev
 ### 3. 类型检查、测试与生产构建
 ```bash
 npm run lint    # TypeScript 严格检查（含未使用变量与参数检查）
-npm test        # 运行全套自包含核心单元测试（10 项测试）
+npm test        # 运行全套自包含核心单元测试（11 项测试）
 npm run build   # 分包打包生成 dist/
 ```
 
@@ -93,6 +93,10 @@ npm run build   # 分包打包生成 dist/
 
 ```text
 TransLit/
+├── cloudflare/
+│   └── worker.ts                   # Cloudflare Workers 同源 CORS 代理与静态资源入口
+├── functions/
+│   └── __api_proxy.ts              # Cloudflare Pages Functions 同源 CORS 代理入口
 ├── components/
 │   ├── EpubFinishedPreview.tsx     # 沙箱隔离 iframe 预览与交互式脚注浮窗组件
 │   ├── FileUpload.tsx              # EPUB 拖拽上传与进度交互组件
@@ -112,7 +116,7 @@ TransLit/
 │   ├── domAdapter.ts               # 浏览器原生 DOM 与 Node/jsdom 双端 XML/HTML 适配器
 │   └── glossaryUtils.ts            # 术语表解析、安全正则回写、变化对比与语境去重
 ├── tests/
-│   ├── run_all.ts                  # 一键运行 10 项核心非 UI 测试入口
+│   ├── run_all.ts                  # 一键运行 11 项核心非 UI 测试入口
 │   ├── verify_*.ts                 # 单元测试与 Playwright 端到端 UI 测试
 ├── docs/
 │   ├── screenshots/                # README 高清界面演示截图
@@ -123,6 +127,7 @@ TransLit/
 ├── types.ts                        # 全局 TypeScript 数据结构定义
 ├── logo.svg                        # 极简几何矢量 Logo
 ├── vite.config.ts                  # Vite 构建分包与本地 CORS 调试代理配置
+├── wrangler.jsonc                  # Cloudflare Workers 静态资产与路由配置
 └── package.json                    # 项目依赖与 npm scripts 定义
 ```
 
@@ -154,7 +159,7 @@ For design background and translation engineering notes (in Chinese):
 
 - 🔌 **BYOK & Multi-API Profile Manager**
   - Manage multiple OpenAI-compatible API profiles in `localStorage`, fetch available models, verify live connectivity, and switch profiles without losing session progress when resetting a book.
-  - Includes a dev-only CORS proxy (`/__api_proxy`) bound to `127.0.0.1` and restricted strictly to `http:` / `https:` targets.
+  - Includes a built-in same-origin CORS proxy (`/__api_proxy`) across Vite dev/preview, Cloudflare Workers ([wrangler.jsonc](wrangler.jsonc) + [cloudflare/worker.ts](cloudflare/worker.ts)), and Cloudflare Pages Functions ([functions/__api_proxy.ts](functions/__api_proxy.ts)), with automatic `/v1` endpoint fallback for bare domain URLs and graceful direct-fetch fallback on static-only hosts.
 - 🧬 **In-Place DOM Mutation Engine** (`DomMutationEngine`)
   - Eliminates lossy HTML-to-Markdown roundtrips (`turndown` has been completely removed). Translatable leaf blocks and inline markup are extracted in place and mutated back into the original XHTML skeleton with **zero structural tree drift**, including dynamic programming paragraph split/merge alignment.
   - [EpubFinishedPreview.tsx](components/EpubFinishedPreview.tsx) renders chapters inside an isolated `sandbox="allow-same-origin"` `iframe` with interactive footnote popovers.
@@ -182,7 +187,7 @@ For design background and translation engineering notes (in Chinese):
 npm install       # Install dependencies
 npm run dev       # Start local dev server at http://127.0.0.1:3000
 npm run lint      # Run TypeScript check (noUnusedLocals + noUnusedParameters)
-npm test          # Execute self-contained verification suite (10 suites)
+npm test          # Execute self-contained verification suite (11 suites)
 npm run build     # Build production bundle into dist/
 ```
 

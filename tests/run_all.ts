@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 
 const TESTS = [
   'tests/verify_api_profiles.ts',
+  'tests/verify_cors_proxy.ts',
   'tests/verify_bilingual_alignment.ts',
   'tests/verify_dom_mutation.ts',
   'tests/verify_footnote_pipeline.ts',

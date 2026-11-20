@@ -1,0 +1,17 @@
+{
+  "name": "translit",
+  "compatibility_date": "2025-01-01",
+  "main": "./cloudflare/worker.ts",
+  "build": {
+    "command": "npm run build"
+  },
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": [
+      "/__api_proxy",
+      "/__api_proxy/*"
+    ]
+  }
+}
