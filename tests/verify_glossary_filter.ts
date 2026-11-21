@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { filterGlossaryDeltaByPosterior, generateEnglishSearchForms } from '../utils/glossaryUtils.ts';
+import { filterGlossaryDeltaByPosterior, generateEnglishSearchForms, mergeChunkGlossaries } from '../utils/glossaryUtils.ts';
 
 function runTests() {
   // 1. Case-insensitive deduplication against currentGlossary and within delta
@@ -76,7 +76,28 @@ function runTests() {
     assert.equal(finalChapter.filteredText, 'EpilogueTerm=尾声词');
   }
 
-  console.log('✅ All filterGlossaryDeltaByPosterior tests passed!');
+  // 7. mergeChunkGlossaries: empty, sparse, deduplication, and legacy format
+  {
+    assert.equal(mergeChunkGlossaries(undefined), '');
+    assert.equal(mergeChunkGlossaries([]), '');
+    assert.equal(mergeChunkGlossaries(['', '   ', undefined]), '');
+
+    const sparse = mergeChunkGlossaries([
+      'TermA=术语A\nTermB=术语B',
+      undefined,
+      '   ',
+      'terma=术语A2\nTermC=术语C'
+    ]);
+    assert.equal(sparse, 'TermA=术语A\nTermB=术语B\nTermC=术语C');
+
+    const legacy = mergeChunkGlossaries([
+      'SOURCE: Alpha | TARGET: 阿尔法',
+      'Beta: 贝塔'
+    ]);
+    assert.equal(legacy, 'Alpha=阿尔法\nBeta=贝塔');
+  }
+
+  console.log('✅ All filterGlossaryDeltaByPosterior & mergeChunkGlossaries tests passed!');
 }
 
 runTests();

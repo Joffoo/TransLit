@@ -40,6 +40,7 @@ import {
   parseGlossaryValue,
   safeReplaceKeyword,
   detectGlossaryChanges,
+  mergeChunkGlossaries,
   TermChange
 } from './utils/glossaryUtils';
 import {
@@ -815,6 +816,8 @@ const App: React.FC = () => {
             chapter.fallbackChunks = undefined;
             chapter.fallbackProofreadChunks = undefined;
             chapter.translatedFootnotes = undefined;
+            chapter.chunkGlossaries = undefined;
+            chapter.glossary = undefined;
             updated = true;
             await persistenceService.current.updateChapter(chapter);
             setChapters([...chaptersRef.current]);
@@ -913,8 +916,9 @@ const App: React.FC = () => {
 
               if (chapter.translatedChunks) {
                   chapter.translatedChunks![current - 1] = chunkResult;
-                  if (updatedGlossary) {
-                      chapter.chunkGlossaries![current - 1] = updatedGlossary;
+                  if (!isFallback) {
+                      if (!chapter.chunkGlossaries) chapter.chunkGlossaries = [];
+                      chapter.chunkGlossaries[current - 1] = updatedGlossary || '';
                   }
                   chapter.translatedMarkdown = chapter.translatedChunks.filter(Boolean).join('\n\n');
                   setChapters([...chaptersRef.current]);
@@ -1015,6 +1019,7 @@ const App: React.FC = () => {
             // Re-initialize chunks array if it's stale/missing
             if (!chapter.translatedChunks || chapter.translatedChunks.length !== sourceChunks.length) {
                 chapter.translatedChunks = new Array(sourceChunks.length).fill(null);
+                chapter.chunkGlossaries = new Array(sourceChunks.length).fill('');
             }
         }
 
@@ -1034,6 +1039,7 @@ const App: React.FC = () => {
             // Force ALL chunks to be retried
             const sourceChunks = aiService.splitTextIntoChunks(chapter.markdown, config.enableProofreading ? 1800 : undefined);
             failedIndices = sourceChunks.map((_, i) => i);
+            chapter.chunkGlossaries = new Array(sourceChunks.length).fill('');
         }
         
         // Fetch the latest master glossary from DB for accurate retry
@@ -2907,6 +2913,7 @@ const App: React.FC = () => {
                                                             );
                                                             if (!chapter.translatedChunks || chapter.translatedChunks.length !== sourceChunks.length) {
                                                                 chapter.translatedChunks = new Array(sourceChunks.length).fill(null);
+                                                                chapter.chunkGlossaries = new Array(sourceChunks.length).fill('');
                                                             }
                                                             handleRetryChapter(idx);
                                                         }}
@@ -2925,18 +2932,24 @@ const App: React.FC = () => {
                                     </div>
                                 </div>
 
-                                {config.enableGlossary && chapter.glossary && (
-                                    <div className="mt-3 pt-3 border-t border-neutral-200">
-                                        <details className="cursor-pointer">
-                                            <summary className="text-[10px] font-mono text-neutral-500 hover:text-neutral-800 uppercase tracking-widest transition-colors focus:outline-none">
-                                                查看本章提取术语
-                                            </summary>
-                                            <div className="mt-2 text-[11px] font-mono text-neutral-700 bg-neutral-50 p-2.5 rounded border border-neutral-200 whitespace-pre-wrap leading-relaxed">
-                                                {chapter.glossary}
-                                            </div>
-                                        </details>
-                                    </div>
-                                )}
+                                {(() => {
+                                    const chapterNewGlossary =
+                                        config.enableGlossary && !isSkipped && !isReference && !isFootnoteSource
+                                            ? mergeChunkGlossaries(chapter.chunkGlossaries)
+                                            : '';
+                                    return chapterNewGlossary ? (
+                                        <div className="mt-3 pt-3 border-t border-neutral-200">
+                                            <details className="cursor-pointer">
+                                                <summary className="text-[10px] font-mono text-neutral-500 hover:text-neutral-800 uppercase tracking-widest transition-colors focus:outline-none">
+                                                    查看本章提取术语
+                                                </summary>
+                                                <div className="mt-2 text-[11px] font-mono text-neutral-700 bg-neutral-50 p-2.5 rounded border border-neutral-200 whitespace-pre-wrap leading-relaxed">
+                                                    {chapterNewGlossary}
+                                                </div>
+                                            </details>
+                                        </div>
+                                    ) : null;
+                                })()}
                             </div>
                         );
                     })

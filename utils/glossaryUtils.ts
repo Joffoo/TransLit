@@ -451,3 +451,30 @@ export function detectGlossaryChanges(
   }
   return changes;
 }
+
+/**
+ * Merges per-chunk delta glossary strings for a chapter into a single
+ * deduplicated glossary string representing terms newly extracted in that chapter.
+ */
+export function mergeChunkGlossaries(chunkGlossaries?: (string | undefined | null)[]): string {
+  if (!chunkGlossaries || chunkGlossaries.length === 0) return '';
+
+  const merged: Record<string, string> = {};
+  const seenLower = new Set<string>();
+  const orderedKeys: string[] = [];
+
+  for (const chunkStr of chunkGlossaries) {
+    if (!chunkStr || !chunkStr.trim()) continue;
+    const parsed = parseGlossaryStr(chunkStr);
+    for (const [key, val] of Object.entries(parsed)) {
+      const lowerKey = key.toLowerCase();
+      if (!seenLower.has(lowerKey)) {
+        seenLower.add(lowerKey);
+        merged[key] = val;
+        orderedKeys.push(key);
+      }
+    }
+  }
+
+  return glossaryToOutputStr(merged, orderedKeys);
+}
