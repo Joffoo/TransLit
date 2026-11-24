@@ -1389,8 +1389,14 @@ export function computeStructuralTreeDiff(
 
   if (origDoc.body || mutDoc.body) {
     const engine = new DomMutationEngine();
-    if (origDoc.body) engine.decomposeBlockquotes(origDoc.body);
-    if (mutDoc.body) engine.decomposeBlockquotes(mutDoc.body);
+    if (origDoc.body) {
+      engine.decomposeBlockquotes(origDoc.body);
+      engine.normalizeMixedContentContainers(origDoc.body);
+    }
+    if (mutDoc.body) {
+      engine.decomposeBlockquotes(mutDoc.body);
+      engine.normalizeMixedContentContainers(mutDoc.body);
+    }
   }
 
   if (origDoc.body && mutDoc.body) {
@@ -1448,6 +1454,35 @@ interface InlineXhtmlSanitizeOptions {
   allowClassAttr: boolean;
   stripUnmatchedAllowedTags: boolean;
   stripDisallowedHtmlShells?: boolean;
+  allowSafeVoidImg?: boolean;
+}
+
+function buildSafeVoidImgHtml(attrsText: string): string | null {
+  const attrRe = /([a-zA-Z_:][\w:.-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/g;
+  const safeParts: string[] = [];
+  let hasSafeSrc = false;
+  let m: RegExpExecArray | null;
+
+  const escapeAttr = (v: string) =>
+    v.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  while ((m = attrRe.exec(attrsText)) !== null) {
+    const name = m[1].toLowerCase();
+    const rawVal = (m[2] ?? m[3] ?? m[4] ?? '').replace(/^[“”‘’]+|[“”‘’]+$/g, '').trim();
+    if (name === 'src') {
+      if (!rawVal || /^(?:javascript|vbscript|data\s*:\s*text\/html):/i.test(rawVal)) {
+        return null;
+      }
+      hasSafeSrc = true;
+      safeParts.push(`src="${escapeAttr(rawVal)}"`);
+    } else if (name === 'alt' || name === 'class' || name === 'role' || name === 'width' || name === 'height') {
+      if (name === 'class' && !/^[A-Za-z0-9 _-]*$/.test(rawVal)) continue;
+      safeParts.push(`${name}="${escapeAttr(rawVal)}"`);
+    }
+  }
+
+  if (!hasSafeSrc) return null;
+  return `<img ${safeParts.join(' ')}/>`;
 }
 
 function sanitizeInlineXhtmlCore(text: string, options: InlineXhtmlSanitizeOptions): string {
@@ -1464,6 +1499,7 @@ function sanitizeInlineXhtmlCore(text: string, options: InlineXhtmlSanitizeOptio
         raw: string;
         tagName?: string;
         normalizedAttr?: string;
+        normalizedVoidHtml?: string;
         isClose?: boolean;
         isVoidBr?: boolean;
         isAllowedInline?: boolean;
@@ -1493,6 +1529,20 @@ function sanitizeInlineXhtmlCore(text: string, options: InlineXhtmlSanitizeOptio
     const rawTag = match[0];
     if (/^<\s*br\s*\/?\s*>$/i.test(rawTag)) {
       tokens.push({ kind: 'tag', raw: rawTag, tagName: 'br', isVoidBr: true, valid: true });
+    } else if (options.allowSafeVoidImg && /^<\s*img\b[^>]*>$/i.test(rawTag)) {
+      const attrsMatch = rawTag.match(/^<\s*img\b([\s\S]*?)\/?\s*>$/i);
+      const safeImgHtml = attrsMatch ? buildSafeVoidImgHtml(attrsMatch[1]) : null;
+      if (safeImgHtml) {
+        tokens.push({
+          kind: 'tag',
+          raw: rawTag,
+          tagName: 'img',
+          normalizedVoidHtml: safeImgHtml,
+          valid: true
+        });
+      } else {
+        tokens.push({ kind: 'tag', raw: rawTag, isAllowedInline: false, stripShell: true, valid: false });
+      }
     } else {
       const closeMatch = rawTag.match(/^<\s*\/\s*([a-zA-Z0-9]+)\s*>$/);
       if (closeMatch && options.allowedTags.has(closeMatch[1].toLowerCase())) {
@@ -1569,7 +1619,7 @@ function sanitizeInlineXhtmlCore(text: string, options: InlineXhtmlSanitizeOptio
   const stack: Array<{ tok: Extract<Token, { kind: 'tag' }>; tagName: string }> = [];
   for (let i = 0; i < tokens.length; i++) {
     const tok = tokens[i];
-    if (tok.kind !== 'tag' || !tok.tagName || tok.isVoidBr) continue;
+    if (tok.kind !== 'tag' || !tok.tagName || tok.isVoidBr || tok.normalizedVoidHtml) continue;
     if (!tok.isClose) {
       stack.push({ tok, tagName: tok.tagName });
     } else {
@@ -1593,6 +1643,7 @@ function sanitizeInlineXhtmlCore(text: string, options: InlineXhtmlSanitizeOptio
     .map((tok) => {
       if (tok.kind === 'tag' && tok.valid) {
         if (tok.isVoidBr) return '<br/>';
+        if (tok.normalizedVoidHtml) return tok.normalizedVoidHtml;
         return tok.isClose
           ? `</${tok.tagName}>`
           : `<${tok.tagName}${tok.normalizedAttr || ''}>`;
@@ -1647,7 +1698,8 @@ export function sanitizeInlineXhtmlForLeaf(html: string): string {
     allowedTags: LEAF_INLINE_TAG_SET,
     allowClassAttr: true,
     stripUnmatchedAllowedTags: true,
-    stripDisallowedHtmlShells: true
+    stripDisallowedHtmlShells: true,
+    allowSafeVoidImg: true
   });
 }
 
@@ -1731,6 +1783,93 @@ export function buildFootnoteAsideHtml(
 }
 
 export class DomMutationEngine {
+  /**
+   * Wraps contiguous runs of loose inline text/tags inside mixed-content containers
+   * (e.g. `<li>lead text<p>continuation</p></li>`) into `<p data-translit-mixed-run="true">`
+   * so leaf block extraction never skips leading inline text next to a nested `<p>`.
+   */
+  public normalizeMixedContentContainers(root: Element): void {
+    const doc = root.ownerDocument;
+    if (!doc) return;
+
+    const SKIP_MIXED_CONTAINER_TAGS = new Set([
+      'BODY',
+      'HEAD',
+      'HTML',
+      'SCRIPT',
+      'STYLE',
+      'SVG',
+      'MATH',
+      'TABLE',
+      'THEAD',
+      'TBODY',
+      'TFOOT',
+      'TR',
+      'UL',
+      'OL',
+      'DL',
+      'NAV'
+    ]);
+
+    for (const container of Array.from(root.querySelectorAll('*'))) {
+      if (!container.isConnected) continue;
+      if (isFootnotePopupElement(container) || container.closest('aside, nav, script, style, svg, math')) {
+        continue;
+      }
+      const tag = (container.tagName || '').toUpperCase();
+      if (SKIP_MIXED_CONTAINER_TAGS.has(tag)) continue;
+
+      const childElements = Array.from(container.children).filter((c) => !isFootnotePopupElement(c));
+      const hasBlockChild = childElements.some((c) =>
+        BLOCK_LEVEL_TAGS.has((c.tagName || '').toUpperCase())
+      );
+      if (!hasBlockChild) continue;
+
+      const childNodes = Array.from(container.childNodes);
+      let inlineRun: ChildNode[] = [];
+
+      const flushInlineRun = () => {
+        if (inlineRun.length === 0) return;
+        const hasVisibleInlineContent = inlineRun.some((n) => {
+          if (n.nodeType === 3) {
+            return (n.textContent || '').replace(/[\s\u00a0]+/g, '').length > 0;
+          }
+          if (n.nodeType === 1) {
+            if (isEmptyPagebreakAnchor(n)) return false;
+            const elem = n as Element;
+            if (isNoterefAnchor(elem)) return true;
+            if ((elem.tagName || '').toUpperCase() === 'IMG') return true;
+            return (elem.textContent || '').replace(/[\s\u00a0]+/g, '').length > 0;
+          }
+          return false;
+        });
+
+        if (hasVisibleInlineContent) {
+          const wrapper = doc.createElement('p');
+          wrapper.setAttribute('data-translit-mixed-run', 'true');
+          wrapper.setAttribute('data-translit-indent', 'none');
+          container.insertBefore(wrapper, inlineRun[0]);
+          for (const node of inlineRun) {
+            wrapper.appendChild(node);
+          }
+        }
+        inlineRun = [];
+      };
+
+      for (const node of childNodes) {
+        if (
+          node.nodeType === 1 &&
+          BLOCK_LEVEL_TAGS.has(((node as Element).tagName || '').toUpperCase())
+        ) {
+          flushInlineRun();
+        } else {
+          inlineRun.push(node);
+        }
+      }
+      flushInlineRun();
+    }
+  }
+
   /**
    * Decomposes blockquotes containing internal <br/> separators into discrete child blocks (<p>).
    * This ensures that multi-line dialogues, interviews, or discrete thoughts inside <blockquote>
@@ -1939,6 +2078,7 @@ export class DomMutationEngine {
     slottedText: string;
     leadingAnchorHtmls: string[];
     footnoteIds: string[];
+    inlineImageHtmls: string[];
   } {
     const clone = el.cloneNode(true) as Element;
     const leadingAnchorHtmls: string[] = [];
@@ -1984,6 +2124,19 @@ export class DomMutationEngine {
           a.replaceWith(textNode);
         }
       }
+    }
+
+    // 3.5. Replace inline <img> elements with opaque __IMG_{idx}__ slots so LLM never sees or corrupts image URLs/attributes
+    const inlineImageHtmls: string[] = [];
+    for (const img of Array.from(targetContainer.querySelectorAll('img'))) {
+      if (img.classList.contains('qqreader-footnote')) continue;
+      const imgOuter = (img.cloneNode(true) as Element).outerHTML.replace(
+        /<img\b([^>]*)>/gi,
+        (m, attrs) => (attrs.trim().endsWith('/') ? m : `<img${attrs}/>`)
+      );
+      const imgIdx = inlineImageHtmls.length;
+      inlineImageHtmls.push(imgOuter);
+      img.replaceWith(targetContainer.ownerDocument!.createTextNode(`__IMG_${imgIdx}__`));
     }
 
     // 4. Strip mid-paragraph invisible pagebreak spans and empty metadata anchors so the LLM never sees or hallucinates on them
@@ -2123,7 +2276,8 @@ export class DomMutationEngine {
     return {
       slottedText,
       leadingAnchorHtmls,
-      footnoteIds
+      footnoteIds,
+      inlineImageHtmls
     };
   }
 
@@ -2430,6 +2584,7 @@ export class DomMutationEngine {
     }
 
     this.decomposeBlockquotes(doc.body);
+    this.normalizeMixedContentContainers(doc.body);
 
     const leafElements = this.collectTranslatableLeafElements(doc.body);
     const analysis = resolveLeafHeadingAnalysis(leafElements, cssProfiles, bookStyleRoles);
@@ -2552,6 +2707,7 @@ export class DomMutationEngine {
     }
 
     this.decomposeBlockquotes(doc.body);
+    this.normalizeMixedContentContainers(doc.body);
 
     // Remove any pre-existing footnote popup asides to avoid duplication
     for (const existingAside of Array.from(doc.body.children)) {
@@ -2569,7 +2725,7 @@ export class DomMutationEngine {
     this.stampSemanticRoleClasses(doc.body, leafElements, cssProfiles, bookStyleRoles, headingAnalysis);
 
     const extractedSourceBlocks = leafElements.map((el, idx) => {
-      const { slottedText, leadingAnchorHtmls, footnoteIds } = this.extractLeafBlockContent(
+      const { slottedText, leadingAnchorHtmls, footnoteIds, inlineImageHtmls } = this.extractLeafBlockContent(
         el,
         bookStyleRoles,
         cssProfiles
@@ -2580,6 +2736,7 @@ export class DomMutationEngine {
         slottedText,
         leadingAnchorHtmls,
         footnoteIds,
+        inlineImageHtmls,
         isHeadingLike: Boolean(headingAnalysis.isHeadingLikeMap.get(el))
       };
     });
@@ -2735,6 +2892,18 @@ export class DomMutationEngine {
         .replace(/\[\^(?:fn-)?([A-Za-z0-9_-]+)\]/g, replacer);
     };
 
+    const renderInlineImageSlots = (htmlFragment: string, inlineImageHtmls: string[]): string => {
+      if (!inlineImageHtmls || inlineImageHtmls.length === 0) return htmlFragment;
+      let out = htmlFragment.replace(/__IMG_\s*(\d+)\s*__/gi, (full, idxStr) => {
+        const idx = Number(idxStr);
+        return inlineImageHtmls[idx] ?? full;
+      });
+      if (inlineImageHtmls.length === 1 && !/<img\b/i.test(out)) {
+        out = `${inlineImageHtmls[0]}${out}`;
+      }
+      return out;
+    };
+
     const isBilingual = bilingualMode === 'source_first' || bilingualMode === 'target_first';
 
     for (let i = 0; i < extractedSourceBlocks.length; i++) {
@@ -2754,16 +2923,22 @@ export class DomMutationEngine {
         }
         // Monolingual In-Place Mutation: keep element, classes, IDs, leading anchors, and inner wrapper shell intact
         const formattedTarget = this.formatInlineMarkup(targetRaw);
-        const renderedTargetHtml = renderFootnoteSlotsInHtml(
-          shouldFormatTargetHeti ? applyHetiTextTypography(formattedTarget) : formattedTarget,
-          false
+        const renderedTargetHtml = renderInlineImageSlots(
+          renderFootnoteSlotsInHtml(
+            shouldFormatTargetHeti ? applyHetiTextTypography(formattedTarget) : formattedTarget,
+            false
+          ),
+          blockInfo.inlineImageHtmls
         );
         this.writeHtmlIntoLeafElement(el, renderedTargetHtml);
       } else {
         // Bilingual In-Place Cloning
-        const renderedSourceHtml = renderFootnoteSlotsInHtml(
-          this.formatInlineMarkup(blockInfo.slottedText),
-          true
+        const renderedSourceHtml = renderInlineImageSlots(
+          renderFootnoteSlotsInHtml(
+            this.formatInlineMarkup(blockInfo.slottedText),
+            true
+          ),
+          blockInfo.inlineImageHtmls
         );
         if (isMergedEmpty) {
           el.classList.add('bilingual-source');
@@ -2771,9 +2946,12 @@ export class DomMutationEngine {
           continue;
         }
         const formattedTarget = this.formatInlineMarkup(targetRaw);
-        const renderedTargetHtml = renderFootnoteSlotsInHtml(
-          shouldFormatTargetHeti ? applyHetiTextTypography(formattedTarget) : formattedTarget,
-          false
+        const renderedTargetHtml = renderInlineImageSlots(
+          renderFootnoteSlotsInHtml(
+            shouldFormatTargetHeti ? applyHetiTextTypography(formattedTarget) : formattedTarget,
+            false
+          ),
+          blockInfo.inlineImageHtmls
         );
 
         // If source and target are identical (e.g. pure number "1" in table.title2 td.bor1), do not duplicate!

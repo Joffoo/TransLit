@@ -605,6 +605,70 @@ async function runSeam3Tests() {
     'Swapped long body paragraph must be restored back into <p.indent>'
   );
 
+  // 3h. Inline <img> inside leaf <p> must be slotted cleanly and safe cached <img> tags must render instead of escaping to literal text
+  const inlineImgXhtml = `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+  <p class="score"><img alt="" class="inline" role="presentation" src="../images/com02.jpg"/>Score: 6/10</p>
+</body>
+</html>`;
+  const extractedImg = notesEngine.extractTranslatablePayload(inlineImgXhtml);
+  assert.equal(
+    extractedImg.blocks[0].slottedText,
+    '__IMG_0__Score: 6/10',
+    'Inline <img> must be replaced with __IMG_0__ slot before sending to LLM'
+  );
+  const mutatedImgFromSlot = notesEngine.mutateDomInPlace(inlineImgXhtml, '__IMG_0__评分：6/10');
+  assert.ok(
+    mutatedImgFromSlot.includes('<img alt="" class="inline" role="presentation" src="../images/com02.jpg"/>') &&
+      !mutatedImgFromSlot.includes('&lt;img'),
+    `__IMG_0__ must rehydrate back to real <img> tag, got: ${mutatedImgFromSlot}`
+  );
+  assert.equal(
+    sanitizeInlineXhtmlForLeaf('<img alt="" class="inline" role="presentation" src="../images/com02.jpg" onerror="alert(1)">评分：6/10'),
+    '<img alt="" class="inline" role="presentation" src="../images/com02.jpg"/>评分：6/10',
+    'Cached safe inline <img> must render as valid self-closing XHTML without unsafe handlers'
+  );
+  assert.equal(
+    sanitizeInlineXhtmlForLeaf('<img src="javascript:alert(1)">评分：6/10'),
+    '评分：6/10',
+    'Unsafe javascript: image src must be stripped'
+  );
+
+  // 3i. Mixed-content <li> with direct inline text/tags + nested <p> must extract & translate BOTH runs without leaving English
+  const mixedLiXhtml = `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+  <ul class="bullet">
+    <li class="bul1t"><span class="scb">low-level physical actions.</span> This is the “body” part—actually <i>doing</i> the thing in the world.
+      <p class="bul1p">However, with this method, the robot is limited to what it sees humans do.</p>
+    </li>
+  </ul>
+</body>
+</html>`;
+  const mixedExtracted = notesEngine.extractTranslatablePayload(mixedLiXhtml);
+  assert.equal(mixedExtracted.blocks.length, 2, 'Mixed <li> + nested <p> must extract 2 blocks instead of skipping lead text');
+  assert.ok(mixedExtracted.blocks[0].slottedText.includes('low-level physical actions.'));
+  assert.ok(mixedExtracted.blocks[1].slottedText.includes('However, with this method'));
+  const mixedMutated = notesEngine.mutateDomInPlace(
+    mixedLiXhtml,
+    '<b>低层物理动作。</b>这是“身体”部分——也就是真正在现实世界里<i>动手去做</i>。\n\n然而，采用这种方法时，机器人会受限于它所见人类做过的事情。'
+  );
+  assert.ok(
+    mixedMutated.includes('低层物理动作') &&
+      mixedMutated.includes('采用这种方法时') &&
+      !/low-level physical actions/i.test(mixedMutated),
+    `Mixed-content <li> lead text must be translated cleanly, got:\n${mixedMutated}`
+  );
+  assert.equal(
+    computeStructuralTreeDiff(
+      mixedLiXhtml,
+      `<html xmlns="http://www.w3.org/1999/xhtml"><body>${mixedMutated}</body></html>`
+    ).diffCount,
+    0,
+    'Mixed-content <li> normalization must keep structural Tree-Diff == 0'
+  );
+
   console.log('  [OK] Zero-CSS EPUB fallback stylesheet generation & XHTML linkage verified');
   console.log('  [OK] KaTeX inline formula vs currency ($10 and $20) separation verified');
   console.log('  [OK] Multi-paragraph same-page footnote cleanup verified');

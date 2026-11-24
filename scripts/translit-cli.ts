@@ -1160,7 +1160,7 @@ async function runEpubQualityAudit(
 
       corruptedChars += countReplacementChars(text);
 
-      if (/<\/?(?:a|span|div|p|font|strong|em)\b[^>]*>/i.test(text)) {
+      if (/<\/?(?:a|img|span|div|p|font|strong|em)\b[^>]*>/i.test(text)) {
         escapedHtmlLeaks.push({ fileName: ch.fileName, snippet: text.slice(0, 100) });
       }
 
