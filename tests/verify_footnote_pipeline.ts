@@ -107,6 +107,44 @@ async function runSlice1Tests() {
   console.log('  [OK] Multi-paragraph sibling boundary extraction (3 paragraphs captured for #fn1)');
   console.log('  [OK] Cross-file link internalization & chapter-scoped namespacing (#fn-0-1, #fn-1-1)');
   console.log('  [OK] Standalone footnote source protection & 0-Offset XHTML placeholder generation');
+
+  // 5. Leading separator cleanup when punctuation is outside the backlink <a> tag
+  const externalPunctResult = resolver.resolveAll(
+    {
+      'Text/ch.xhtml': `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+  <p>Quote<a href="notes.xhtml#fn3">[3]</a> and<a href="notes.xhtml#fn4">[4]</a> and<a href="notes.xhtml#fn5">[5]</a>.</p>
+</body></html>`,
+      'Text/notes.xhtml': `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+  <p id="fn3"><a href="ch.xhtml#ref3">3</a>. “Empowering Personal Superintelligence”: Mark Zuckerberg.</p>
+  <p id="fn4"><sup><a href="ch.xhtml#ref4">[4]</a></sup>. 2025年7月30日报告。</p>
+  <p id="fn5"><a href="ch.xhtml#ref5">5</a> ...continued from earlier note.</p>
+</body></html>`
+    },
+    ['Text/ch.xhtml', 'Text/notes.xhtml']
+  );
+
+  const fn3Node = externalPunctResult.topology.get('Text/notes.xhtml#fn3')!;
+  const fn4Node = externalPunctResult.topology.get('Text/notes.xhtml#fn4')!;
+  const fn5Node = externalPunctResult.topology.get('Text/notes.xhtml#fn5')!;
+  assert.equal(
+    fn3Node.plainText,
+    '“Empowering Personal Superintelligence”: Mark Zuckerberg.',
+    'Should strip leftover leading period outside backlink <a>'
+  );
+  assert.equal(
+    fn4Node.plainText,
+    '2025年7月30日报告。',
+    'Should strip empty <sup> wrapper + leftover period while preserving leading year digits'
+  );
+  assert.equal(
+    fn5Node.plainText,
+    '...continued from earlier note.',
+    'Should preserve leading ellipsis (...)'
+  );
+  console.log('  [OK] External backlink separator cleanup (preserving years & ellipses)');
+
   console.log('✓ Slice 1 (FootnoteResolver) passed!');
 }
 

@@ -623,6 +623,7 @@ export class FootnoteResolver {
 
   private cleanFootnoteParagraphNode(el: Element): { text: string; html: string } {
     const clone = el.cloneNode(true) as Element;
+    let removedLeadingBacklink = false;
 
     // Remove backlink anchors (leading number backlinks or trailing ↩ arrows)
     const links = Array.from(clone.querySelectorAll('a[href]'));
@@ -630,26 +631,43 @@ export class FootnoteResolver {
       const linkText = (a.textContent || '').trim();
       const cls = a.getAttribute('class') || '';
       const role = a.getAttribute('role') || a.getAttribute('epub:type') || '';
-      const isBacklink =
+      const trimmedCloneText = (clone.textContent || '').trim();
+      const isLeadingBacklink =
+        Boolean(linkText) &&
+        trimmedCloneText.startsWith(linkText) &&
+        /^(\[?\d+\]?\.?|\*+|†|‡)$/.test(linkText);
+      const isExplicitBacklink =
         /backlink|backref|doc-backlink/i.test(cls) ||
         /backlink|doc-backlink/i.test(role) ||
-        /^(↩|↑|↵|«|‹|back|return)$/i.test(linkText) ||
-        (/^(\[?\d+\]?\.?|\*+|†|‡)$/.test(linkText) &&
-          (clone.textContent || '').trim().startsWith(linkText));
+        /^(↩|↑|↵|«|‹|back|return)$/i.test(linkText);
 
-      if (isBacklink) {
+      if (isExplicitBacklink || isLeadingBacklink) {
+        if (isLeadingBacklink || (Boolean(linkText) && trimmedCloneText.startsWith(linkText))) {
+          removedLeadingBacklink = true;
+        }
         a.remove();
       }
     }
 
     let html = clone.innerHTML.trim();
-    // Strip leading punctuation/numbers left behind after backlink removal (e.g. "1. " or "[1] ")
-    html = html.replace(/^(?:\[\d+\]|\d+\.)\s*/, '').trim();
+    let text = (clone.textContent || '').replace(/\s+/g, ' ').trim();
 
-    const text = (clone.textContent || '')
-      .replace(/^(?:\[\d+\]|\d+\.)\s*/, '')
-      .replace(/\s+/g, ' ')
-      .trim();
+    if (removedLeadingBacklink) {
+      html = html
+        .replace(
+          /^(?:<(?:sup|sub|span|b|strong|i|em)\b[^>]*>\s*<\/(?:sup|sub|span|b|strong|i|em)>\s*)+/i,
+          ''
+        )
+        .trim();
+    }
+
+    // Strip leading punctuation/numbers left behind after backlink removal (e.g. "1. ", "[1]. ", or leftover ".")
+    const leadingPrefixRegex = removedLeadingBacklink
+      ? /^(?:(?:\[\d+\]|\(\d+\))(?:\s*[.．:：、])?|\d+[.．:：、]|\.(?!\.)|[．:：、])\s*/
+      : /^(?:(?:\[\d+\]|\(\d+\))(?:\s*[.．:：、])?|\d+[.．:：、])\s*/;
+
+    html = html.replace(leadingPrefixRegex, '').trim();
+    text = text.replace(leadingPrefixRegex, '').trim();
 
     return { text, html };
   }
