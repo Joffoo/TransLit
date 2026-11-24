@@ -4,7 +4,8 @@ import { PersistenceService } from '../services/persistenceService';
 import {
   buildAdaptiveChineseTypographyCss,
   EPUB3_POPUP_FOOTNOTE_CSS,
-  BILINGUAL_EPUB_CSS
+  BILINGUAL_EPUB_CSS,
+  HETI_SERIF_FONT_STACK
 } from '../services/epubService';
 import {
   DomMutationEngine,
@@ -374,15 +375,19 @@ html, body {
   box-sizing: border-box;
 }
 ${
-  !showTranslation
+  showTranslation
     ? `
+body {
+  font-family: ${HETI_SERIF_FONT_STACK};
+}
+`
+    : `
 body {
   font-family: "Lora", Georgia, Cambria, "Times New Roman", serif;
   line-height: 1.75;
   color: #262524;
 }
 `
-    : ''
 }
 img, svg {
   max-width: 100% !important;

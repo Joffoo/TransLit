@@ -194,14 +194,14 @@ export const EPUB3_POPUP_FOOTNOTE_CSS = `
   }
 `;
 
-const HETI_SERIF_FONT_STACK =
+export const HETI_SERIF_FONT_STACK =
   '"Heti Song", "Songti SC", "STSong", "Source Han Serif SC", "Source Han Serif CN", "Noto Serif SC", "Noto Serif CJK SC", "SimSun", "PMingLiU", serif';
 
 const HETI_SANS_FONT_STACK =
   '"Heti Hei", "PingFang SC", "Hiragino Sans GB", "Source Han Sans SC", "Source Han Sans CN", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif';
 
 const HETI_KAI_FONT_STACK =
-  '"Kaiti SC", "STKaiti", "KaiTi", "BiauKai", "LXGW WenKai", "FangSong", "STFangsong", serif';
+  '"Kaiti SC", "STKaiti", "KaiTi", "楷体", "SimKai", "BiauKai", "FZKai-Z03S", "DK-Kaiti", "LXGW WenKai", "FangSong", "STFangsong", serif';
 
 const STATIC_HEADING_CLASSES = [
   'sec1-titlea',
@@ -434,7 +434,7 @@ export function buildAdaptiveChineseTypographyCss(
   return `
   /* TransLit Chinese Bookish Typography Enhancement (Pure Heti + CLREQ Monochrome Preset) */
   body, .calibre {
-    font-family: ${HETI_SERIF_FONT_STACK};
+    /* Leave body font-family undeclared so e-readers (NeoReader, Apple Books, Kindle, WeRead) apply user-selected fonts without "Replace All Fonts". */
     font-size: 100%;
     line-height: 1.8;
     text-align: justify;
@@ -454,7 +454,7 @@ export function buildAdaptiveChineseTypographyCss(
   ${headingSelectorList},
   [data-translit-role="h1"], [data-translit-role="h2"],
   [data-translit-role="h3"], [data-translit-role="h4"] {
-    font-family: ${HETI_SANS_FONT_STACK}, ${HETI_SERIF_FONT_STACK};
+    font-family: ${HETI_SANS_FONT_STACK};
     font-weight: 700;
     color: inherit;
     line-height: 1.45;
@@ -487,7 +487,7 @@ export function buildAdaptiveChineseTypographyCss(
     margin: 1.1em 0 0.4em;
   }
   [data-translit-role="kicker"] {
-    font-family: ${HETI_SANS_FONT_STACK}, ${HETI_SERIF_FONT_STACK};
+    font-family: ${HETI_SANS_FONT_STACK};
     font-size: 0.88em;
     font-weight: 600;
     letter-spacing: 0.12em;
@@ -525,7 +525,7 @@ export function buildAdaptiveChineseTypographyCss(
     border: none;
     border-right: 2px solid rgba(128, 128, 128, 0.45);
     padding: 0 0.65em 0 0;
-    font-family: ${HETI_SANS_FONT_STACK}, ${HETI_SERIF_FONT_STACK};
+    font-family: ${HETI_SANS_FONT_STACK};
     font-weight: 700;
     font-size: 1.45em;
     line-height: 1.4;
@@ -566,7 +566,7 @@ export function buildAdaptiveChineseTypographyCss(
     margin: 0.35em 0 0 !important;
     color: inherit;
     opacity: 0.78;
-    font-family: ${HETI_SANS_FONT_STACK}, ${HETI_SERIF_FONT_STACK} !important;
+    font-family: ${HETI_SANS_FONT_STACK} !important;
   }
   [data-translit-role="title-table"] i,
   [data-translit-role="title-table"] em {
@@ -617,7 +617,6 @@ export function buildAdaptiveChineseTypographyCss(
     margin: 0.15em 0;
   }
   [data-translit-role="callout"] {
-    font-family: ${HETI_SERIF_FONT_STACK};
     font-size: 0.94em;
     line-height: 1.72;
     color: inherit;
@@ -667,7 +666,6 @@ export function buildAdaptiveChineseTypographyCss(
     font-family: ${HETI_KAI_FONT_STACK};
   }
   ${boldSelectorList}, [data-translit-role="strong"], [data-translit-weight="bold"] {
-    font-family: ${HETI_SERIF_FONT_STACK};
     font-weight: 700;
     color: inherit;
   }
@@ -939,7 +937,6 @@ export const BILINGUAL_EPUB_CSS = `
     font-family: inherit;
   }
   .bilingual-target {
-    font-family: ${HETI_SERIF_FONT_STACK};
     font-size: 1.02em;
     line-height: 1.8;
     line-break: strict;
@@ -1041,6 +1038,43 @@ export const BILINGUAL_EPUB_CSS = `
 `;
 
 export const CHINESE_TYPOGRAPHY_ENHANCEMENT_CSS = buildAdaptiveChineseTypographyCss();
+
+/**
+ * Strips hardcoded `font-family` declarations from per-chapter `<style>` blocks and
+ * `<body style="...">` attributes in Chinese EPUB exports so e-readers can apply
+ * user-selected fonts to body text while preserving external CSS role fonts (e.g. KaiTi).
+ */
+export function stripInlineFontFamilyForChineseEpub(xhtml: string): string {
+  if (!xhtml) return xhtml;
+  let updated = xhtml.replace(
+    /(<style\b[^>]*>)([\s\S]*?)(<\/style>)/gi,
+    (_m, openTag: string, cssBody: string, closeTag: string) => {
+      const cleanedCss = cssBody.replace(/font-family\s*:[^;{}]*(?:;|(?=\}))/gi, '');
+      return `${openTag}${cleanedCss}${closeTag}`;
+    }
+  );
+  updated = updated.replace(/<body\b[^>]*>/gi, (bodyTag) => {
+    return bodyTag.replace(
+      /\s*\bstyle\s*=\s*(?:"([^"]*)"|'([^']*)')/gi,
+      (_attrMatch, dqVal: string | undefined, sqVal: string | undefined) => {
+        const quote = dqVal !== undefined ? '"' : "'";
+        const rawStyle = dqVal !== undefined ? dqVal : (sqVal ?? '');
+        if (!/font-family\s*:/i.test(rawStyle)) {
+          return ` style=${quote}${rawStyle}${quote}`;
+        }
+        const cleanedDecls = rawStyle
+          .split(';')
+          .map((d) => d.trim())
+          .filter((d) => d.length > 0 && !/^font-family\s*:/i.test(d));
+        if (cleanedDecls.length === 0) {
+          return '';
+        }
+        return ` style=${quote}${cleanedDecls.join('; ')}${quote}`;
+      }
+    );
+  });
+  return updated;
+}
 
 export interface MarkdownBlock {
   type: 'heading' | 'image' | 'hr' | 'code' | 'table' | 'blockquote' | 'list' | 'paragraph';
@@ -2765,6 +2799,9 @@ export class EpubService {
       }
 
       newXhtml = attachGeneratedCssLink(newXhtml, cssRelPath);
+      if (isChinese) {
+        newXhtml = stripInlineFontFamilyForChineseEpub(newXhtml);
+      }
       zip.file(fullPath, newXhtml);
     }
 

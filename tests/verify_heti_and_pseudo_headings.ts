@@ -11,6 +11,8 @@ import {
 import {
   EpubService,
   buildAdaptiveChineseTypographyCss,
+  BILINGUAL_EPUB_CSS,
+  stripInlineFontFamilyForChineseEpub,
   splitMarkdownIntoBlocks,
   alignMarkdownBlocks
 } from '../services/epubService';
@@ -534,6 +536,170 @@ async function runTests() {
     'Remaining single visible quote-line must be re-indexed to data-translit-quote-pos="single"'
   );
   console.log('  [OK] Scene G passed');
+
+  // =========================================================================
+  // Scene H: Reader Custom Font Inheritance + KaiTi Preservation + Inline Strip
+  // =========================================================================
+  console.log('  [Scene H] Testing reader custom font inheritance, KaiTi rules & inline font-family stripping...');
+  const adaptiveCssH = buildAdaptiveChineseTypographyCss();
+  const extractCssBlock = (css: string, selectorSnippet: string): string => {
+    const idx = css.indexOf(selectorSnippet);
+    assert.ok(idx >= 0, `Expected CSS selector snippet "${selectorSnippet}"`);
+    const openBrace = css.indexOf('{', idx);
+    const closeBrace = css.indexOf('}', openBrace);
+    assert.ok(openBrace >= 0 && closeBrace > openBrace, `Expected CSS rule block for "${selectorSnippet}"`);
+    return css.slice(openBrace + 1, closeBrace);
+  };
+
+  assert.ok(
+    !/font-family\s*:/i.test(extractCssBlock(adaptiveCssH, 'body, .calibre {')),
+    'body, .calibre must NOT declare font-family so e-readers apply user custom fonts'
+  );
+  assert.ok(
+    !/font-family\s*:/i.test(extractCssBlock(adaptiveCssH, '[data-translit-role="callout"] {')),
+    '[data-translit-role="callout"] must NOT declare font-family so callouts inherit reader custom font'
+  );
+  assert.ok(
+    !/font-family\s*:/i.test(extractCssBlock(adaptiveCssH, '[data-translit-role="strong"], [data-translit-weight="bold"] {')),
+    'strong/bold selector rule must NOT declare font-family'
+  );
+  assert.ok(
+    !/sans-serif\s*,/i.test(adaptiveCssH),
+    'CSS must NOT contain invalid mid-list generic font-family "sans-serif,"'
+  );
+
+  // Bilingual CSS must let .bilingual-target inherit reader custom font while preserving KaiTi on em/blockquote
+  assert.ok(
+    !/font-family\s*:/i.test(extractCssBlock(BILINGUAL_EPUB_CSS, '.bilingual-target {')),
+    '.bilingual-target must NOT declare font-family'
+  );
+  assert.ok(
+    extractCssBlock(BILINGUAL_EPUB_CSS, '.bilingual-target em, .bilingual-target i {').includes('"KaiTi"'),
+    '.bilingual-target em/i must keep KaiTi font stack'
+  );
+  assert.ok(
+    extractCssBlock(BILINGUAL_EPUB_CSS, '\n  .bilingual-target blockquote {').includes('"KaiTi"'),
+    '.bilingual-target blockquote must keep KaiTi font stack'
+  );
+
+  // All KaiTi semantic selectors must preserve KaiTi font stack
+  for (const kaiSelector of [
+    'em, i, cite',
+    '[data-translit-role="emphasis"] {',
+    'blockquote {',
+    '[data-translit-role="quote-line"] {',
+    '[data-translit-role="epigraph"] {',
+    '[data-translit-role="verse"] {',
+    '[data-translit-role="subtitle"] {',
+    '[data-translit-role="right"], [data-translit-role="attribution"] {',
+    'caption, figcaption, [data-translit-role="caption"] {'
+  ]) {
+    assert.ok(
+      extractCssBlock(adaptiveCssH, kaiSelector).includes('"KaiTi"'),
+      `Expected KaiTi font stack in "${kaiSelector}"`
+    );
+  }
+
+  // Unit check for stripInlineFontFamilyForChineseEpub helper
+  const strippedSample = stripInlineFontFamilyForChineseEpub(
+    `<html><head><style>body { font-family: "Times New Roman", serif; color: #222; }</style></head><body class="calibre" style="color: #111; font-family: 'Times New Roman', serif; line-height: 1.6"><p>Hi</p></body></html>`
+  );
+  assert.ok(!/font-family/i.test(strippedSample), 'Expected helper to strip all inline font-family declarations');
+  assert.ok(strippedSample.includes('color: #222;'), 'Expected helper to keep non-font rules in <style>');
+  assert.ok(
+    strippedSample.includes('style="color: #111; line-height: 1.6"'),
+    `Expected helper to keep other <body style> declarations cleanly, got: ${strippedSample}`
+  );
+
+  // E2E Calibre-style EPUB export test with <style> and <body style="font-family: ...">
+  const calibreZip = new JSZip();
+  calibreZip.file('mimetype', 'application/epub+zip', { compression: 'STORE' });
+  calibreZip.file(
+    'META-INF/container.xml',
+    `<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>`
+  );
+  calibreZip.file(
+    'OEBPS/content.opf',
+    `<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Calibre Font Test</dc:title><dc:language>en</dc:language></metadata>
+  <manifest>
+    <item id="css" href="stylesheet.css" media-type="text/css"/>
+    <item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>`
+  );
+  calibreZip.file(
+    'OEBPS/stylesheet.css',
+    `.calibre { font-family: times, serif; } .bold { font-weight: bold; } .calibre5 { font-style: italic; }`
+  );
+  calibreZip.file(
+    'OEBPS/ch1.xhtml',
+    `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <title>Ch1</title>
+  <link rel="stylesheet" type="text/css" href="stylesheet.css"/>
+  <style>body { font-family: "Times New Roman", serif; color: #222; }</style>
+</head>
+<body class="calibre" style="font-family: Georgia, serif;">
+  <p class="calibre">Normal body with <span class="bold">bold</span> and <em>italic</em>.</p>
+  <blockquote><p>Quoted text</p></blockquote>
+</body>
+</html>`
+  );
+
+  const calibreBuf = await calibreZip.generateAsync({ type: 'uint8array' });
+  const parsedCalibre = await epubService.parseEpub(calibreBuf);
+  parsedCalibre.chapters[0].translatedMarkdown = '带有**粗体**和*斜体*的正文。\n\n> 引文内容。';
+  const calibreWorkingZip = await new JSZip().loadAsync(calibreBuf);
+  const exportedCalibreBlob = await epubService.generateEpub(
+    parsedCalibre.chapters,
+    calibreWorkingZip,
+    parsedCalibre.opfPath,
+    parsedCalibre.opfDir,
+    parsedCalibre.cssFiles,
+    'Calibre Font Test',
+    'Chinese'
+  );
+  const exportedCalibreZip = await new JSZip().loadAsync(await exportedCalibreBlob.arrayBuffer());
+  const exportedCalibreCss = await exportedCalibreZip.file('OEBPS/stylesheet.css')!.async('string');
+  const exportedCalibreXhtml = await exportedCalibreZip.file('OEBPS/ch1.xhtml')!.async('string');
+
+  assert.ok(
+    !/font-family\s*:/i.test(extractCssBlock(exportedCalibreCss, 'body, .calibre {')),
+    'Exported Calibre CSS body, .calibre must NOT have font-family'
+  );
+  assert.ok(
+    !/font-family\s*:/i.test(extractCssBlock(exportedCalibreCss, '[data-translit-role="callout"] {')),
+    'Exported Calibre CSS callout must NOT have font-family'
+  );
+  assert.ok(
+    !/font-family\s*:/i.test(extractCssBlock(exportedCalibreCss, '[data-translit-role="strong"], [data-translit-weight="bold"] {')),
+    'Exported Calibre CSS bold rule must NOT have font-family'
+  );
+  assert.ok(
+    extractCssBlock(exportedCalibreCss, 'blockquote {').includes('"KaiTi"'),
+    'Exported Calibre CSS blockquote must preserve KaiTi'
+  );
+  assert.ok(
+    extractCssBlock(exportedCalibreCss, 'em, i, cite').includes('"KaiTi"'),
+    'Exported Calibre CSS em/i/cite must preserve KaiTi'
+  );
+  assert.ok(
+    !/font-family/i.test(exportedCalibreXhtml),
+    `Exported Calibre XHTML must strip font-family from <style> and <body style>, got:\n${exportedCalibreXhtml}`
+  );
+  assert.ok(
+    exportedCalibreXhtml.includes('color: #222;'),
+    'Exported Calibre XHTML must preserve non-font rules inside <style>'
+  );
+  assert.ok(
+    exportedCalibreXhtml.includes('<body class="calibre"'),
+    'Exported Calibre XHTML must preserve body class attribute'
+  );
+  console.log('  [OK] Scene H passed');
 
   console.log('ALL HETI & PSEUDO-HEADING TESTS PASSED!');
 }
