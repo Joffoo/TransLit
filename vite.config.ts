@@ -5,6 +5,41 @@ import type { Plugin } from 'vite';
 import type { IncomingMessage, ServerResponse } from 'http';
 import { isForbiddenTargetHost, isSelfProxyPath } from './cloudflare/worker';
 
+let cachedEnvProxyAgent: unknown | null | undefined = undefined;
+
+async function getEnvProxyDispatcher(parsedUrl: URL): Promise<unknown | undefined> {
+  const hostname = parsedUrl.hostname.trim().toLowerCase();
+  if (
+    hostname === 'localhost' ||
+    hostname === '127.0.0.1' ||
+    hostname === '::1' ||
+    hostname === '[::1]'
+  ) {
+    return undefined;
+  }
+
+  const hasProxyEnv = Boolean(
+    process.env.HTTPS_PROXY ||
+      process.env.https_proxy ||
+      process.env.HTTP_PROXY ||
+      process.env.http_proxy
+  );
+  if (!hasProxyEnv) return undefined;
+
+  if (cachedEnvProxyAgent !== undefined) {
+    return cachedEnvProxyAgent ?? undefined;
+  }
+
+  try {
+    const undiciModName: string = 'undici';
+    const undici: any = await import(/* @vite-ignore */ undiciModName);
+    cachedEnvProxyAgent = undici?.EnvHttpProxyAgent ? new undici.EnvHttpProxyAgent() : null;
+  } catch {
+    cachedEnvProxyAgent = null;
+  }
+  return cachedEnvProxyAgent ?? undefined;
+}
+
 function attachApiProxyMiddleware(middlewares: {
   use: (route: string, fn: (req: IncomingMessage, res: ServerResponse) => void) => void;
 }) {
@@ -90,12 +125,27 @@ function attachApiProxyMiddleware(middlewares: {
       forwardHeaders['x-api-key'] = req.headers['x-api-key'] as string;
     }
 
+    const baseFetchInit: RequestInit = {
+      method,
+      headers: forwardHeaders,
+      body: method === 'POST' && body.length > 0 ? body : undefined,
+    };
+
     try {
-      const apiRes = await fetch(parsedUrl.toString(), {
-        method,
-        headers: forwardHeaders,
-        body: method === 'POST' && body.length > 0 ? body : undefined,
-      });
+      const dispatcher = await getEnvProxyDispatcher(parsedUrl);
+      let apiRes: Response;
+      if (dispatcher) {
+        try {
+          apiRes = await fetch(parsedUrl.toString(), {
+            ...baseFetchInit,
+            dispatcher,
+          } as RequestInit);
+        } catch {
+          apiRes = await fetch(parsedUrl.toString(), baseFetchInit);
+        }
+      } else {
+        apiRes = await fetch(parsedUrl.toString(), baseFetchInit);
+      }
 
       res.writeHead(apiRes.status, {
         ...baseHeaders,
@@ -104,11 +154,16 @@ function attachApiProxyMiddleware(middlewares: {
       const text = await apiRes.text();
       res.end(text);
     } catch (err: any) {
+      const causeMsg = err?.cause?.code || err?.cause?.message || '';
+      const baseMsg = String(err?.message ?? err);
+      const detail = causeMsg ? `${baseMsg} (${causeMsg})` : baseMsg;
       res.writeHead(502, {
         ...baseHeaders,
         'content-type': 'application/json',
+        'x-translit-proxy-error': '1',
+        'access-control-expose-headers': 'x-translit-proxy, x-translit-proxy-error',
       });
-      res.end(JSON.stringify({ error: 'Proxy error', detail: String(err?.message ?? err) }));
+      res.end(JSON.stringify({ error: 'Proxy error', detail }));
     }
   });
 }

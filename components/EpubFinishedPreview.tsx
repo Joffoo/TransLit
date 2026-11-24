@@ -12,7 +12,7 @@ import {
   applyHetiTextTypography,
   parseEpubCssProfiles
 } from '../services/domMutationEngine';
-import { Chapter, BilingualMode, FootnoteNode } from '../types';
+import { Chapter, BilingualMode, BookStyleRoleMap, FootnoteNode } from '../types';
 
 // Helper to resolve relative paths in EPUB
 export const resolveEpubPath = (basePath: string, relativePath: string): string => {
@@ -162,6 +162,7 @@ export interface EpubFinishedPreviewProps {
   chapter: Chapter;
   displayMode: 'translation' | 'bilingual' | 'source';
   bookCssTexts: string[];
+  bookStyleRoles?: BookStyleRoleMap;
   opfDir?: string;
   persistence: PersistenceService;
   isStreamingCurrentChapter?: boolean;
@@ -172,6 +173,7 @@ export const EpubFinishedPreview: React.FC<EpubFinishedPreviewProps> = ({
   chapter,
   displayMode,
   bookCssTexts,
+  bookStyleRoles,
   opfDir,
   persistence,
   isStreamingCurrentChapter = false,
@@ -236,6 +238,7 @@ export const EpubFinishedPreview: React.FC<EpubFinishedPreviewProps> = ({
         bilingualMode: effectiveBilingualMode,
         wereadMode: false,
         cssProfiles,
+        bookStyleRoles,
         applyChineseTypography: showTranslation,
         isStreaming: isStreamingCurrentChapter && showTranslation
       }
@@ -254,6 +257,7 @@ export const EpubFinishedPreview: React.FC<EpubFinishedPreviewProps> = ({
     showTranslation,
     effectiveBilingualMode,
     cssProfiles,
+    bookStyleRoles,
     isStreamingCurrentChapter
   ]);
 
@@ -345,7 +349,8 @@ export const EpubFinishedPreview: React.FC<EpubFinishedPreviewProps> = ({
   const combinedPreviewCss = useMemo(() => {
     const adaptiveCss = showTranslation
       ? buildAdaptiveChineseTypographyCss(
-          effectiveCssTexts.length > 0 ? effectiveCssTexts : undefined
+          effectiveCssTexts.length > 0 ? effectiveCssTexts : undefined,
+          bookStyleRoles
         )
       : '';
     const bilingualCss = effectiveBilingualMode !== 'none' ? BILINGUAL_EPUB_CSS : '';
@@ -362,6 +367,7 @@ html, body {
   margin: 0 !important;
   padding: 2px 2px 16px 2px !important;
   background: transparent !important;
+  color: #242424;
   overflow-x: hidden !important;
   height: auto !important;
   min-height: 0 !important;
@@ -389,7 +395,7 @@ aside.footnote-popup.is-highlighted {
   transition: background-color 0.25s ease;
 }
     `.trim();
-  }, [effectiveCssTexts, showTranslation, effectiveBilingualMode]);
+  }, [effectiveCssTexts, bookStyleRoles, showTranslation, effectiveBilingualMode]);
 
   const srcDoc = useMemo(() => {
     const safeHtml = resolvedBodyHtml || rawMutatedBodyHtml;

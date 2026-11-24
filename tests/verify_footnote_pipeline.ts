@@ -7,11 +7,14 @@ import {
   FOOTNOTE_SLOT_PROMPT_CONSTRAINT,
   createFootnoteSlot,
   validateAndRepairSlots,
+  stripLeakedFootnoteDefinitions,
   isPureUrlOrCode
 } from '../services/footnotePool';
+import { DomMutationEngine } from '../services/domMutationEngine';
 import { EpubService } from '../services/epubService';
 import { Chapter, FootnoteNode, AppConfig } from '../types';
-import { AiService } from '../services/geminiService';
+import { AiService, countReplacementChars } from '../services/geminiService';
+import { parseHtmlDocument } from '../utils/domAdapter';
 
 async function runSlice1Tests() {
   console.log('--- Running Slice 1: FootnoteResolver Verification ---');
@@ -1148,6 +1151,244 @@ https://www.irs.gov/pub/irs-pdf/p17.pdf
   console.log('✓ Slice 7 (Real-World Dual-Channel Footnote Robustness Suite) passed!');
 }
 
+async function runSlice8LeakStripAndEncodingTests() {
+  console.log('--- Running Slice 8: Leaked (ch-n) Footnote Stripping, Paragraph-Aware Repair & Encoding Check ---');
+
+  // 1. stripLeakedFootnoteDefinitions handles (8 -1), <sup>(8 -2)</sup>, and stuck trailing __FN_REF_8-1____FN_REF_8-2__
+  const leakedSample = [
+    '这是主正文段落__FN_REF_8-1____FN_REF_8-2__。',
+    '这句提到 (1956) 年和算式 (3 - 1 = 2) 应当保留。',
+    '(8 -1) “这项研究将基于这样一个猜想展开”：约翰·麦卡锡，1955 年 8 月 31 日。',
+    '<sup>(8 -2)</sup> “制造智能机器的科学与工程”：约翰·麦卡锡主页，2007 年 11 月 12 日。__FN_REF_8-1____FN_REF_8-2__'
+  ].join('\n\n');
+
+  const stripped = stripLeakedFootnoteDefinitions(leakedSample, ['8-1', '8-2']);
+  assert.ok(!stripped.cleanedText.includes('(8 -1)'), 'Must strip (8 -1) leaked paragraph');
+  assert.ok(!stripped.cleanedText.includes('<sup>(8 -2)</sup>'), 'Must strip <sup>(8 -2)</sup> leaked paragraph');
+  assert.ok(stripped.cleanedText.includes('(1956)'), 'Ordinary year parenthetical (1956) must be preserved');
+  assert.ok(stripped.cleanedText.includes('(3 - 1 = 2)'), 'Ordinary arithmetic parenthetical must be preserved');
+  assert.ok(
+    stripped.extractedDefs['8-1']?.includes('约翰·麦卡锡，1955 年 8 月 31 日'),
+    'Salvaged 8-1 definition must retain clean prose'
+  );
+  assert.ok(
+    !stripped.extractedDefs['8-2']?.includes('__FN_REF_'),
+    'Salvaged 8-2 definition must strip trailing stuck __FN_REF_ slots'
+  );
+
+  // 2. parseDualChannelResponse strips leaked (8 -1)/(8 -2) BEFORE validateAndRepairSlots & removes Level 4 body definitions
+  const fn8_1: FootnoteNode = {
+    key: 'Text/Notes.xhtml#fn_8-1',
+    sourceFile: 'Text/Notes.xhtml',
+    originalId: 'fn_8-1',
+    namespaceId: '8-1',
+    label: '1',
+    html: '<p>Proposal for the Dartmouth Summer Research Project, 1955.</p>',
+    plainText: 'Proposal for the Dartmouth Summer Research Project, 1955.',
+    paragraphs: ['Proposal for the Dartmouth Summer Research Project, 1955.'],
+    referencedByChapters: [8]
+  };
+  const fn8_2: FootnoteNode = {
+    key: 'Text/Notes.xhtml#fn_8-2',
+    sourceFile: 'Text/Notes.xhtml',
+    originalId: 'fn_8-2',
+    namespaceId: '8-2',
+    label: '2',
+    html: '<p>John McCarthy, What is Artificial Intelligence, 2007.</p>',
+    plainText: 'John McCarthy, What is Artificial Intelligence, 2007.',
+    paragraphs: ['John McCarthy, What is Artificial Intelligence, 2007.'],
+    referencedByChapters: [8]
+  };
+
+  const pool = new FootnotePool();
+  const dualSrc = '第一段提到麦卡锡__FN_REF_8-1__。\n\n第二段给出定义__FN_REF_8-2__。';
+  const dualRespWithLeaks = [
+    '[MAIN_CONTENT]',
+    '第一段提到麦卡锡。',
+    '',
+    '第二段给出定义。',
+    '',
+    '(8 -1) 达特茅斯夏季人工智能研究项目提案，1955 年。',
+    '',
+    '(8 -2) 约翰·麦卡锡，《什么是人工智能？》，2007 年。',
+    '[/MAIN_CONTENT]'
+  ].join('\n');
+
+  const dualParsed = pool.parseDualChannelResponse(dualRespWithLeaks, dualSrc, [fn8_1, fn8_2]);
+  assert.ok(!dualParsed.translatedBody.includes('(8 -1)'), 'parseDualChannelResponse must strip (8 -1) from body');
+  assert.ok(!dualParsed.translatedBody.includes('(8 -2)'), 'parseDualChannelResponse must strip (8 -2) from body');
+  assert.ok(dualParsed.translatedFootnotes['8-1']?.includes('达特茅斯夏季人工智能研究项目提案'));
+  assert.ok(dualParsed.translatedFootnotes['8-2']?.includes('约翰·麦卡锡'));
+
+  // 3. Multi-paragraph validateAndRepairSlots re-injects missing slots into source-corresponding paragraphs (never into # Heading)
+  const multiSrc = [
+    '## Section Title',
+    'Paragraph one cites proposal __FN_REF_8-1__.',
+    'Paragraph two cites website __FN_REF_8-2__.',
+    'Trailing closing paragraph without footnotes.'
+  ].join('\n\n');
+  const multiTgtMissingSlots = [
+    '## 章节标题',
+    '第一段引用了提案。',
+    '第二段引用了网页。',
+    '最后一段没有任何脚注。'
+  ].join('\n\n');
+  const repairedMulti = validateAndRepairSlots(multiSrc, multiTgtMissingSlots);
+  const repairedParas = repairedMulti.repairedText.split(/\n{2,}/);
+  assert.ok(!repairedParas[0].includes('__FN_REF_'), 'Heading must never receive re-injected slots');
+  assert.ok(repairedParas[1].includes('__FN_REF_8-1__'), `Paragraph 1 must receive 8-1, got: ${repairedParas[1]}`);
+  assert.ok(repairedParas[2].includes('__FN_REF_8-2__'), `Paragraph 2 must receive 8-2, got: ${repairedParas[2]}`);
+  assert.ok(!repairedParas[3].includes('__FN_REF_'), 'Unrelated trailing paragraph must not collect dumped slots');
+
+  // 4. DomMutationEngine strips legacy cached leaked (8 -1)/(8 -2) paragraphs during export
+  const domEngine = new DomMutationEngine();
+  const sampleXhtml = `<html xmlns="http://www.w3.org/1999/xhtml"><body>
+    <h2>Are You My AI?</h2>
+    <p>McCarthy proposed the term.<a epub:type="noteref" href="#fn-8-1" data-fn-id="8-1">[1]</a></p>
+    <p>AI means smart machines.<a epub:type="noteref" href="#fn-8-2" data-fn-id="8-2">[2]</a></p>
+  </body></html>`;
+  const legacyCachedTranslation = [
+    '你是我的 AI 吗？',
+    '麦卡锡提出了这个词。__FN_REF_8-1__',
+    '人工智能是指智能机器。__FN_REF_8-2__',
+    '(8 -1) “这项研究将基于这样一个猜想展开”：约翰·麦卡锡。',
+    '<sup>(8 -2)</sup> “制造智能机器的科学与工程”：麦卡锡主页。__FN_REF_8-1____FN_REF_8-2__'
+  ].join('\n\n');
+
+  const cleanedMutated = domEngine.mutateDomInPlace(sampleXhtml, legacyCachedTranslation, {
+    internalizedFootnotes: { '8-1': fn8_1, '8-2': fn8_2 }
+  });
+  const mutatedDoc = parseHtmlDocument(cleanedMutated);
+  const bodyNonAsideText = Array.from(mutatedDoc.body!.querySelectorAll('h2, p'))
+    .filter((el) => !el.closest('aside'))
+    .map((el) => el.textContent || '')
+    .join('\n');
+  assert.ok(!bodyNonAsideText.includes('(8 -1)'), 'Exported body paragraphs must not contain leaked (8 -1)');
+  assert.ok(!bodyNonAsideText.includes('(8 -2)'), 'Exported body paragraphs must not contain leaked (8 -2)');
+  assert.equal(mutatedDoc.querySelectorAll('aside.footnote-popup').length, 2, 'Salvaged 8-1 and 8-2 must appear inside EPUB3 aside popups');
+
+  // 5. countReplacementChars detects \uFFFD and ignores ordinary geometric block ■
+  assert.equal(countReplacementChars('一个我可以反复■到的精确\uFFFD\uFFFD\uFFFD义'), 3, 'Must count exact 3 \\uFFFD chars');
+  assert.equal(countReplacementChars('被螺栓■定在素白墙上'), 0, 'Must NOT treat geometric black square ■ as \\uFFFD');
+
+  // 6. Digit boundary + explicit localized citation/definition guard (never eat "2025年初..." as footnote 2!)
+  const fn0_1: FootnoteNode = {
+    key: 'Text/Notes.xhtml#en000',
+    sourceFile: 'Text/Notes.xhtml',
+    originalId: 'en000',
+    namespaceId: '0-1',
+    label: '1',
+    html: '<p>Bill Gates on The Tonight Show.</p>',
+    plainText: 'Bill Gates on The Tonight Show.',
+    paragraphs: ['Bill Gates on The Tonight Show.'],
+    referencedByChapters: [0]
+  };
+  const fn0_2: FootnoteNode = {
+    key: 'Text/Notes.xhtml#en001',
+    sourceFile: 'Text/Notes.xhtml',
+    originalId: 'en001',
+    namespaceId: '0-2',
+    label: '2',
+    html: '<p>Google CEO on AI.</p>',
+    plainText: 'Google CEO on AI.',
+    paragraphs: ['Google CEO on AI.'],
+    referencedByChapters: [0]
+  };
+
+  const introSrcWithNotes = [
+    '## Why Would Anyone Choose to Live Like This?',
+    '2025 began my experiment with AI.__FN_REF_0-1__ Google CEO even compared it to fire and electricity.__FN_REF_0-2__'
+  ].join('\n\n');
+  const introRespChineseLocalized = [
+    '[MAIN_CONTENT]',
+    '为什么会有人选择这样生活？',
+    '',
+    '2025 年初我开始这项实验（脚注 1），谷歌 CEO 甚至称它比火和电更深刻（脚注 2）。',
+    '',
+    '脚注 1：比尔·盖茨在《今夜秀》上的访谈记录。',
+    '',
+    '脚注 2：桑达尔·皮查伊关于人工智能的演讲。',
+    '[/MAIN_CONTENT]'
+  ].join('\n');
+
+  const parsedLocalizedIntro = pool.parseDualChannelResponse(
+    introRespChineseLocalized,
+    introSrcWithNotes,
+    [fn0_1, fn0_2]
+  );
+  assert.ok(
+    parsedLocalizedIntro.translatedBody.includes('2025 年初我开始这项实验'),
+    `Body starting with digit year 2025 must NEVER be eaten by footnote Level 4 fuzzy matcher, got:\n${parsedLocalizedIntro.translatedBody}`
+  );
+  assert.ok(
+    parsedLocalizedIntro.translatedBody.includes('为什么会有人选择这样生活？'),
+    'Heading above digit-starting paragraph must stay intact'
+  );
+  assert.ok(
+    !parsedLocalizedIntro.translatedBody.includes('（脚注 1）') &&
+      !parsedLocalizedIntro.translatedBody.includes('（脚注 2）') &&
+      !parsedLocalizedIntro.translatedBody.includes('脚注 1：') &&
+      !parsedLocalizedIntro.translatedBody.includes('脚注 2：'),
+    `Localized inline citations & leaked keyword definitions must be replaced/stripped cleanly, got:\n${parsedLocalizedIntro.translatedBody}`
+  );
+  assert.ok(
+    parsedLocalizedIntro.translatedBody.includes('__FN_REF_0-1__') &&
+      parsedLocalizedIntro.translatedBody.includes('__FN_REF_0-2__'),
+    'Localized（脚注 1）/（脚注 2）citations must normalize in-place to __FN_REF_0-1__/__FN_REF_0-2__'
+  );
+  assert.equal(
+    parsedLocalizedIntro.translatedFootnotes['0-1'],
+    '比尔·盖茨在《今夜秀》上的访谈记录。'
+  );
+  assert.equal(
+    parsedLocalizedIntro.translatedFootnotes['0-2'],
+    '桑达尔·皮查伊关于人工智能的演讲。'
+  );
+
+  // Tortoise-shell brackets (`〔1〕`, `〔2〕`, `〔3〕`) in prose + inline-concatenated leaked definitions
+  const fn0_3: FootnoteNode = {
+    key: 'notes.xhtml#fn3',
+    sourceFile: 'notes.xhtml',
+    originalId: 'fn3',
+    namespaceId: '0-3',
+    label: '3',
+    html: '<p>Sam Altman Senate testimony.</p>',
+    plainText: 'Sam Altman Senate testimony.',
+    paragraphs: ['Sam Altman Senate testimony.'],
+    referencedByChapters: [0]
+  };
+  const tortoiseSrc =
+    'Bill Gates spoke on TV.__FN_REF_0-1__ Google CEO agreed.__FN_REF_0-2__ Sam Altman testified.__FN_REF_0-3__';
+  const tortoiseResp = [
+    '[MAIN_CONTENT]',
+    '比尔·盖茨在《今夜秀》〔1〕大力宣传 AI，谷歌 CEO〔2〕表示赞同，萨姆·奥尔特曼〔3〕在参议院作证。',
+    '',
+    '〔1〕比尔·盖茨在《今夜秀》上大力宣传 AI 革命：访谈记录。〔2〕AI“比火与电更为深刻”：世界经济论坛报道。',
+    '',
+    '〔3〕“我相信好的将比坏的大出几个数量级”：参议院证词。',
+    '[/MAIN_CONTENT]'
+  ].join('\n');
+
+  const parsedTortoise = pool.parseDualChannelResponse(tortoiseResp, tortoiseSrc, [fn0_1, fn0_2, fn0_3]);
+  assert.ok(
+    parsedTortoise.translatedBody.includes('__FN_REF_0-1__') &&
+      parsedTortoise.translatedBody.includes('__FN_REF_0-2__') &&
+      parsedTortoise.translatedBody.includes('__FN_REF_0-3__'),
+    `Tortoise-shell citations 〔1〕/〔2〕/〔3〕 must normalize in-place to __FN_REF__ slots, got:\n${parsedTortoise.translatedBody}`
+  );
+  assert.ok(
+    !/〔[123]〕/.test(parsedTortoise.translatedBody) &&
+      !parsedTortoise.translatedBody.includes('访谈记录') &&
+      !parsedTortoise.translatedBody.includes('参议院证词'),
+    `Leaked inline & standalone 〔n〕 footnote definitions must be stripped from body, got:\n${parsedTortoise.translatedBody}`
+  );
+  assert.equal(parsedTortoise.translatedFootnotes['0-1'], '比尔·盖茨在《今夜秀》上大力宣传 AI 革命：访谈记录。');
+  assert.equal(parsedTortoise.translatedFootnotes['0-2'], 'AI“比火与电更为深刻”：世界经济论坛报道。');
+  assert.equal(parsedTortoise.translatedFootnotes['0-3'], '“我相信好的将比坏的大出几个数量级”：参议院证词。');
+
+  console.log('✓ Slice 8 passed!');
+}
+
 async function main() {
   await runSlice1Tests();
   await runSlice2Tests();
@@ -1155,6 +1396,7 @@ async function main() {
   await runSlice5EndToEndTests();
   await runSlice6RealWorldEpub3RegressionTests();
   await runSlice7Tests();
+  await runSlice8LeakStripAndEncodingTests();
   console.log('\n[PASS] ALL_PIPELINE_VERIFICATIONS_SUCCESSFUL');
 }
 

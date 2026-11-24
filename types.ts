@@ -81,6 +81,44 @@ export interface TokenUsageStats extends TokenUsage {
   requestCount: number;
 }
 
+export type BlockStyleRole =
+  | 'h1'
+  | 'h2'
+  | 'h3'
+  | 'h4'
+  | 'kicker'
+  | 'subtitle'
+  | 'body'
+  | 'quote'
+  | 'epigraph'
+  | 'verse'
+  | 'attribution'
+  | 'callout'
+  | 'caption'
+  | 'hanging'
+  | 'meta'
+  | 'divider'
+  | 'ignore';
+
+export type InlineStyleRole =
+  | 'emphasis'
+  | 'strong'
+  | 'dropcap'
+  | 'code'
+  | 'ignore';
+
+export type BookStyleRole = BlockStyleRole | InlineStyleRole;
+
+export interface CssClassSemanticMapping {
+  role: BookStyleRole;
+  scope?: 'block' | 'inline';
+  align?: 'left' | 'center' | 'right';
+  weight?: 'bold';
+  indent?: 'none';
+}
+
+export type BookStyleRoleMap = Record<string, CssClassSemanticMapping>;
+
 export interface SessionState {
   status: AppStatus;
   config: AppConfig;
@@ -92,6 +130,8 @@ export interface SessionState {
   opfDir?: string;
   cssFiles?: string[];
   cssContents?: string[];
+  bookStyleRoles?: BookStyleRoleMap;
+  bookStyleRolesAiDone?: boolean;
   tokenStats?: TokenUsageStats;
 }
 

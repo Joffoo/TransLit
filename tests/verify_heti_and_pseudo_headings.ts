@@ -354,6 +354,187 @@ async function runTests() {
   assert.equal(outDoc.querySelectorAll('blockquote').length, 1, 'Exported XHTML should collapse 8 nested blockquotes into 1');
   console.log('  [OK] Scene E passed');
 
+  // =========================================================================
+  // Scene F: Offline Consecutive Short-Line Veto, Bold Non-Headings & Exemptions
+  // =========================================================================
+  console.log('  [Scene F] Testing offline consecutive short-line veto, bold non-headings & exemptions...');
+  const sceneFCss = `
+    .centert { font-size: 0.9em; font-weight: bold; text-align: center; font-variant: small-caps; text-indent: 0; margin-top: 1em; }
+    .center { font-size: 0.9em; font-weight: bold; text-align: center; font-variant: small-caps; text-indent: 0; }
+    .centerb { font-size: 0.9em; font-weight: bold; text-align: center; font-variant: small-caps; text-indent: 0; margin-bottom: 1em; }
+    .bold-lead { font-weight: bold; text-indent: 0; }
+    .takeaway { font-weight: bold; text-align: center; text-indent: 0; }
+    .bold { font-weight: bold; }
+    .stickupcap { font-size: 1.5em; font-weight: bold; }
+    .box { border-left: 2px solid #888; padding-left: 1em; font-weight: bold; text-indent: 0; }
+  `;
+  const profilesF = parseEpubCssProfiles([sceneFCss]);
+  const offlineCssF = buildAdaptiveChineseTypographyCss([sceneFCss]);
+
+  // Verify .bold-lead is in bold selector and NOT in heading selector; .stickupcap is neutralized
+  const headingMatchF = offlineCssF.match(/\/\*\s*Semantic Headings & Publisher Pseudo-Headings\s*\*\/\s*([\s\S]*?)\{/);
+  assert.ok(headingMatchF && !headingMatchF[1].includes('.bold-lead'), 'Bold non-indented prose .bold-lead must NOT become a CSS heading');
+  assert.ok(
+    /strong,\s*b[^}]*\.bold-lead/.test(offlineCssF),
+    'Bold non-indented prose .bold-lead must be preserved in bold CSS rule'
+  );
+  assert.ok(
+    offlineCssF.includes('.stickupcap') && /font-weight:\s*inherit\s*!important/.test(offlineCssF),
+    'Offline CSS must neutralize .stickupcap dropcap weight'
+  );
+
+  // Offline 3-line plaque without bookStyleRoles -> vetoed from headings & stamped quote-line
+  const plaqueOfflineXhtml = `<html xmlns="http://www.w3.org/1999/xhtml"><body>
+    <p><span class="stickupcap">I</span>t began in front of a plaque:</p>
+    <p class="centert">IN THIS BUILDING DURING THE SUMMER OF 1956</p>
+    <p class="center">the Dartmouth Summer Research Project on Artificial Intelligence</p>
+    <p class="centerb">Founding of Artificial Intelligence as a Research Discipline</p>
+    <p class="bold-lead">Remember how this technology evolved.</p>
+    <p class="takeaway">Read this book to understand how AI tries to imitate the way we do things.</p>
+    <div class="box"><p class="bold-lead">Boxed note</p></div>
+    <blockquote><p style="font-weight: bold; text-transform: uppercase;">QUOTED TITLE LINE</p></blockquote>
+    <p>Inline <span class="bold">bold phrase</span> inside body.</p>
+  </body></html>`;
+
+  const extractedF = engine.extractTranslatablePayload(plaqueOfflineXhtml, {}, profilesF);
+  for (const blk of extractedF.blocks) {
+    assert.ok(!blk.slottedText.startsWith('#'), `Block "${blk.slottedText}" must NOT be extracted as heading`);
+  }
+
+  const mutatedF = engine.mutateDomInPlace(plaqueOfflineXhtml, [
+    '一切始于一块牌匾前：',
+    '1956 年夏天在此楼举行',
+    '达特茅斯夏季人工智能研究项目',
+    '人工智能作为一门研究学科的创立',
+    '请记住这项技术是如何演变的。',
+    '阅读这本书，你就能理解人工智能是如何试图模仿我们做事的方式的。',
+    '文本框注释',
+    '引文标题行',
+    '正文中的<b>粗体短语</b>。'
+  ].join('\n\n'), { cssProfiles: profilesF });
+  const docF = parseHtmlDocument(mutatedF);
+  assert.equal(docF.querySelector('p.centert')?.getAttribute('data-translit-role'), 'quote-line');
+  assert.equal(docF.querySelector('p.centert')?.getAttribute('data-translit-quote-pos'), 'first');
+  assert.equal(docF.querySelector('p.centert')?.getAttribute('data-translit-align'), 'center');
+  assert.equal(docF.querySelector('p.center')?.getAttribute('data-translit-quote-pos'), 'mid');
+  assert.equal(docF.querySelector('p.centerb')?.getAttribute('data-translit-quote-pos'), 'last');
+  assert.notEqual(docF.querySelector('p.bold-lead')?.getAttribute('data-translit-role'), 'h2');
+  assert.notEqual(docF.querySelector('blockquote p')?.getAttribute('data-translit-role'), 'h2');
+
+  // 2-line exemptions preserved: CHAPTER 1 + title AND chapter-opening 1.4em display title
+  const exemptXhtml = `<html xmlns="http://www.w3.org/1999/xhtml"><body>
+    <p style="font-weight: bold; text-align: center; text-transform: uppercase; letter-spacing: 0.08em; text-indent: 0;">CHAPTER 1</p>
+    <p style="font-weight: bold; text-align: center; font-variant: small-caps; text-indent: 0;">The Rise of Machines</p>
+    <p style="font-size: 1.4em; font-weight: bold; text-align: center; text-indent: 0;">PART ONE</p>
+    <p style="font-size: 1.4em; font-weight: bold; text-align: center; text-indent: 0;">A New Dawn</p>
+    <p>Opening narrative paragraph.</p>
+  </body></html>`;
+  const extractedExempt = engine.extractTranslatablePayload(exemptXhtml);
+  assert.ok(extractedExempt.blocks[0].slottedText.startsWith('#'), 'CHAPTER 1 must remain heading');
+  assert.ok(extractedExempt.blocks[1].slottedText.startsWith('#'), 'Subtitle immediately after CHAPTER 1 must remain heading');
+  assert.ok(extractedExempt.blocks[2].slottedText.startsWith('#'), 'Chapter-opening 1.4em line 1 must remain heading');
+  assert.ok(extractedExempt.blocks[3].slottedText.startsWith('#'), 'Chapter-opening 1.4em line 2 must remain heading');
+  console.log('  [OK] Scene F passed');
+
+  // =========================================================================
+  // Scene G: 4->1 DP Merge Zero English Leak, Structural Isomorphism & Quote-Pos Re-indexing
+  // =========================================================================
+  console.log('  [Scene G] Testing 4->1 DP merge zero English leak & quote-pos re-indexing...');
+  const plaqueBookRoles = {
+    centert: { role: 'quote' as const, scope: 'block' as const, align: 'center' as const },
+    center: { role: 'quote' as const, scope: 'block' as const, align: 'center' as const },
+    centerb: { role: 'quote' as const, scope: 'block' as const, align: 'center' as const },
+    centertb: { role: 'callout' as const, scope: 'block' as const, align: 'center' as const, weight: 'bold' as const }
+  };
+  const mergeXhtml = `<html xmlns="http://www.w3.org/1999/xhtml"><body>
+    <p class="indent">I stared at a heavy bronze slab with gold-colored lettering: __FN_REF_8-1__</p>
+    <p class="centert">IN THIS BUILDING DURING THE SUMMER OF 1956</p>
+    <p class="center">the Dartmouth Summer Research Project on Artificial Intelligence</p>
+    <p class="centerb">Founding of Artificial Intelligence as a Research Discipline</p>
+    <p class="indent">You might imagine this plaque beneath a maple tree.</p>
+    <p class="centertb">AI is creating intelligent machines that can think like humans.</p>
+  </body></html>`;
+
+  // Clean up test literal footnote placeholder inside source DOM so it uses normal <a> noteref
+  const realMergeXhtml = mergeXhtml.replace(
+    '__FN_REF_8-1__',
+    '<a epub:type="noteref" href="#fn-8-1" data-fn-id="8-1">[1]</a>'
+  );
+  const mergedTranslation4to1 = [
+    '我盯着一块沉重的青铜牌匾，上面刻着金字：“1956 年夏天在此楼举行达特茅斯夏季人工智能研究项目；人工智能作为一门研究学科的创立。”__FN_REF_8-1__',
+    '你也许会想象它立在枫树下。',
+    '人工智能是创造能够像人类一样思考的智能机器。'
+  ].join('\n\n');
+
+  const mutated4to1 = engine.mutateDomInPlace(realMergeXhtml, mergedTranslation4to1, {
+    internalizedFootnotes: {
+      '8-1': {
+        key: 'Notes.xhtml#fn1',
+        sourceFile: 'Notes.xhtml',
+        originalId: 'fn1',
+        namespaceId: '8-1',
+        label: '1',
+        html: '<p>Dartmouth proposal, 1955.</p>',
+        plainText: 'Dartmouth proposal, 1955.',
+        paragraphs: ['Dartmouth proposal, 1955.'],
+        referencedByChapters: [8]
+      }
+    },
+    translatedFootnotes: { '8-1': '1955 年达特茅斯提案。' },
+    cssProfiles: profilesF,
+    bookStyleRoles: plaqueBookRoles
+  });
+
+  assert.ok(!mutated4to1.includes('In This Building'), '4->1 merge must NOT leak untranslated English back into DOM');
+  assert.ok(!mutated4to1.includes('IN THIS BUILDING'), '4->1 merge must NOT leak original uppercase English back into DOM');
+  assert.ok(!mutated4to1.includes('Dartmouth Summer'), '4->1 merge must NOT leak middle plaque English line');
+  const doc4to1 = parseHtmlDocument(mutated4to1);
+  assert.equal(doc4to1.querySelector('p.centert')?.getAttribute('data-translit-merged'), 'true');
+  assert.equal(doc4to1.querySelector('p.center')?.getAttribute('data-translit-merged'), 'true');
+  assert.equal(doc4to1.querySelector('p.centerb')?.getAttribute('data-translit-merged'), 'true');
+  assert.ok(
+    doc4to1.querySelector('p.centertb')?.textContent?.includes('人工智能是创造能够像人类一样思考的智能机器'),
+    '.centertb callout must stay aligned onto the definition sentence (never shifted)'
+  );
+  const diffG = computeStructuralTreeDiff(realMergeXhtml, mutated4to1);
+  assert.equal(diffG.diffCount, 0, `4->1 merge with data-translit-merged must maintain structuralTreeDiff === 0, got: ${diffG.diffs.join('; ')}`);
+
+  // Partial plaque merge leaving only 1 visible plaque line -> re-index data-translit-quote-pos to "single"
+  const partialMergeTranslation = [
+    '我盯着青铜牌匾：__FN_REF_8-1__',
+    '1956 年夏天达特茅斯人工智能研究项目创立大会在此举行。',
+    '你也许会想象它立在枫树下。',
+    '人工智能是创造能够像人类一样思考的智能机器。'
+  ].join('\n\n');
+  const mutatedPartial = engine.mutateDomInPlace(realMergeXhtml, partialMergeTranslation, {
+    internalizedFootnotes: {
+      '8-1': {
+        key: 'Notes.xhtml#fn1',
+        sourceFile: 'Notes.xhtml',
+        originalId: 'fn1',
+        namespaceId: '8-1',
+        label: '1',
+        html: '<p>Dartmouth proposal.</p>',
+        plainText: 'Dartmouth proposal.',
+        paragraphs: ['Dartmouth proposal.'],
+        referencedByChapters: [8]
+      }
+    },
+    translatedFootnotes: { '8-1': '达特茅斯提案。' },
+    cssProfiles: profilesF,
+    bookStyleRoles: plaqueBookRoles
+  });
+  const docPartial = parseHtmlDocument(mutatedPartial);
+  const visibleQuoteLines = Array.from(docPartial.querySelectorAll('[data-translit-role="quote-line"]'))
+    .filter((el) => el.getAttribute('data-translit-merged') !== 'true');
+  assert.equal(visibleQuoteLines.length, 1, 'Expected 1 remaining visible quote-line after 3->1 merge');
+  assert.equal(
+    visibleQuoteLines[0].getAttribute('data-translit-quote-pos'),
+    'single',
+    'Remaining single visible quote-line must be re-indexed to data-translit-quote-pos="single"'
+  );
+  console.log('  [OK] Scene G passed');
+
   console.log('ALL HETI & PSEUDO-HEADING TESTS PASSED!');
 }
 

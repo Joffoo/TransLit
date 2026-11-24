@@ -65,3 +65,6 @@ fix_titles.py
 pack_epub.js
 test_fuse.js
 skills-lock.json
+
+# Local test EPUB samples and CLI preview outputs
+.local-samples/

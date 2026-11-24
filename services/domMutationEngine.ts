@@ -1,10 +1,17 @@
-import { BilingualMode, FootnoteNode } from '../types';
+import {
+  BilingualMode,
+  BookStyleRoleMap,
+  CssClassSemanticMapping,
+  FootnoteNode
+} from '../types';
 import { parseHtmlDocument } from '../utils/domAdapter';
 import {
   createFootnoteSlot,
   extractFootnoteSlots,
+  stripLeakedFootnoteDefinitions,
   validateAndRepairSlots
 } from './footnotePool';
+import { stripBlockProtocolMarkers } from '../utils/blockProtocol';
 
 export interface TranslatableDomBlock {
   index: number;
@@ -32,10 +39,14 @@ export interface CssClassProfile {
   marginTopEm?: number;
   marginBottomEm?: number;
   marginLeftEm?: number;
+  paddingLeftEm?: number;
+  listStyleNone?: boolean;
   textTransform?: 'uppercase' | 'capitalize' | 'lowercase' | 'none';
   fontVariant?: 'small-caps' | 'normal';
   letterSpacingEm?: number;
   hasBorder?: boolean;
+  hasBorderBottom?: boolean;
+  isInlineOnly?: boolean;
   displayNone?: boolean;
 }
 
@@ -48,10 +59,13 @@ export interface ElementVisualStyle {
   marginTopEm?: number;
   marginBottomEm?: number;
   marginLeftEm?: number;
+  paddingLeftEm?: number;
+  listStyleNone?: boolean;
   textTransform?: 'uppercase' | 'capitalize' | 'lowercase' | 'none';
   fontVariant?: 'small-caps' | 'normal';
   letterSpacingEm?: number;
   hasBorder?: boolean;
+  hasBorderBottom?: boolean;
   displayNone?: boolean;
 }
 
@@ -63,6 +77,7 @@ export interface DomMutationOptions {
   wereadMode?: boolean;
   imagesRelPath?: string;
   cssProfiles?: Map<string, CssClassProfile>;
+  bookStyleRoles?: BookStyleRoleMap;
   applyChineseTypography?: boolean;
   isStreaming?: boolean;
 }
@@ -127,7 +142,26 @@ const BLOCK_LEVEL_TAGS = new Set([
   'HR'
 ]);
 
-const EXCLUDED_PSEUDO_HEADING_CLASSES = /\b(caption|fig|figcaption|bib\d*|toc\d*|copyright|epigraph|dedication|footnote|noteref|quote)\b/i;
+export const EXCLUDED_PSEUDO_HEADING_CLASSES =
+  /(?:^|[\s_-])(?:caption|fig|figcaption|bib|toc|copyright|epigraph|dedication|footnote|endnote|noteref|note|quote|blockquote|bq|extract|ext|callout|box|sidebar|plaque|inscription|verse|poem|poetry|letter|motto|sign|signature|attribution|credit|dropcap|stickupcap|initial|firstletter)\d*(?:$|[\s_-])/i;
+
+const INLINE_CSS_SELECTOR_TAGS = new Set([
+  'SPAN',
+  'A',
+  'B',
+  'STRONG',
+  'I',
+  'EM',
+  'SMALL',
+  'BIG',
+  'SUP',
+  'SUB',
+  'U',
+  'ABBR',
+  'CITE',
+  'CODE',
+  'FONT'
+]);
 
 const INLINE_WRAPPER_TAGS = new Set([
   'SPAN',
@@ -301,6 +335,9 @@ function parseCssDeclarations(declText: string): Partial<ElementVisualStyle> {
       case 'border-right': {
         if (rawVal !== 'none' && rawVal !== '0' && !/^0\b/.test(rawVal)) {
           result.hasBorder = true;
+          if (prop === 'border-bottom') {
+            result.hasBorderBottom = true;
+          }
         }
         break;
       }
@@ -331,6 +368,16 @@ function parseCssDeclarations(declText: string): Partial<ElementVisualStyle> {
         if (em !== undefined) result.letterSpacingEm = em;
         break;
       }
+      case 'padding-left': {
+        const em = parseCssLengthToEm(rawVal);
+        if (em !== undefined) result.paddingLeftEm = em;
+        break;
+      }
+      case 'list-style-type':
+      case 'list-style': {
+        result.listStyleNone = /\bnone\b/.test(rawVal);
+        break;
+      }
     }
   }
   return result;
@@ -344,7 +391,11 @@ export function parseEpubCssProfiles(cssTexts: string[]): Map<string, CssClassPr
   const profiles = new Map<string, CssClassProfile>();
   if (!cssTexts || cssTexts.length === 0) return profiles;
 
-  const mergeProfile = (className: string, parsed: Partial<ElementVisualStyle>) => {
+  const mergeProfile = (
+    className: string,
+    parsed: Partial<ElementVisualStyle>,
+    isInlineSelectorTag: boolean
+  ) => {
     const existing = profiles.get(className) || { className };
     if (parsed.fontSizeEm !== undefined) existing.fontSizeEm = parsed.fontSizeEm;
     if (parsed.fontWeight !== undefined) existing.fontWeight = parsed.fontWeight;
@@ -354,11 +405,19 @@ export function parseEpubCssProfiles(cssTexts: string[]): Map<string, CssClassPr
     if (parsed.marginTopEm !== undefined) existing.marginTopEm = parsed.marginTopEm;
     if (parsed.marginBottomEm !== undefined) existing.marginBottomEm = parsed.marginBottomEm;
     if (parsed.marginLeftEm !== undefined) existing.marginLeftEm = parsed.marginLeftEm;
+    if (parsed.paddingLeftEm !== undefined) existing.paddingLeftEm = parsed.paddingLeftEm;
+    if (parsed.listStyleNone !== undefined) existing.listStyleNone = parsed.listStyleNone;
     if (parsed.textTransform !== undefined) existing.textTransform = parsed.textTransform;
     if (parsed.fontVariant !== undefined) existing.fontVariant = parsed.fontVariant;
     if (parsed.letterSpacingEm !== undefined) existing.letterSpacingEm = parsed.letterSpacingEm;
     if (parsed.hasBorder !== undefined) existing.hasBorder = parsed.hasBorder;
+    if (parsed.hasBorderBottom !== undefined) existing.hasBorderBottom = parsed.hasBorderBottom;
     if (parsed.displayNone !== undefined) existing.displayNone = parsed.displayNone;
+    if (isInlineSelectorTag) {
+      if (existing.isInlineOnly === undefined) existing.isInlineOnly = true;
+    } else {
+      existing.isInlineOnly = false;
+    }
     profiles.set(className, existing);
   };
 
@@ -393,12 +452,15 @@ export function parseEpubCssProfiles(cssTexts: string[]): Map<string, CssClassPr
         const compoundParts = sel.split(/[\s>+~]+/).filter(Boolean);
         if (compoundParts.length === 0) continue;
         const targetCompound = compoundParts[compoundParts.length - 1];
+        const tagMatch = targetCompound.match(/^([A-Za-z][A-Za-z0-9]*)/);
+        const targetTag = tagMatch ? tagMatch[1].toUpperCase() : '';
+        const isInlineSelectorTag = Boolean(targetTag && INLINE_CSS_SELECTOR_TAGS.has(targetTag));
         const classMatches = targetCompound.match(/\.([A-Za-z_-][A-Za-z0-9_-]*)/g);
         if (!classMatches) continue;
 
         for (const clsToken of classMatches) {
           const className = clsToken.slice(1);
-          mergeProfile(className, parsed);
+          mergeProfile(className, parsed, isInlineSelectorTag);
         }
       }
     }
@@ -451,7 +513,10 @@ export function resolveElementVisualStyle(
       if (p.marginTopEm !== undefined) style.marginTopEm = p.marginTopEm;
       if (p.marginBottomEm !== undefined) style.marginBottomEm = p.marginBottomEm;
       if (p.marginLeftEm !== undefined) style.marginLeftEm = p.marginLeftEm;
+      if (p.paddingLeftEm !== undefined) style.paddingLeftEm = p.paddingLeftEm;
+      if (p.listStyleNone !== undefined) style.listStyleNone = p.listStyleNone;
       if (p.hasBorder !== undefined) style.hasBorder = p.hasBorder;
+      if (p.hasBorderBottom !== undefined) style.hasBorderBottom = p.hasBorderBottom;
       if (p.displayNone !== undefined) style.displayNone = p.displayNone;
     }
   };
@@ -630,27 +695,101 @@ function isImmutableNumberCell(el: Element): boolean {
   return text.length === 0 || /^(?:\d{1,3}|[IVXLCDM]{1,6})\.?$/i.test(text);
 }
 
-export function getHeadingMarkdownLevel(
+const INLINE_STYLE_ROLES = new Set<string>(['emphasis', 'strong', 'dropcap', 'code', 'ignore']);
+
+export function resolveElementBookStyleMapping(
   el: Element,
-  cssProfiles?: Map<string, CssClassProfile>
-): number {
+  bookStyleRoles?: BookStyleRoleMap
+): CssClassSemanticMapping | undefined {
+  if (!bookStyleRoles) return undefined;
+  const clsList = (el.getAttribute('class') || '').split(/\s+/).filter(Boolean);
+  if (clsList.length === 0) return undefined;
+
+  const isInlineEl = INLINE_CSS_SELECTOR_TAGS.has((el.tagName || '').toUpperCase());
+  let sawIgnore = false;
+
+  for (const cls of clsList) {
+    const mapping = bookStyleRoles[cls];
+    if (!mapping) continue;
+    const isInlineRole = INLINE_STYLE_ROLES.has(mapping.role);
+    if (mapping.scope === 'inline' && !isInlineEl) continue;
+    if (mapping.scope === 'block' && isInlineEl) continue;
+    if (!mapping.scope && isInlineEl !== isInlineRole && mapping.role !== 'ignore') continue;
+    if (mapping.role === 'ignore') {
+      sawIgnore = true;
+      continue;
+    }
+    return mapping;
+  }
+
+  return sawIgnore ? { role: 'ignore', scope: isInlineEl ? 'inline' : 'block' } : undefined;
+}
+
+type HeadingDetectionLayer = 'none' | 'native' | 'ai-style' | 'semantic-class' | 'visual-heuristic';
+
+interface HeadingDetectionResult {
+  level: number;
+  layer: HeadingDetectionLayer;
+  isHeadingLikeAnchor: boolean;
+}
+
+const STANDALONE_STRUCTURAL_LABEL_RE =
+  /^(?:§\s*\d+|Chapter\s+[\dIVXLCDM]+|Chapter\s+(?:One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten|Eleven|Twelve)|Part\s+[\dIVXLCDM]+|Part\s+(?:One|Two|Three|Four|Five|Six)|Section\s+[\dIVXLCDM]+|Book\s+[\dIVXLCDM]+|第[零一二三四五六七八九十百千万\d]+[章节篇部卷]|(?:I|II|III|IV|V|VI|VII|VIII|IX|X|XI|XII|XIII|XIV|XV)\.?|\d{1,3}\.?)$/i;
+
+function detectHeadingWithLayer(
+  el: Element,
+  cssProfiles?: Map<string, CssClassProfile>,
+  bookStyleRoles?: BookStyleRoleMap
+): HeadingDetectionResult {
   const tag = (el.tagName || '').toUpperCase();
   const hMatch = tag.match(/^H([1-6])$/);
-  if (hMatch) return Number(hMatch[1]);
+  if (hMatch) {
+    return { level: Number(hMatch[1]), layer: 'native', isHeadingLikeAnchor: true };
+  }
 
   const cls = el.getAttribute('class') || '';
   const parentTable = el.closest('table');
   if (parentTable && isStructuralTitleTable(parentTable)) {
-    if (isImmutableNumberCell(el) || /\b(bor1?|num)\b/i.test(cls)) return 0;
-    if (/\b(top-int1|top2|subtitle|subhead)\b/i.test(cls)) return 2;
+    if (isImmutableNumberCell(el) || /\b(bor1?|num)\b/i.test(cls)) {
+      return { level: 0, layer: 'native', isHeadingLikeAnchor: false };
+    }
+    if (/\b(top-int1|top2|subtitle|subhead)\b/i.test(cls)) {
+      return { level: 2, layer: 'native', isHeadingLikeAnchor: true };
+    }
     const cell = el.closest('td, th');
     if (cell && el !== cell) {
       const siblingBlocks = Array.from(cell.children).filter((c) =>
         BLOCK_LEVEL_TAGS.has((c.tagName || '').toUpperCase())
       );
-      if (siblingBlocks.indexOf(el) > 0) return 2;
+      if (siblingBlocks.indexOf(el) > 0) {
+        return { level: 2, layer: 'native', isHeadingLikeAnchor: true };
+      }
     }
-    return 1;
+    return { level: 1, layer: 'native', isHeadingLikeAnchor: true };
+  }
+
+  // Layer 1.5: Whole-book AI / semantic style mapping
+  const mappedStyle = resolveElementBookStyleMapping(el, bookStyleRoles);
+  if (mappedStyle && mappedStyle.role !== 'ignore') {
+    if (
+      mappedStyle.role === 'h1' ||
+      mappedStyle.role === 'h2' ||
+      mappedStyle.role === 'h3' ||
+      mappedStyle.role === 'h4'
+    ) {
+      return {
+        level: Number(mappedStyle.role.slice(1)),
+        layer: 'ai-style',
+        isHeadingLikeAnchor: true
+      };
+    }
+    if (mappedStyle.role === 'subtitle') {
+      return { level: 2, layer: 'ai-style', isHeadingLikeAnchor: true };
+    }
+    if (mappedStyle.role === 'kicker') {
+      return { level: 0, layer: 'ai-style', isHeadingLikeAnchor: true };
+    }
+    return { level: 0, layer: 'ai-style', isHeadingLikeAnchor: false };
   }
 
   // Layer 2: Explicit semantic heading class names
@@ -659,55 +798,60 @@ export function getHeadingMarkdownLevel(
       cls
     )
   ) {
-    return 1;
+    return { level: 1, layer: 'semantic-class', isHeadingLikeAnchor: true };
   }
   if (
     /\b(sec1-title[a-z0-9]*|sec-title[a-z0-9]*|section-title|sub-title|subtitle\b|head\b|heading\b|title2\b|authorleft\b|h2\b)/i.test(
       cls
     )
   ) {
-    return 2;
+    return { level: 2, layer: 'semantic-class', isHeadingLikeAnchor: true };
   }
   if (/\b(sec2-title[a-z0-9]*|sec3-title[a-z0-9]*|subhead\b|h3\b|h4\b)/i.test(cls)) {
-    return 3;
+    return { level: 3, layer: 'semantic-class', isHeadingLikeAnchor: true };
   }
 
   // Layer 3: Multi-dimensional weighted visual feature scoring for pseudo-headings
-  if (tag !== 'P' && tag !== 'DIV' && tag !== 'BLOCKQUOTE') {
-    return 0;
+  if (tag !== 'P' && tag !== 'DIV') {
+    return { level: 0, layer: 'none', isHeadingLikeAnchor: false };
+  }
+  if (el.closest('blockquote')) {
+    return { level: 0, layer: 'none', isHeadingLikeAnchor: false };
   }
   if (EXCLUDED_PSEUDO_HEADING_CLASSES.test(cls)) {
-    return 0;
+    return { level: 0, layer: 'none', isHeadingLikeAnchor: false };
   }
 
   const rawText = (el.textContent || '').replace(/[\s\u00a0]+/g, ' ').trim();
   if (rawText.length === 0 || rawText.length > 120) {
-    return 0;
+    return { level: 0, layer: 'none', isHeadingLikeAnchor: false };
   }
   // Hard negative text guards: salutations, dialogue quotes, dash attributions, multi-sentence prose
   if (/[,;，；:：—\-]$/.test(rawText)) {
-    return 0;
+    return { level: 0, layer: 'none', isHeadingLikeAnchor: false };
   }
   if (/^["“‘「『'].*["”’」』']$/.test(rawText) || /^[-—–―]\s*/.test(rawText)) {
-    return 0;
+    return { level: 0, layer: 'none', isHeadingLikeAnchor: false };
   }
   const internalSentenceBreaks = rawText.slice(0, -1).match(/[.!?。！？](?:\s|$)/g)?.length || 0;
   if (internalSentenceBreaks > 1 || (rawText.length > 60 && internalSentenceBreaks > 0)) {
-    return 0;
+    return { level: 0, layer: 'none', isHeadingLikeAnchor: false };
   }
   const isStructuralPrefix =
     /^(?:§\s*\d+|Chapter\s+[\dIVXLCDM]+|Part\s+[\dIVXLCDM]+|Section\s+[\dIVXLCDM]+|第[零一二三四五六七八九十百千万\d]+[章节篇部卷]|(?:I|II|III|IV|V|VI|VII|VIII|IX|X|XI|XII|XIII|XIV|XV)\.?|\d{1,2}\.\s+\S)/i.test(
       rawText
     );
   if (rawText.length > 45 && /[.。]$/.test(rawText) && !isStructuralPrefix) {
-    return 0;
+    return { level: 0, layer: 'none', isHeadingLikeAnchor: false };
   }
 
   const style = resolveElementVisualStyle(el, cssProfiles);
-  if (style.displayNone) return 0;
+  if (style.displayNone) {
+    return { level: 0, layer: 'none', isHeadingLikeAnchor: false };
+  }
   // Negative text-indent indicates hanging-indent bib/toc/list; > 0.5em indicates standard indented body paragraph
   if (style.textIndentEm !== undefined && (style.textIndentEm < 0 || style.textIndentEm > 0.5)) {
-    return 0;
+    return { level: 0, layer: 'none', isHeadingLikeAnchor: false };
   }
 
   const fs = style.fontSizeEm ?? 1;
@@ -728,10 +872,10 @@ export function getHeadingMarkdownLevel(
     style.textTransform === 'uppercase' ||
     style.fontVariant === 'small-caps' ||
     (style.letterSpacingEm ?? 0) >= 0.05 ||
-    Boolean(style.hasBorder);
+    Boolean(style.hasBorderBottom);
 
   if (!hasVisualSignal) {
-    return 0;
+    return { level: 0, layer: 'none', isHeadingLikeAnchor: false };
   }
 
   let score = 0;
@@ -753,13 +897,13 @@ export function getHeadingMarkdownLevel(
   else if (mt >= 1.0) score += 0.9;
   if (mb >= 1.0) score += 0.5;
 
-  if (style.textIndentEm === 0) score += 0.8;
+  if (style.textIndentEm === 0) score += 0.4;
 
   if (
     style.textTransform === 'uppercase' ||
     style.fontVariant === 'small-caps' ||
     (style.letterSpacingEm ?? 0) >= 0.05 ||
-    style.hasBorder ||
+    style.hasBorderBottom ||
     isAllCapsText
   ) {
     score += 1.2;
@@ -767,22 +911,282 @@ export function getHeadingMarkdownLevel(
 
   if (isStructuralPrefix) score += 1.8;
 
-  if (/[.。]$/.test(rawText) && !isStructuralPrefix) score -= 1.2;
+  if (/[.。!！]$/.test(rawText) && !isStructuralPrefix) score -= 1.6;
 
-  if (fs >= 1.35 && score >= 3.5) return 1;
-  if (score >= 3.0) return 2;
-  if (score >= 2.3) return 3;
+  let level = 0;
+  if (fs >= 1.35 && score >= 3.5) level = 1;
+  else if (score >= 3.0) level = 2;
+  else if (score >= 2.3) level = 3;
 
-  return 0;
+  return level > 0
+    ? { level, layer: 'visual-heuristic', isHeadingLikeAnchor: true }
+    : { level: 0, layer: 'none', isHeadingLikeAnchor: false };
+}
+
+export function getHeadingMarkdownLevel(
+  el: Element,
+  cssProfiles?: Map<string, CssClassProfile>,
+  bookStyleRoles?: BookStyleRoleMap
+): number {
+  return detectHeadingWithLayer(el, cssProfiles, bookStyleRoles).level;
 }
 
 export function isHeadingLikeElement(
   el: Element,
-  cssProfiles?: Map<string, CssClassProfile>
+  cssProfiles?: Map<string, CssClassProfile>,
+  bookStyleRoles?: BookStyleRoleMap
 ): boolean {
-  if (getHeadingMarkdownLevel(el, cssProfiles) > 0) return true;
+  const res = detectHeadingWithLayer(el, cssProfiles, bookStyleRoles);
+  if (res.level > 0 || res.isHeadingLikeAnchor) return true;
   if (el.closest('table.title1, table.title2')) return true;
   return false;
+}
+
+export interface LeafHeadingAnalysis {
+  headingLevels: Map<Element, number>;
+  isHeadingLikeMap: Map<Element, boolean>;
+  vetoedQuoteRuns: Element[][];
+  vetoedQuotePos: Map<Element, 'first' | 'mid' | 'last' | 'single'>;
+}
+
+function getQuoteVisualSignature(
+  el: Element,
+  cssProfiles?: Map<string, CssClassProfile>
+): {
+  fs: number;
+  bold: boolean;
+  italic: boolean;
+  align: string;
+  caps: boolean;
+  hasSignal: boolean;
+} | null {
+  const tag = (el.tagName || '').toUpperCase();
+  if ((tag !== 'P' && tag !== 'DIV') || el.closest('blockquote')) return null;
+  const cls = el.getAttribute('class') || '';
+  if (EXCLUDED_PSEUDO_HEADING_CLASSES.test(cls)) return null;
+  const rawText = (el.textContent || '').replace(/[\s\u00a0]+/g, ' ').trim();
+  if (rawText.length === 0 || rawText.length > 120) return null;
+
+  const style = resolveElementVisualStyle(el, cssProfiles);
+  if (style.displayNone) return null;
+  if (style.textIndentEm !== undefined && (style.textIndentEm < 0 || style.textIndentEm > 0.5)) {
+    return null;
+  }
+
+  const fs = style.fontSizeEm ?? 1;
+  const bold = style.fontWeight === 'bold';
+  const italic = style.fontStyle === 'italic';
+  const align = style.textAlign || 'left';
+  const isAllCapsText =
+    rawText.length >= 4 &&
+    rawText.length <= 80 &&
+    /[A-Z]{3,}/.test(rawText) &&
+    rawText === rawText.toUpperCase() &&
+    !/^[0-9\W]+$/.test(rawText);
+  const caps =
+    style.fontVariant === 'small-caps' || style.textTransform === 'uppercase' || isAllCapsText;
+
+  const hasSignal =
+    fs > 1.04 ||
+    bold ||
+    italic ||
+    align === 'center' ||
+    caps ||
+    (style.letterSpacingEm ?? 0) >= 0.05 ||
+    Boolean(style.hasBorderBottom);
+
+  if (!hasSignal) return null;
+  return { fs, bold, italic, align, caps, hasSignal };
+}
+
+function quoteVisualSignaturesMatch(
+  a: NonNullable<ReturnType<typeof getQuoteVisualSignature>>,
+  b: NonNullable<ReturnType<typeof getQuoteVisualSignature>>
+): boolean {
+  return (
+    Math.abs(a.fs - b.fs) <= 0.1 &&
+    a.bold === b.bold &&
+    a.italic === b.italic &&
+    a.align === b.align &&
+    a.caps === b.caps
+  );
+}
+
+/**
+ * Resolves heading levels for a sequence of leaf elements while applying batch-level
+ * consecutive short-line veto on Layer 3 visual-heuristic runs (preserving native h1-h6,
+ * semantic heading classes, AI style mappings, and genuine structural double-line titles).
+ */
+export function resolveLeafHeadingAnalysis(
+  leafElements: Element[],
+  cssProfiles?: Map<string, CssClassProfile>,
+  bookStyleRoles?: BookStyleRoleMap
+): LeafHeadingAnalysis {
+  const headingLevels = new Map<Element, number>();
+  const isHeadingLikeMap = new Map<Element, boolean>();
+  const vetoedQuoteRuns: Element[][] = [];
+  const vetoedQuotePos = new Map<Element, 'first' | 'mid' | 'last' | 'single'>();
+
+  const detections = leafElements.map((el) =>
+    detectHeadingWithLayer(el, cssProfiles, bookStyleRoles)
+  );
+  leafElements.forEach((el, idx) => {
+    const det = detections[idx];
+    headingLevels.set(el, det.level);
+    isHeadingLikeMap.set(
+      el,
+      det.level > 0 || det.isHeadingLikeAnchor || Boolean(el.closest('table.title1, table.title2'))
+    );
+  });
+
+  // Precompute DOM order indices & separator positions to detect intervening img/hr/figure/table between leaf siblings
+  const separatorOrders: number[] = [];
+  const leafStartOrder = new Map<Element, number>();
+  const leafEndOrder = new Map<Element, number>();
+  const rootBody = leafElements[0]?.ownerDocument?.body;
+  if (rootBody) {
+    let seq = 0;
+    const leafSet = new Set(leafElements);
+    const walkOrder = (node: Element, insideLeaf: boolean) => {
+      const start = ++seq;
+      const isLeaf = leafSet.has(node);
+      if (isLeaf) leafStartOrder.set(node, start);
+
+      const tag = (node.tagName || '').toUpperCase();
+      const cls = node.getAttribute('class') || '';
+      if (
+        !insideLeaf &&
+        !isLeaf &&
+        (tag === 'HR' ||
+          tag === 'FIGURE' ||
+          tag === 'TABLE' ||
+          tag === 'SVG' ||
+          (tag === 'IMG' && !/\bqqreader-footnote\b/i.test(cls)))
+      ) {
+        separatorOrders.push(start);
+      }
+
+      for (const child of Array.from(node.children)) {
+        walkOrder(child, insideLeaf || isLeaf);
+      }
+
+      const end = ++seq;
+      if (isLeaf) leafEndOrder.set(node, end);
+    };
+    walkOrder(rootBody, false);
+  }
+
+  const hasSeparatorBetween = (a: Element, b: Element): boolean => {
+    const endA = leafEndOrder.get(a);
+    const startB = leafStartOrder.get(b);
+    if (endA === undefined || startB === undefined) return false;
+    for (const sepSeq of separatorOrders) {
+      if (sepSeq > endA && sepSeq < startB) return true;
+    }
+    return false;
+  };
+
+  // 1. Group explicit AI-mapped `quote` runs (outside <blockquote>) so adjacent quote paragraphs render seamlessly
+  let i = 0;
+  while (i < leafElements.length) {
+    const mapped = resolveElementBookStyleMapping(leafElements[i], bookStyleRoles);
+    if (mapped?.role === 'quote' && !leafElements[i].closest('blockquote')) {
+      const run: Element[] = [leafElements[i]];
+      let j = i + 1;
+      while (j < leafElements.length) {
+        const nextEl = leafElements[j];
+        const nextMapped = resolveElementBookStyleMapping(nextEl, bookStyleRoles);
+        if (
+          nextMapped?.role !== 'quote' ||
+          nextEl.closest('blockquote') ||
+          hasSeparatorBetween(leafElements[j - 1], nextEl)
+        ) {
+          break;
+        }
+        run.push(nextEl);
+        j++;
+      }
+      vetoedQuoteRuns.push(run);
+      if (run.length === 1) {
+        vetoedQuotePos.set(run[0], 'single');
+      } else {
+        run.forEach((node, idx) => {
+          vetoedQuotePos.set(node, idx === 0 ? 'first' : idx === run.length - 1 ? 'last' : 'mid');
+        });
+      }
+      i = j;
+    } else {
+      i++;
+    }
+  }
+
+  // 2. Consecutive short-line veto for Layer 3 visual-heuristic runs
+  i = 0;
+  while (i < leafElements.length) {
+    const det = detections[i];
+    if (det.layer === 'native' || det.layer === 'semantic-class' || det.layer === 'ai-style') {
+      i++;
+      continue;
+    }
+    const sig = getQuoteVisualSignature(leafElements[i], cssProfiles);
+    if (!sig) {
+      i++;
+      continue;
+    }
+
+    const runIndices: number[] = [i];
+    let j = i + 1;
+    while (j < leafElements.length) {
+      const nextDet = detections[j];
+      if (
+        nextDet.layer === 'native' ||
+        nextDet.layer === 'semantic-class' ||
+        nextDet.layer === 'ai-style' ||
+        hasSeparatorBetween(leafElements[j - 1], leafElements[j])
+      ) {
+        break;
+      }
+      const nextSig = getQuoteVisualSignature(leafElements[j], cssProfiles);
+      if (!nextSig || !quoteVisualSignaturesMatch(sig, nextSig)) {
+        break;
+      }
+      runIndices.push(j);
+      j++;
+    }
+
+    const hasVisualHeadingCandidate = runIndices.some(
+      (idx) => detections[idx].layer === 'visual-heuristic' && (headingLevels.get(leafElements[idx]) || 0) > 0
+    );
+
+    if (runIndices.length >= 2 && hasVisualHeadingCandidate) {
+      const firstEl = leafElements[runIndices[0]];
+      const firstText = (firstEl.textContent || '').replace(/[\s\u00a0]+/g, ' ').trim();
+      const firstStyle = resolveElementVisualStyle(firstEl, cssProfiles);
+      const isExemptTwoLine =
+        runIndices.length === 2 &&
+        (STANDALONE_STRUCTURAL_LABEL_RE.test(firstText) ||
+          (runIndices[0] === 0 && (firstStyle.fontSizeEm ?? 1) >= 1.35));
+
+      if (!isExemptTwoLine) {
+        const runEls = runIndices.map((idx) => leafElements[idx]);
+        for (const el of runEls) {
+          headingLevels.set(el, 0);
+          isHeadingLikeMap.set(el, false);
+        }
+        vetoedQuoteRuns.push(runEls);
+        runEls.forEach((el, rIdx) => {
+          vetoedQuotePos.set(
+            el,
+            rIdx === 0 ? 'first' : rIdx === runEls.length - 1 ? 'last' : 'mid'
+          );
+        });
+      }
+    }
+
+    i = j;
+  }
+
+  return { headingLevels, isHeadingLikeMap, vetoedQuoteRuns, vetoedQuotePos };
 }
 
 /**
@@ -999,13 +1403,54 @@ export function computeStructuralTreeDiff(
   };
 }
 
-/**
- * Sanitizes footnote prose so it is strictly well-formed XHTML inside `<aside>` elements:
- * - Escapes bare `&` characters not part of valid XML entities.
- * - Preserves balanced, attribute-free inline formatting tags (`i`, `em`, `b`, `strong`, `sup`, `sub`, `u`, `small`, `code`) and `<br/>`.
- * - Escapes unclosed, mismatched, or arbitrary angle-bracket text (e.g. `<internal>`, `x < y`).
- */
-export function sanitizeFootnoteTextForXhtml(text: string): string {
+const FOOTNOTE_INLINE_TAG_SET = new Set([
+  'i',
+  'em',
+  'b',
+  'strong',
+  'sup',
+  'sub',
+  'u',
+  'small',
+  'code'
+]);
+
+const LEAF_INLINE_TAG_SET = new Set([
+  ...FOOTNOTE_INLINE_TAG_SET,
+  'span'
+]);
+
+const STRIP_SHELL_HTML_TAGS = new Set([
+  'a',
+  'font',
+  'big',
+  'center',
+  'cite',
+  'q',
+  'abbr',
+  'mark',
+  'del',
+  'ins',
+  's',
+  'strike',
+  'div',
+  'p',
+  'section',
+  'article',
+  'header',
+  'footer',
+  'nav',
+  'aside'
+]);
+
+interface InlineXhtmlSanitizeOptions {
+  allowedTags: Set<string>;
+  allowClassAttr: boolean;
+  stripUnmatchedAllowedTags: boolean;
+  stripDisallowedHtmlShells?: boolean;
+}
+
+function sanitizeInlineXhtmlCore(text: string, options: InlineXhtmlSanitizeOptions): string {
   if (!text) return '';
   const safeAmps = text.replace(
     /&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)/gi,
@@ -1014,9 +1459,29 @@ export function sanitizeFootnoteTextForXhtml(text: string): string {
 
   type Token =
     | { kind: 'text'; raw: string }
-    | { kind: 'tag'; raw: string; tagName?: string; isClose?: boolean; isVoidBr?: boolean; valid?: boolean };
+    | {
+        kind: 'tag';
+        raw: string;
+        tagName?: string;
+        normalizedAttr?: string;
+        isClose?: boolean;
+        isVoidBr?: boolean;
+        isAllowedInline?: boolean;
+        stripShell?: boolean;
+        valid?: boolean;
+      };
 
   const tokens: Token[] = [];
+  const pushDisallowedTag = (rawTag: string) => {
+    const shellMatch = options.stripDisallowedHtmlShells
+      ? rawTag.match(/^<\s*\/?\s*([a-zA-Z][a-zA-Z0-9]*)(?:\s[^>]*)?\/?\s*>$/)
+      : null;
+    const stripShell = Boolean(
+      shellMatch && STRIP_SHELL_HTML_TAGS.has(shellMatch[1].toLowerCase())
+    );
+    tokens.push({ kind: 'tag', raw: rawTag, isAllowedInline: false, stripShell, valid: false });
+  };
+
   const tagRe = /<[^<>]*>/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
@@ -1029,17 +1494,69 @@ export function sanitizeFootnoteTextForXhtml(text: string): string {
     if (/^<\s*br\s*\/?\s*>$/i.test(rawTag)) {
       tokens.push({ kind: 'tag', raw: rawTag, tagName: 'br', isVoidBr: true, valid: true });
     } else {
-      const fmtMatch = rawTag.match(/^<\s*(\/?)\s*(i|em|b|strong|sup|sub|u|small|code)\s*>$/i);
-      if (fmtMatch) {
+      const closeMatch = rawTag.match(/^<\s*\/\s*([a-zA-Z0-9]+)\s*>$/);
+      if (closeMatch && options.allowedTags.has(closeMatch[1].toLowerCase())) {
         tokens.push({
           kind: 'tag',
           raw: rawTag,
-          tagName: fmtMatch[2].toLowerCase(),
-          isClose: fmtMatch[1] === '/',
+          tagName: closeMatch[1].toLowerCase(),
+          isClose: true,
+          isAllowedInline: true,
           valid: false
         });
+      } else if (!options.allowClassAttr) {
+        const openNoAttrMatch = rawTag.match(/^<\s*([a-zA-Z0-9]+)\s*>$/);
+        if (openNoAttrMatch && options.allowedTags.has(openNoAttrMatch[1].toLowerCase())) {
+          tokens.push({
+            kind: 'tag',
+            raw: rawTag,
+            tagName: openNoAttrMatch[1].toLowerCase(),
+            isClose: false,
+            isAllowedInline: true,
+            valid: false
+          });
+        } else {
+          pushDisallowedTag(rawTag);
+        }
       } else {
-        tokens.push({ kind: 'tag', raw: rawTag, valid: false });
+        const openMatch = rawTag.match(/^<\s*([a-zA-Z0-9]+)(?:\s+([^>]*))?>$/);
+        const tagLower = openMatch ? openMatch[1].toLowerCase() : '';
+        if (openMatch && options.allowedTags.has(tagLower)) {
+          const attrs = (openMatch[2] || '').trim();
+          let normalizedAttr = '';
+          if (attrs && !/\/\s*$/.test(attrs)) {
+            const clsMatch = attrs.match(
+              /(?:^|\s)class\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>]+))/i
+            );
+            const rawCls = clsMatch ? clsMatch[1] ?? clsMatch[2] ?? clsMatch[3] ?? '' : '';
+            const cleanCls = rawCls.replace(/^[“”'‘’`]+|[“”'‘’`]+$/g, '').trim();
+            if (cleanCls && /^[A-Za-z0-9 _-]+$/.test(cleanCls)) {
+              normalizedAttr = ` class="${cleanCls}"`;
+            }
+          }
+          if (/\/\s*$/.test(attrs)) {
+            // Drop self-closing non-void inline tags like `<span />`
+            tokens.push({
+              kind: 'tag',
+              raw: rawTag,
+              tagName: tagLower,
+              isAllowedInline: true,
+              valid: false
+            });
+          } else {
+            tokens.push({
+              kind: 'tag',
+              raw: rawTag,
+              tagName: tagLower,
+              normalizedAttr,
+              isClose: false,
+              isAllowedInline: true,
+              valid: false
+            });
+          }
+        } else {
+          pushDisallowedTag(rawTag);
+        }
       }
     }
     lastIndex = tagRe.lastIndex;
@@ -1076,11 +1593,112 @@ export function sanitizeFootnoteTextForXhtml(text: string): string {
     .map((tok) => {
       if (tok.kind === 'tag' && tok.valid) {
         if (tok.isVoidBr) return '<br/>';
-        return tok.isClose ? `</${tok.tagName}>` : `<${tok.tagName}>`;
+        return tok.isClose
+          ? `</${tok.tagName}>`
+          : `<${tok.tagName}${tok.normalizedAttr || ''}>`;
+      }
+      if (tok.kind === 'tag' && (tok.stripShell || (options.stripUnmatchedAllowedTags && tok.isAllowedInline))) {
+        return '';
       }
       return tok.raw.replace(/</g, '&lt;').replace(/>/g, '&gt;');
     })
     .join('');
+}
+
+/**
+ * Sanitizes footnote prose so it is strictly well-formed XHTML inside `<aside>` elements:
+ * - Escapes bare `&` characters not part of valid XML entities.
+ * - Preserves balanced, attribute-free inline formatting tags (`i`, `em`, `b`, `strong`, `sup`, `sub`, `u`, `small`, `code`) and `<br/>`.
+ * - Escapes unclosed, mismatched, or arbitrary angle-bracket text (e.g. `<internal>`, `x < y`).
+ */
+export function sanitizeFootnoteTextForXhtml(text: string): string {
+  return sanitizeInlineXhtmlCore(text, {
+    allowedTags: FOOTNOTE_INLINE_TAG_SET,
+    allowClassAttr: false,
+    stripUnmatchedAllowedTags: false
+  });
+}
+
+/**
+ * Sanitizes inline markup inside translated leaf blocks so arbitrary LLM output is guaranteed
+ * to be well-formed XHTML:
+ * - Rescues unclosed opening tags missing `>` before text + closing tag (e.g. `<span class="“stickupcap”" 站</span>`).
+ * - Normalizes curly quotes inside allowed `class` attributes and strips unsafe/unknown attributes.
+ * - Preserves balanced inline formatting tags (`i`, `em`, `b`, `strong`, `sup`, `sub`, `u`, `small`, `code`, `span`) and `<br/>`.
+ * - Strips unmatched/orphan inline HTML tags while escaping literal angle-bracket prose (`x < y`, `<internal>`).
+ */
+export function sanitizeInlineXhtmlForLeaf(html: string): string {
+  if (!html) return '';
+  const rescued = html
+    .replace(
+      /<(span|i|em|b|strong|sup|sub|u|small|code)\b[^<>]*?\s+([^<>\s=]+)<=""\s*\1="">/gi,
+      '$2'
+    )
+    .replace(
+      /<(span|i|em|b|strong|sup|sub|u|small|code)\b(?:\s+[a-zA-Z_:][\w:.-]*\s*=\s*(?:"[^"<>\r\n]*"|'[^'<>\r\n]*'|[^\s"'=<>`]+))*(?:\s+|(?<=["']))([^<>]*?)<\/\s*\1\s*>/gi,
+      '$2'
+    )
+    .replace(
+      /<(span|i|em|b|strong|sup|sub|u|small|code)\s+([^<>"'=]*?)<\/\s*\1\s*>/gi,
+      '$2'
+    );
+
+  return sanitizeInlineXhtmlCore(rescued, {
+    allowedTags: LEAF_INLINE_TAG_SET,
+    allowClassAttr: true,
+    stripUnmatchedAllowedTags: true,
+    stripDisallowedHtmlShells: true
+  });
+}
+
+function recoverSingleNewlineBoundaries(
+  paragraphs: string[],
+  sourceBlocks: Array<{ isHeadingLike: boolean }>
+): string[] {
+  if (paragraphs.length >= sourceBlocks.length) return paragraphs;
+  const hasHeadingBlocks = sourceBlocks.some((b) => b.isHeadingLike);
+  const listMarkerRe = /^(?:\d{1,3}[.．、\)](?!\d)|\(\d{1,3}\)|\[\d{1,3}\]|[-*•·])\s*\S/;
+  const mdHeadingRe = /^#{1,6}\s+\S/;
+  const expanded: string[] = [];
+
+  for (const para of paragraphs) {
+    const lines = para
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (lines.length <= 1) {
+      expanded.push(para);
+      continue;
+    }
+
+    const chunks: string[] = [lines[0]];
+    for (let i = 1; i < lines.length; i++) {
+      const prev = chunks[chunks.length - 1];
+      const curr = lines[i];
+      const prevLastLine = prev.split(/\r?\n/).pop()?.trim() || '';
+      const prevPlain = prevLastLine.replace(/^#{1,6}\s+/, '').trim();
+      const prevEndsSentence = /[。！？.!?：:;；]$/.test(prevPlain);
+      const isListBoundary = listMarkerRe.test(curr);
+      const isMdHeadingBoundary = mdHeadingRe.test(prevLastLine) || mdHeadingRe.test(curr);
+      const isShortHeadingBeforeBody =
+        hasHeadingBlocks &&
+        !listMarkerRe.test(prevLastLine) &&
+        prevPlain.length > 0 &&
+        prevPlain.length <= 35 &&
+        !prevEndsSentence &&
+        !mdHeadingRe.test(prevLastLine) &&
+        (curr.length > prevPlain.length * 1.3 || /[。！？.!?]$/.test(curr));
+
+      if (isListBoundary || isMdHeadingBoundary || isShortHeadingBeforeBody) {
+        chunks.push(curr);
+      } else {
+        chunks[chunks.length - 1] = `${prev}\n${curr}`;
+      }
+    }
+    expanded.push(...chunks);
+  }
+
+  return expanded;
 }
 
 /**
@@ -1310,9 +1928,14 @@ export class DomMutationEngine {
    * - Separates leading empty pagebreak anchors (`<a id="p17" class="calibre4"></a>`) so the LLM never sees or drops them
    * - Unwraps single outer inline wrapper (`<small class="calibre6">...</small>`) if it wraps the entire leaf block
    * - Converts `<a epub:type="noteref">` into opaque `__FN_REF_{id}__` slots
-   * - Keeps inline formatting tags (`<i>`, `<b>`, `<em>`, `<strong>`, etc.) intact
+   * - Purifies inline `<span>` elements using CSS profiles & AI style roles so class/dropcap noise never leaks to the LLM
+   * - Keeps clean semantic formatting tags (`<i>`, `<b>`, `<em>`, `<strong>`, `<code>`, etc.) intact
    */
-  public extractLeafBlockContent(el: Element): {
+  public extractLeafBlockContent(
+    el: Element,
+    bookStyleRoles?: BookStyleRoleMap,
+    cssProfiles?: Map<string, CssClassProfile>
+  ): {
     slottedText: string;
     leadingAnchorHtmls: string[];
     footnoteIds: string[];
@@ -1371,6 +1994,126 @@ export class DomMutationEngine {
       }
     }
 
+    // 4.5. Unwrap remaining non-noteref inline <a> elements (e.g. doc-backlink / internal cross-refs)
+    // so raw `<a class="..." href="..." role="doc-backlink">` never leaks to the LLM;
+    // any non-noteref `<a id="...">` anchors are preserved in-place on write-back.
+    for (const anchor of Array.from(targetContainer.querySelectorAll('a')).reverse()) {
+      if (!anchor.parentNode || isNoterefAnchor(anchor)) continue;
+      anchor.replaceWith(...Array.from(anchor.childNodes));
+    }
+
+    // 5. Purify remaining <span> elements (deepest-first) using CSS profiles + AI style roles:
+    // dropcap / ignore / empty / decorative / body / smallcaps spans are unwrapped or removed;
+    // emphasis / strong / code spans are normalized to bare <i> / <b> / <code> tags.
+    const doc = targetContainer.ownerDocument!;
+    const spans = Array.from(targetContainer.querySelectorAll('span')).reverse();
+    for (const span of spans) {
+      if (!span.parentNode || span.getAttribute('data-translit-role') === 'footnote-popup') {
+        continue;
+      }
+      if (span.childNodes.length === 0) {
+        const emptyClsTokens = (span.getAttribute('class') || '').split(/\s+/).filter(Boolean);
+        let hasHorizontalSpacing = false;
+        if (cssProfiles) {
+          for (const c of emptyClsTokens) {
+            const prof = cssProfiles.get(c);
+            if (
+              prof &&
+              ((prof.paddingLeftEm !== undefined && prof.paddingLeftEm > 0) ||
+                (prof.marginLeftEm !== undefined && prof.marginLeftEm > 0))
+            ) {
+              hasHorizontalSpacing = true;
+              break;
+            }
+          }
+        }
+        const emptyInlineStyle = span.getAttribute('style');
+        if (!hasHorizontalSpacing && emptyInlineStyle) {
+          const parsedInline = parseCssDeclarations(emptyInlineStyle);
+          if (
+            (parsedInline.paddingLeftEm !== undefined && parsedInline.paddingLeftEm > 0) ||
+            (parsedInline.marginLeftEm !== undefined && parsedInline.marginLeftEm > 0)
+          ) {
+            hasHorizontalSpacing = true;
+          }
+        }
+        if (hasHorizontalSpacing) {
+          span.replaceWith(doc.createTextNode(' '));
+        } else {
+          span.remove();
+        }
+        continue;
+      }
+
+      const mapped = resolveElementBookStyleMapping(span, bookStyleRoles);
+      const cls = span.getAttribute('class') || '';
+      const clsTokens = cls.split(/\s+/).filter(Boolean);
+
+      let ownFontStyle: 'italic' | 'normal' | undefined;
+      let ownFontWeight: 'bold' | 'normal' | undefined;
+      if (cssProfiles) {
+        for (const c of clsTokens) {
+          const prof = cssProfiles.get(c);
+          if (!prof) continue;
+          if (prof.fontStyle !== undefined) ownFontStyle = prof.fontStyle;
+          if (prof.fontWeight !== undefined) ownFontWeight = prof.fontWeight;
+        }
+      }
+      const inlineStyleAttr = span.getAttribute('style');
+      if (inlineStyleAttr) {
+        const inlineParsed = parseCssDeclarations(inlineStyleAttr);
+        if (inlineParsed.fontStyle !== undefined) ownFontStyle = inlineParsed.fontStyle;
+        if (inlineParsed.fontWeight !== undefined) ownFontWeight = inlineParsed.fontWeight;
+      }
+
+      const isDropcapOrIgnore =
+        mapped?.role === 'dropcap' ||
+        mapped?.role === 'ignore' ||
+        /(?:^|[\s_-])(?:dropcap|stickupcap|initial|firstletter)\d*(?:$|[\s_-])/i.test(cls);
+
+      if (isDropcapOrIgnore) {
+        span.replaceWith(...Array.from(span.childNodes));
+        continue;
+      }
+
+      const isCode =
+        mapped?.role === 'code' ||
+        /(?:^|[\s_-])(?:code|mono|monospace|tt)\d*(?:$|[\s_-])/i.test(cls);
+      if (isCode) {
+        const codeEl = doc.createElement('code');
+        codeEl.append(...Array.from(span.childNodes));
+        span.replaceWith(codeEl);
+        continue;
+      }
+
+      const isItalic =
+        mapped?.role === 'emphasis' ||
+        (ownFontStyle === 'italic' && mapped?.role !== 'body' && mapped?.role !== 'meta') ||
+        /(?:^|[\s_-])(?:italic|italics|emph|emphasis)\d*(?:$|[\s_-])/i.test(cls);
+      const isBold =
+        mapped?.role === 'strong' ||
+        (ownFontWeight === 'bold' && mapped?.role !== 'body' && mapped?.role !== 'meta') ||
+        /(?:^|[\s_-])(?:bold|strong)\d*(?:$|[\s_-])/i.test(cls);
+
+      if (isBold && isItalic) {
+        const bEl = doc.createElement('b');
+        const iEl = doc.createElement('i');
+        iEl.append(...Array.from(span.childNodes));
+        bEl.appendChild(iEl);
+        span.replaceWith(bEl);
+      } else if (isItalic) {
+        const iEl = doc.createElement('i');
+        iEl.append(...Array.from(span.childNodes));
+        span.replaceWith(iEl);
+      } else if (isBold) {
+        const bEl = doc.createElement('b');
+        bEl.append(...Array.from(span.childNodes));
+        span.replaceWith(bEl);
+      } else {
+        span.replaceWith(...Array.from(span.childNodes));
+      }
+    }
+
     const slottedText = targetContainer.innerHTML
       .replace(/\r?\n/g, ' ')
       .replace(/\s+/g, ' ')
@@ -1392,12 +2135,17 @@ export class DomMutationEngine {
   private stampSemanticRoleClasses(
     root: Element,
     leafElements: Element[],
-    cssProfiles?: Map<string, CssClassProfile>
+    cssProfiles?: Map<string, CssClassProfile>,
+    bookStyleRoles?: BookStyleRoleMap,
+    headingAnalysis?: LeafHeadingAnalysis
   ): void {
     const setRole = (el: Element | null, role: string) => {
       if (!el) return;
       el.setAttribute('data-translit-role', role);
     };
+
+    const analysis =
+      headingAnalysis || resolveLeafHeadingAnalysis(leafElements, cssProfiles, bookStyleRoles);
 
     for (const table of Array.from(root.querySelectorAll('table'))) {
       if (isStructuralTitleTable(table)) {
@@ -1418,7 +2166,7 @@ export class DomMutationEngine {
               setRole(cell, 'h1');
             } else {
               blockChildren.forEach((child, idx) => {
-                const lvl = getHeadingMarkdownLevel(child, cssProfiles);
+                const lvl = getHeadingMarkdownLevel(child, cssProfiles, bookStyleRoles);
                 if (lvl === 2 || (lvl === 0 && idx > 0)) {
                   setRole(child, 'h2');
                 } else {
@@ -1440,34 +2188,98 @@ export class DomMutationEngine {
       if (parentTable && isStructuralTitleTable(parentTable)) {
         continue;
       }
-      const headingLevel = getHeadingMarkdownLevel(el, cssProfiles);
 
-      if (headingLevel === 1) {
-        setRole(el, 'h1');
-        continue;
-      }
-      if (headingLevel === 2) {
-        setRole(el, 'h2');
-        continue;
-      }
-      if (headingLevel === 3) {
-        setRole(el, 'h3');
-        continue;
-      }
-      if (headingLevel >= 4) {
-        setRole(el, 'h4');
-        continue;
-      }
-
-      if (/\b(epigraph|dedication|verse|poem|motto)\b/i.test(cls)) {
-        setRole(el, 'epigraph');
-        continue;
-      }
-
+      const mappedStyle = resolveElementBookStyleMapping(el, bookStyleRoles);
+      const quotePos = analysis.vetoedQuotePos.get(el);
       const style = resolveElementVisualStyle(el, cssProfiles);
+
+      if (quotePos) {
+        setRole(el, 'quote-line');
+        el.setAttribute('data-translit-quote-pos', quotePos);
+        const effAlign = mappedStyle?.align || style.textAlign;
+        if (effAlign === 'center' || effAlign === 'right' || effAlign === 'left') {
+          el.setAttribute('data-translit-align', effAlign);
+        }
+        continue;
+      }
+
+      const headingLevel = analysis.headingLevels.get(el) ?? 0;
+
+      if (headingLevel > 0) {
+        if (mappedStyle?.role === 'subtitle') {
+          setRole(el, 'subtitle');
+        } else if (headingLevel === 1) {
+          setRole(el, 'h1');
+        } else if (headingLevel === 2) {
+          setRole(el, 'h2');
+        } else if (headingLevel === 3) {
+          setRole(el, 'h3');
+        } else {
+          setRole(el, 'h4');
+        }
+        if (mappedStyle?.align) {
+          el.setAttribute('data-translit-align', mappedStyle.align);
+        }
+        continue;
+      }
+
+      if (mappedStyle && mappedStyle.role !== 'ignore') {
+        const insideBlockquote = Boolean(el.closest('blockquote'));
+        if (mappedStyle.role === 'quote' && insideBlockquote) {
+          if (mappedStyle.align) {
+            el.setAttribute('data-translit-align', mappedStyle.align);
+          }
+          if (mappedStyle.weight === 'bold') {
+            el.setAttribute('data-translit-weight', 'bold');
+          }
+          if (mappedStyle.indent === 'none') {
+            el.setAttribute('data-translit-indent', 'none');
+          }
+          continue;
+        }
+
+        const mappedRole = mappedStyle.role === 'quote' ? 'quote-line' : mappedStyle.role;
+        if (
+          mappedRole !== 'body' ||
+          (tag === 'P' && !el.closest('blockquote, li, table, figcaption'))
+        ) {
+          setRole(el, mappedRole);
+        }
+        if (mappedStyle.align) {
+          el.setAttribute('data-translit-align', mappedStyle.align);
+        }
+        if (
+          mappedStyle.weight === 'bold' ||
+          (style.fontWeight === 'bold' &&
+            (mappedStyle.role === 'callout' ||
+              mappedStyle.role === 'body' ||
+              mappedStyle.role === 'attribution' ||
+              mappedStyle.role === 'meta'))
+        ) {
+          el.setAttribute('data-translit-weight', 'bold');
+        }
+        if (mappedStyle.indent === 'none') {
+          el.setAttribute('data-translit-indent', 'none');
+        }
+        continue;
+      }
+
+      if (/(?:^|[\s_-])(?:verse|poem|poetry)\d*(?:$|[\s_-])/i.test(cls)) {
+        setRole(el, 'verse');
+        continue;
+      }
+
+      if (/(?:^|[\s_-])(?:epigraph|dedication|motto)\d*(?:$|[\s_-])/i.test(cls)) {
+        setRole(el, 'epigraph');
+        if (style.textAlign === 'center') {
+          el.setAttribute('data-translit-align', 'center');
+        }
+        continue;
+      }
+
       if (
         (style.textIndentEm !== undefined && style.textIndentEm < 0) ||
-        /\b(bib\d*|ref|reference|ind|inda|toc\d*)\b/i.test(cls)
+        /(?:^|[\s_-])(?:bib|ref|reference|ind|inda|toc|hang)\d*(?:$|[\s_-])/i.test(cls)
       ) {
         setRole(el, 'hanging');
         continue;
@@ -1476,10 +2288,14 @@ export class DomMutationEngine {
       if (
         tag === 'FIGCAPTION' ||
         tag === 'CAPTION' ||
-        /\b(caption|img-caption|fig-caption)\b/i.test(cls)
+        /(?:^|[\s_-])(?:caption|img-caption|fig-caption)\d*(?:$|[\s_-])/i.test(cls)
       ) {
         setRole(el, 'caption');
         continue;
+      }
+
+      if (style.fontWeight === 'bold') {
+        el.setAttribute('data-translit-weight', 'bold');
       }
 
       if (style.textAlign === 'center' || /\b(center|centered|halftitle|half-title)\b/i.test(cls)) {
@@ -1489,14 +2305,77 @@ export class DomMutationEngine {
 
       if (
         style.textAlign === 'right' ||
-        /\b(right|signature|dateline|author-right)\b/i.test(cls)
+        /(?:^|[\s_-])(?:right|signature|dateline|author-right|attribution)\d*(?:$|[\s_-])/i.test(cls)
       ) {
         setRole(el, 'right');
         continue;
       }
 
+      if (style.textIndentEm === 0 && style.fontWeight === 'bold') {
+        el.setAttribute('data-translit-indent', 'none');
+      }
+
       if (tag === 'P' && !el.closest('blockquote, li, table, figcaption')) {
         setRole(el, 'body');
+      }
+    }
+
+    for (const listEl of Array.from(root.querySelectorAll('ol, ul'))) {
+      if (isFootnotePopupElement(listEl) || listEl.closest('aside')) continue;
+      const listStyle = resolveElementVisualStyle(listEl, cssProfiles);
+      const directLis = Array.from(listEl.children).filter(
+        (c) => (c.tagName || '').toUpperCase() === 'LI'
+      );
+      const hasHangingChild = directLis.some(
+        (li) => li.getAttribute('data-translit-role') === 'hanging'
+      );
+      const nonEmptyLis = directLis.filter(
+        (li) => (li.textContent || '').replace(/[\s\u00a0]+/g, '').trim().length > 0
+      );
+      const manualNumCount = nonEmptyLis.filter((li) =>
+        /^\s*(?:\d+[.．、\)]|\(\d+\)|\[\d+\])/.test(li.textContent || '')
+      ).length;
+      const hasManualNumbering =
+        (listEl.tagName || '').toUpperCase() === 'OL' &&
+        nonEmptyLis.length > 0 &&
+        manualNumCount * 2 >= nonEmptyLis.length;
+
+      if (listStyle.listStyleNone === true || hasHangingChild || hasManualNumbering) {
+        listEl.setAttribute('data-translit-list', 'none');
+      }
+    }
+
+    for (const li of Array.from(root.querySelectorAll('li'))) {
+      if (isFootnotePopupElement(li) || li.closest('aside')) continue;
+      if (resolveElementVisualStyle(li, cssProfiles).listStyleNone === true) {
+        li.setAttribute('data-translit-list', 'none');
+      }
+    }
+  }
+
+  private stampInlineSemanticRoles(root: Element, bookStyleRoles?: BookStyleRoleMap): void {
+    for (const inlineEl of Array.from(
+      root.querySelectorAll(
+        'span[class], a[class], b[class], strong[class], i[class], em[class], small[class], big[class], code[class]'
+      )
+    )) {
+      if (isNoterefAnchor(inlineEl) || isFootnotePopupElement(inlineEl)) continue;
+      const mappedInline = resolveElementBookStyleMapping(inlineEl, bookStyleRoles);
+      if (mappedInline) {
+        if (mappedInline.role === 'ignore') continue;
+        if (
+          mappedInline.role === 'dropcap' ||
+          mappedInline.role === 'emphasis' ||
+          mappedInline.role === 'strong' ||
+          mappedInline.role === 'code'
+        ) {
+          inlineEl.setAttribute('data-translit-role', mappedInline.role);
+          continue;
+        }
+      }
+      const cls = inlineEl.getAttribute('class') || '';
+      if (/(?:^|[\s_-])(?:dropcap|stickupcap|initial|firstletter)\d*(?:$|[\s_-])/i.test(cls)) {
+        inlineEl.setAttribute('data-translit-role', 'dropcap');
       }
     }
   }
@@ -1542,7 +2421,8 @@ export class DomMutationEngine {
   public extractTranslatablePayload(
     xhtml: string,
     _internalizedFootnotes: Record<string, FootnoteNode> = {},
-    cssProfiles?: Map<string, CssClassProfile>
+    cssProfiles?: Map<string, CssClassProfile>,
+    bookStyleRoles?: BookStyleRoleMap
   ): DomExtractionResult {
     const doc = parseHtmlDocument(xhtml);
     if (!doc.body) {
@@ -1552,13 +2432,18 @@ export class DomMutationEngine {
     this.decomposeBlockquotes(doc.body);
 
     const leafElements = this.collectTranslatableLeafElements(doc.body);
+    const analysis = resolveLeafHeadingAnalysis(leafElements, cssProfiles, bookStyleRoles);
     const blocks: TranslatableDomBlock[] = [];
 
     leafElements.forEach((el) => {
-      const { slottedText, leadingAnchorHtmls, footnoteIds } = this.extractLeafBlockContent(el);
+      const { slottedText, leadingAnchorHtmls, footnoteIds } = this.extractLeafBlockContent(
+        el,
+        bookStyleRoles,
+        cssProfiles
+      );
       if (!slottedText) return;
 
-      const headingLevel = getHeadingMarkdownLevel(el, cssProfiles);
+      const headingLevel = analysis.headingLevels.get(el) ?? 0;
       const formattedSlottedText =
         headingLevel > 0 && !/^#{1,6}\s/.test(slottedText)
           ? `${'#'.repeat(headingLevel)} ${slottedText}`
@@ -1569,7 +2454,7 @@ export class DomMutationEngine {
         tagName: el.tagName.toLowerCase(),
         className: el.getAttribute('class') || '',
         id: el.getAttribute('id') || '',
-        isHeadingLike: isHeadingLikeElement(el, cssProfiles),
+        isHeadingLike: Boolean(analysis.isHeadingLikeMap.get(el)),
         slottedText: formattedSlottedText,
         footnoteIds,
         leadingAnchorHtmls
@@ -1609,6 +2494,7 @@ export class DomMutationEngine {
       wereadMode = false,
       imagesRelPath = 'Images/',
       cssProfiles,
+      bookStyleRoles,
       applyChineseTypography = true,
       isStreaming = false
     } = options;
@@ -1647,6 +2533,19 @@ export class DomMutationEngine {
       }
     );
 
+    const knownFnIds = Object.keys(internalizedFootnotes);
+    if (knownFnIds.length > 0 && cleanTarget) {
+      const strippedLeaks = stripLeakedFootnoteDefinitions(cleanTarget, knownFnIds);
+      if (strippedLeaks.cleanedText !== cleanTarget) {
+        cleanTarget = strippedLeaks.cleanedText;
+        for (const [fnId, fnText] of Object.entries(strippedLeaks.extractedDefs)) {
+          if (!inlineTranslatedNotes[fnId] && fnText) {
+            inlineTranslatedNotes[fnId] = fnText;
+          }
+        }
+      }
+    }
+
     const doc = parseHtmlDocument(originalXhtml);
     if (!doc.body) {
       return { html: originalXhtml, leafCount: 0 };
@@ -1666,17 +2565,22 @@ export class DomMutationEngine {
       return { html: doc.body.innerHTML, leafCount: 0 };
     }
 
-    this.stampSemanticRoleClasses(doc.body, leafElements, cssProfiles);
+    const headingAnalysis = resolveLeafHeadingAnalysis(leafElements, cssProfiles, bookStyleRoles);
+    this.stampSemanticRoleClasses(doc.body, leafElements, cssProfiles, bookStyleRoles, headingAnalysis);
 
     const extractedSourceBlocks = leafElements.map((el, idx) => {
-      const { slottedText, leadingAnchorHtmls, footnoteIds } = this.extractLeafBlockContent(el);
+      const { slottedText, leadingAnchorHtmls, footnoteIds } = this.extractLeafBlockContent(
+        el,
+        bookStyleRoles,
+        cssProfiles
+      );
       return {
         index: idx,
         el,
         slottedText,
         leadingAnchorHtmls,
         footnoteIds,
-        isHeadingLike: isHeadingLikeElement(el, cssProfiles)
+        isHeadingLike: Boolean(headingAnalysis.isHeadingLikeMap.get(el))
       };
     });
     const nonEmptyLeafCount = extractedSourceBlocks.filter((b) => b.slottedText.length > 0).length;
@@ -1716,6 +2620,13 @@ export class DomMutationEngine {
           .map((p) => p.trim())
           .filter((p) => p.length > 0);
       }
+    }
+
+    if (!isPartialStream && rawTargetParagraphs.length < extractedSourceBlocks.length) {
+      rawTargetParagraphs = recoverSingleNewlineBoundaries(
+        rawTargetParagraphs,
+        extractedSourceBlocks
+      );
     }
 
     rawTargetParagraphs = rawTargetParagraphs.map((p) => this.sanitizeTargetHtml(p));
@@ -1831,9 +2742,16 @@ export class DomMutationEngine {
       const el = blockInfo.el;
       const isUntranslatedStreamTail = isPartialStream && i >= rawTargetParagraphs.length;
       const targetRaw = alignedTargetTexts[i] ?? blockInfo.slottedText;
+      const isMergedEmpty =
+        !isUntranslatedStreamTail && rawTargetParagraphs.length > 0 && targetRaw.trim() === '';
       const shouldFormatTargetHeti = applyChineseTypography && !isUntranslatedStreamTail;
 
       if (!isBilingual) {
+        if (isMergedEmpty) {
+          this.writeHtmlIntoLeafElement(el, '');
+          el.setAttribute('data-translit-merged', 'true');
+          continue;
+        }
         // Monolingual In-Place Mutation: keep element, classes, IDs, leading anchors, and inner wrapper shell intact
         const formattedTarget = this.formatInlineMarkup(targetRaw);
         const renderedTargetHtml = renderFootnoteSlotsInHtml(
@@ -1843,9 +2761,15 @@ export class DomMutationEngine {
         this.writeHtmlIntoLeafElement(el, renderedTargetHtml);
       } else {
         // Bilingual In-Place Cloning
-        const renderedSourceHtml = this.formatInlineMarkup(
-          renderFootnoteSlotsInHtml(blockInfo.slottedText, true)
+        const renderedSourceHtml = renderFootnoteSlotsInHtml(
+          this.formatInlineMarkup(blockInfo.slottedText),
+          true
         );
+        if (isMergedEmpty) {
+          el.classList.add('bilingual-source');
+          this.writeHtmlIntoLeafElement(el, renderedSourceHtml);
+          continue;
+        }
         const formattedTarget = this.formatInlineMarkup(targetRaw);
         const renderedTargetHtml = renderFootnoteSlotsInHtml(
           shouldFormatTargetHeti ? applyHetiTextTypography(formattedTarget) : formattedTarget,
@@ -1941,6 +2865,24 @@ export class DomMutationEngine {
       }
     }
 
+    // Re-index quote-line positions across visible (non-merged) nodes in each quote run
+    for (const run of headingAnalysis.vetoedQuoteRuns) {
+      const visible = run.filter((node) => node.getAttribute('data-translit-merged') !== 'true');
+      if (visible.length === 1) {
+        visible[0].setAttribute('data-translit-quote-pos', 'single');
+      } else if (visible.length > 1) {
+        visible.forEach((node, idx) => {
+          node.setAttribute(
+            'data-translit-quote-pos',
+            idx === 0 ? 'first' : idx === visible.length - 1 ? 'last' : 'mid'
+          );
+        });
+      }
+    }
+
+    // Stamp inline semantic roles AFTER leaf HTML writes so surviving inline spans retain roles
+    this.stampInlineSemanticRoles(doc.body, bookStyleRoles);
+
     // Serialize body innerHTML and normalize XHTML self-closing void tags
     let htmlBody = doc.body.innerHTML
       .replace(/<br\b([^>]*)>/gi, (m, attrs) =>
@@ -2014,6 +2956,23 @@ export class DomMutationEngine {
     }
 
     const innerWrapper = this.resolveInnerWrapperTarget(el);
+    if (!removeLeadingPagebreakAnchors) {
+      const hostId = (el.getAttribute('id') || '').trim();
+      const seenSavedIds = new Set<string>(
+        savedAnchors.map((a) => (a.getAttribute('id') || '').trim()).filter(Boolean)
+      );
+      if (hostId) seenSavedIds.add(hostId);
+
+      for (const anchor of Array.from(innerWrapper.querySelectorAll('a[id]'))) {
+        if (isNoterefAnchor(anchor)) continue;
+        const aid = (anchor.getAttribute('id') || '').trim();
+        if (!aid || seenSavedIds.has(aid)) continue;
+        seenSavedIds.add(aid);
+        const preservedAnchor = el.ownerDocument!.createElement('a');
+        preservedAnchor.setAttribute('id', aid);
+        savedAnchors.push(preservedAnchor);
+      }
+    }
     if (innerWrapper !== el) {
       innerWrapper.innerHTML = newInnerHtml;
     } else {
@@ -2037,7 +2996,7 @@ export class DomMutationEngine {
   }
 
   public sanitizeTargetHtml(html: string): string {
-    return html
+    return stripBlockProtocolMarkers(html)
       .replace(/!\[.*?\]\(.*?\)[\s\u00a0]*/g, '')
       .replace(/^#{1,6}\s+/gm, '')
       .replace(/(?:\r?\n)[ \t]*(?:>+[ \t]*)+/g, '<br/>')
@@ -2052,9 +3011,10 @@ export class DomMutationEngine {
   private formatInlineMarkup(text: string): string {
     const sanitized = this.sanitizeTargetHtml(text);
     // Convert any accidental Markdown **bold** or *italic* emitted by LLM into HTML tags
-    return sanitized
+    const withMarkdownInline = sanitized
       .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
       .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<i>$2</i>');
+    return sanitizeInlineXhtmlForLeaf(withMarkdownInline);
   }
 
   /**
@@ -2074,7 +3034,43 @@ export class DomMutationEngine {
 
     if (N === 0) return [];
     if (M === 0) return [...sourceTexts];
-    if (N === M) return [...targetTexts];
+    if (N === M) {
+      const aligned = [...targetTexts];
+      for (let i = 0; i < N - 1; i++) {
+        const s0 = sourceTexts[i].replace(/^#{1,6}\s+/, '').trim();
+        const s1 = sourceTexts[i + 1].replace(/^#{1,6}\s+/, '').trim();
+        const t0 = aligned[i].replace(/^#{1,6}\s+/, '').trim();
+        const t1 = aligned[i + 1].replace(/^#{1,6}\s+/, '').trim();
+
+        const bodyThenHeadingSwapped =
+          !isHeadingFlags[i] &&
+          isHeadingFlags[i + 1] &&
+          s0.length > 80 &&
+          s1.length <= 60 &&
+          t0.length > 0 &&
+          t0.length <= 35 &&
+          t1.length > 65 &&
+          t1.length >= t0.length * 2.5;
+
+        const headingThenBodySwapped =
+          isHeadingFlags[i] &&
+          !isHeadingFlags[i + 1] &&
+          s0.length <= 60 &&
+          s1.length > 80 &&
+          t0.length > 65 &&
+          t1.length > 0 &&
+          t1.length <= 35 &&
+          t0.length >= t1.length * 2.5;
+
+        if (bodyThenHeadingSwapped || headingThenBodySwapped) {
+          const tmp = aligned[i];
+          aligned[i] = aligned[i + 1];
+          aligned[i + 1] = tmp;
+          i++;
+        }
+      }
+      return aligned;
+    }
 
     // DP to map M target paragraphs onto N source DOM blocks
     const dp: Array<Array<{ cost: number; prevI: number; prevJ: number }>> = [];
@@ -2098,7 +3094,7 @@ export class DomMutationEngine {
       const hasHeading = sIndices.some((idx) => isHeadingFlags[idx]);
       if (hasHeading) {
         if (sIndices.length > 1 || tIndices.length > 1) {
-          cost += 120;
+          cost += 300;
         } else {
           const sEndsSentence = /[。！？.!?]$/.test(sClean);
           const tEndsSentence = /[。！？.!?]$/.test(tClean);
@@ -2139,6 +3135,8 @@ export class DomMutationEngine {
 
       if (sIndices.length === 1 && tIndices.length === 1) {
         cost -= 5;
+      } else if (sIndices.length > 1) {
+        cost += 10 * (sIndices.length - 1);
       } else {
         cost += 12;
       }
@@ -2172,15 +3170,19 @@ export class DomMutationEngine {
             dp[i + 1][j + 3] = { cost: c, prevI: i, prevJ: j };
           }
         }
-        // 2 source blocks <- 1 target paragraph
-        if (i + 2 <= N && j + 1 <= M) {
-          const c = cur + scorePair([i, i + 1], [j]);
-          if (c < dp[i + 2][j + 1].cost) {
-            dp[i + 2][j + 1] = { cost: c, prevI: i, prevJ: j };
+        // 2, 3, or 4 source blocks <- 1 target paragraph (e.g. merged multi-line plaque/quote)
+        for (const sMerge of [2, 3, 4]) {
+          if (i + sMerge <= N && j + 1 <= M) {
+            const sIdxList: number[] = [];
+            for (let k = 0; k < sMerge; k++) sIdxList.push(i + k);
+            const c = cur + scorePair(sIdxList, [j]);
+            if (c < dp[i + sMerge][j + 1].cost) {
+              dp[i + sMerge][j + 1] = { cost: c, prevI: i, prevJ: j };
+            }
           }
         }
-        // 1 source block <- 0 target paragraphs (fallback to empty or source if target exhausted)
-        const cSkip = cur + 35;
+        // 1 source block <- 0 target paragraphs (merged away; never inject untranslated source back into target)
+        const cSkip = cur + 55;
         if (cSkip < dp[i + 1][j].cost) {
           dp[i + 1][j] = { cost: cSkip, prevI: i, prevJ: j };
         }
@@ -2194,14 +3196,14 @@ export class DomMutationEngine {
     while (currI > 0) {
       const step = dp[currI][currJ];
       if (!step || step.prevI === -1) {
-        // Proportional fallback: preserve all M target segments across N source slots
+        // Proportional fallback: preserve all M target segments without leaking untranslated source text
         for (let k = 0; k < N; k++) {
           const startIdx = Math.floor((k * M) / N);
           const endIdx = Math.floor(((k + 1) * M) / N);
           if (endIdx > startIdx) {
             result[k] = targetTexts.slice(startIdx, endIdx).join(' ');
           } else {
-            result[k] = targetTexts[Math.min(startIdx, M - 1)] ?? sourceTexts[k];
+            result[k] = '';
           }
         }
         return result;
@@ -2212,20 +3214,13 @@ export class DomMutationEngine {
 
       if (sCount === 1 && tCount >= 1) {
         result[prevI] = targetTexts.slice(prevJ, currJ).join(' ');
-      } else if (sCount === 2 && tCount === 1) {
-        const combined = targetTexts[prevJ];
-        // Split combined Chinese paragraph at midpoint sentence boundary if possible
-        const mid = Math.floor(combined.length / 2);
-        const punctIdx = combined.indexOf('。', mid - 15);
-        if (punctIdx > 0 && punctIdx < combined.length - 1) {
-          result[prevI] = combined.slice(0, punctIdx + 1).trim();
-          result[prevI + 1] = combined.slice(punctIdx + 1).trim();
-        } else {
-          result[prevI] = combined;
-          result[prevI + 1] = '';
+      } else if (sCount >= 2 && tCount === 1) {
+        result[prevI] = targetTexts[prevJ];
+        for (let k = 1; k < sCount; k++) {
+          result[prevI + k] = '';
         }
       } else if (sCount === 1 && tCount === 0) {
-        result[prevI] = sourceTexts[prevI];
+        result[prevI] = '';
       }
 
       currI = prevI;

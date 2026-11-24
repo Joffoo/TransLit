@@ -24,6 +24,8 @@ import {
   alignMarkdownBlocks
 } from './services/epubService';
 import {
+  DomMutationEngine,
+  parseEpubCssProfiles,
   restoreHeadingPrefixesFromSource
 } from './services/domMutationEngine';
 import { AiService, splitTextIntoChunks } from './services/geminiService';
@@ -32,7 +34,8 @@ import { loadApiProfileStore, getActiveProfile, hasValidApiProfileStore } from '
 import { LanguageDetectionSource } from './services/languageDetectionService';
 import { FootnotePool } from './services/footnotePool';
 import { PageClassifier } from './services/pageClassifier';
-import { AppStatus, AppConfig, Chapter, ProcessingLog, BilingualMode, TokenUsage, TokenUsageStats } from './types';
+import { StyleClassifier } from './services/styleClassifier';
+import { AppStatus, AppConfig, Chapter, ProcessingLog, BilingualMode, BookStyleRoleMap, SessionState, TokenUsage, TokenUsageStats } from './types';
 import { RECOMMENDED_TRANSLATION_PROMPT, TWO_STEP_BASE_PROMPT } from './prompts';
 import {
   parseGlossaryStr,
@@ -116,6 +119,7 @@ const App: React.FC = () => {
   const [previewChapter, setPreviewChapter] = useState<Chapter | null>(null);
   const [chapters, setChapters] = useState<Chapter[]>([]); // Added state for chapters to trigger re-renders
   const [bookCssTexts, setBookCssTexts] = useState<string[]>([]);
+  const [bookStyleRoles, setBookStyleRoles] = useState<BookStyleRoleMap>({});
   const [isCleaningGlossary, setIsCleaningGlossary] = useState(false);
   const [isMissingZip, setIsMissingZip] = useState(false);
   const [exportNotification, setExportNotification] = useState<{
@@ -137,8 +141,17 @@ const App: React.FC = () => {
   const persistenceService = useRef(new PersistenceService());
   const footnotePoolRef = useRef(new FootnotePool());
   const pageClassifierRef = useRef(new PageClassifier());
+  const styleClassifierRef = useRef(new StyleClassifier());
+  const bookStyleRolesRef = useRef<BookStyleRoleMap>({});
+  const bookStyleRolesAiDoneRef = useRef<boolean>(false);
+  const isClassifyingStylesRef = useRef<boolean>(false);
   const logsEndRef = useRef<HTMLDivElement>(null);
   const isPauseRequested = useRef(false);
+
+  const updateBookStyleRoles = (roles: BookStyleRoleMap) => {
+    bookStyleRolesRef.current = roles;
+    setBookStyleRoles(roles);
+  };
   
   // Persist chapters and metadata across renders to allow resuming
   const chaptersRef = useRef<Chapter[]>([]);
@@ -258,6 +271,14 @@ const App: React.FC = () => {
                        if (loadedCss.length > 0) {
                          cssContentsRef.current = loadedCss;
                          setBookCssTexts(loadedCss);
+                         if (Object.keys(bookStyleRolesRef.current).length === 0) {
+                           runBookStyleClassification(
+                             chaptersRef.current,
+                             loadedCss,
+                             { ...session.config, ...localApiConfig },
+                             { allowAi: false, sessionSnapshot: session }
+                           ).catch(() => {});
+                         }
                        }
                      } catch {
                        // Ignore legacy ZIP CSS recovery errors
@@ -275,10 +296,26 @@ const App: React.FC = () => {
                 setGlossaryMap(savedGlossary);
                 updateLiveGlossary(glossaryToOutputStr(savedGlossary));
                 
-                // Restore UI state, merging with LocalStorage configurations
+                 // Restore UI state, merging with LocalStorage configurations
                 const mergedRestoredConfig = { ...session.config, ...localApiConfig };
                 lastSavedConfigJsonRef.current = JSON.stringify(mergedRestoredConfig);
                 setConfig(mergedRestoredConfig);
+
+                bookStyleRolesAiDoneRef.current = Boolean(session.bookStyleRolesAiDone);
+                if (session.bookStyleRoles && Object.keys(session.bookStyleRoles).length > 0) {
+                  updateBookStyleRoles(session.bookStyleRoles);
+                } else {
+                  const cssForCensus =
+                    session.cssContents && session.cssContents.length > 0
+                      ? session.cssContents
+                      : cssContentsRef.current;
+                  runBookStyleClassification(
+                    chaptersRef.current,
+                    cssForCensus,
+                    mergedRestoredConfig,
+                    { allowAi: false, sessionSnapshot: session }
+                  ).catch(() => {});
+                }
                 lastLogTimestampRef.current = savedLogs.reduce(
                   (max, l) => Math.max(max, l.timestamp || 0),
                   0
@@ -540,6 +577,118 @@ const App: React.FC = () => {
     setTokenStats(next);
   };
 
+  const runBookStyleClassification = async (
+    chaptersList: Chapter[],
+    cssTexts: string[],
+    activeCfg: AppConfig,
+    options?: { allowAi?: boolean; sessionSnapshot?: SessionState }
+  ): Promise<BookStyleRoleMap> => {
+    const bodyChaptersHtml = chaptersList
+      .filter((c) => !c.isFootnoteSource && Boolean(c.content))
+      .map((c) => c.content);
+    if (bodyChaptersHtml.length === 0) {
+      return bookStyleRolesRef.current;
+    }
+
+    const { candidates, roles: localRoles } = styleClassifierRef.current.classifyLocal(
+      bodyChaptersHtml,
+      cssTexts
+    );
+    if (!bookStyleRolesAiDoneRef.current && Object.keys(bookStyleRolesRef.current).length === 0 && Object.keys(localRoles).length > 0) {
+      updateBookStyleRoles(localRoles);
+    }
+
+    if (
+      !options?.allowAi ||
+      bookStyleRolesAiDoneRef.current ||
+      !activeCfg.apiKey ||
+      !activeCfg.baseUrl ||
+      candidates.length === 0 ||
+      isClassifyingStylesRef.current
+    ) {
+      return bookStyleRolesRef.current;
+    }
+
+    isClassifyingStylesRef.current = true;
+    try {
+      const aiStyleService = new AiService(activeCfg, recordTokenUsage);
+      let aiSucceeded = false;
+      const { roles: mergedRoles } = await styleClassifierRef.current.classifyBookStylesAi(
+        bodyChaptersHtml,
+        cssTexts,
+        (cands) =>
+          aiStyleService.classifyBookStyles(cands).then((res) => {
+            aiSucceeded = true;
+            return res;
+          })
+      );
+
+      if (aiSucceeded) {
+        bookStyleRolesAiDoneRef.current = true;
+      }
+
+      if (Object.keys(mergedRoles).length > 0) {
+        updateBookStyleRoles(mergedRoles);
+
+        const cssProfiles = parseEpubCssProfiles(cssTexts);
+        const domEngine = new DomMutationEngine();
+        let updatedAnyChapter = false;
+        const nextChapters = chaptersRef.current.map((ch) => {
+          if (ch.translatedMarkdown || ch.proofreadMarkdown || ch.isFootnoteSource || !ch.content) {
+            return ch;
+          }
+          const extracted = domEngine.extractTranslatablePayload(
+            ch.content,
+            ch.internalizedFootnotes,
+            cssProfiles,
+            mergedRoles
+          );
+          if (extracted.payloadText && extracted.payloadText !== ch.markdown) {
+            updatedAnyChapter = true;
+            const refreshed = {
+              ...ch,
+              markdown: extracted.payloadText,
+              slottedMarkdown: extracted.payloadText
+            };
+            persistenceService.current.updateChapter(refreshed).catch(() => {});
+            return refreshed;
+          }
+          return ch;
+        });
+
+        if (updatedAnyChapter) {
+          chaptersRef.current = nextChapters;
+          setChapters(nextChapters);
+        }
+
+        const latestSession = await persistenceService.current.loadSession();
+        const baseSession = latestSession || options?.sessionSnapshot;
+        if (baseSession && baseSession.fileName) {
+          await persistenceService.current.saveSession({
+            ...baseSession,
+            cssContents: cssTexts.length > 0 ? cssTexts : baseSession.cssContents,
+            bookStyleRoles: mergedRoles,
+            bookStyleRolesAiDone: bookStyleRolesAiDoneRef.current,
+            tokenStats: tokenStatsRef.current,
+            lastUpdated: Date.now()
+          });
+        }
+
+        addLog(
+          `[StyleClassifier] 全书样式语义识别完成（${Object.keys(mergedRoles).length} 个样式类），已应用于赫蹏精排。`,
+          'info'
+        );
+        return mergedRoles;
+      }
+    } catch {
+      // Keep local deterministic fallback roles silently
+    } finally {
+      isClassifyingStylesRef.current = false;
+    }
+
+    return bookStyleRolesRef.current;
+  };
+
   const handleFileSelect = async (file: File) => {
     try {
         // Clear previous session
@@ -570,6 +719,9 @@ const App: React.FC = () => {
     coverPathRef.current = undefined;
     cssContentsRef.current = [];
     setBookCssTexts([]);
+    updateBookStyleRoles({});
+    bookStyleRolesAiDoneRef.current = false;
+    isClassifyingStylesRef.current = false;
     updateProgress(0);
     setStatus(AppStatus.IDLE);
     setRestoredSession(false);
@@ -626,8 +778,7 @@ const App: React.FC = () => {
         await persistenceService.current.saveImages(images);
         
         // Save initial session state
-        lastSavedConfigJsonRef.current = JSON.stringify(nextConfig);
-        await persistenceService.current.saveSession({
+        const initialSession: SessionState = {
             status: AppStatus.IDLE, // Keep IDLE so user can review chapters before starting
             config: nextConfig,
             progress: 0,
@@ -638,7 +789,9 @@ const App: React.FC = () => {
             opfDir,
             cssFiles,
             cssContents: cssContents || []
-        });
+        };
+        lastSavedConfigJsonRef.current = JSON.stringify(nextConfig);
+        await persistenceService.current.saveSession(initialSession);
 
         const totalInternalizedNotes = extractedChapters.reduce(
             (sum, c) => sum + Object.keys(c.internalizedFootnotes || {}).length,
@@ -671,6 +824,14 @@ const App: React.FC = () => {
                 }
             ).catch(() => {});
         }
+
+        // Whole-book local CSS style census (zero-token on import; 1-shot AI deferred until translation starts)
+        runBookStyleClassification(
+          extractedChapters,
+          cssContents || [],
+          nextConfig,
+          { allowAi: false, sessionSnapshot: initialSession }
+        ).catch(() => {});
         
         // Auto-switch to studio preview view so user sees the book content immediately
         setSelectedChapterIndex(0);
@@ -717,6 +878,9 @@ const App: React.FC = () => {
     cssFilesRef.current = undefined;
     cssContentsRef.current = [];
     setBookCssTexts([]);
+    updateBookStyleRoles({});
+    bookStyleRolesAiDoneRef.current = false;
+    isClassifyingStylesRef.current = false;
     updateProgress(0);
     setStatus(AppStatus.IDLE);
     setCurrentFile(null);
@@ -899,6 +1063,12 @@ const App: React.FC = () => {
                   
                   const actionWord = config.enableProofreading ? "Translated & Reviewed" : "Translated";
                   addLog(`  > ${actionWord} part ${current}/${total} of "${chapter.title}"... ${glossaryInfo}${formatUsageTag(chunkUsage)}`, 'info');
+                  if (stats?.corruptedCharCount && stats.corruptedCharCount > 0) {
+                      addLog(
+                        `  > ⚠️ 检测到模型返回 ${stats.corruptedCharCount} 处编码乱码字符（\uFFFD），建议在章节列表中手动重译「${chapter.title}」第 ${current}/${total} 部分。`,
+                        'error'
+                      );
+                  }
                   
 
                   if (chapter.fallbackChunks) {
@@ -997,56 +1167,70 @@ const App: React.FC = () => {
             addLog(`Chapter "${chapter.title}" is marked as skipped/reference/footnote-source and does not need translation.`, 'info');
             return;
         }
+
+        if (!bookStyleRolesAiDoneRef.current) {
+            if (config.apiKey && config.baseUrl) {
+                addLog("正在使用大模型识别全书 CSS 排版语义（1-Shot）...", "process");
+            }
+            await runBookStyleClassification(
+                chaptersRef.current,
+                cssContentsRef.current,
+                config,
+                { allowAi: true }
+            ).catch(() => {});
+        }
+        const activeChapters = chaptersRef.current;
+        const activeChapter = activeChapters[index];
         {
             // Use AI split to recover original chunk structure
             const sourceChunks = aiService.splitTextIntoChunks(
-                chapter.markdown,
+                activeChapter.markdown,
                 config.enableProofreading ? 1800 : undefined
             );
             
             // Sync local fallbacks with detection if needed
-            const explicit = chapter.fallbackChunks || [];
+            const explicit = activeChapter.fallbackChunks || [];
             const implicit: number[] = [];
             // If translatedMarkdown exists but chunks are missing/mismatched, scan by content
             sourceChunks.forEach((sChunk, i) => {
                 const trimmed = sChunk.trim();
-                if (trimmed.length > 20 && chapter.translatedMarkdown?.includes(trimmed)) {
+                if (trimmed.length > 20 && activeChapter.translatedMarkdown?.includes(trimmed)) {
                     implicit.push(i);
                 }
             });
-            chapter.fallbackChunks = [...new Set([...explicit, ...implicit])].sort((a,b) => a-b);
+            activeChapter.fallbackChunks = [...new Set([...explicit, ...implicit])].sort((a,b) => a-b);
             
             // Re-initialize chunks array if it's stale/missing
-            if (!chapter.translatedChunks || chapter.translatedChunks.length !== sourceChunks.length) {
-                chapter.translatedChunks = new Array(sourceChunks.length).fill(null);
-                chapter.chunkGlossaries = new Array(sourceChunks.length).fill('');
+            if (!activeChapter.translatedChunks || activeChapter.translatedChunks.length !== sourceChunks.length) {
+                activeChapter.translatedChunks = new Array(sourceChunks.length).fill(null);
+                activeChapter.chunkGlossaries = new Array(sourceChunks.length).fill('');
             }
         }
 
         const effectiveSystemInstruction = buildEffectiveSystemInstruction(config);
             
-        let failedIndices = [...(chapter.fallbackChunks || [])];
-        if (config.enableProofreading && chapter.fallbackProofreadChunks) {
-            chapter.fallbackProofreadChunks.forEach(idx => {
+        let failedIndices = [...(activeChapter.fallbackChunks || [])];
+        if (config.enableProofreading && activeChapter.fallbackProofreadChunks) {
+            activeChapter.fallbackProofreadChunks.forEach(idx => {
                 if (!failedIndices.includes(idx)) failedIndices.push(idx);
             });
         }
         failedIndices.sort((a, b) => a - b);
         
         // If still no failed indices, it means user wants a FULL re-translation (the button says "Re-Translate")
-        if (failedIndices.length === 0 && (chapter.translatedMarkdown || chapter.proofreadMarkdown)) {
-            addLog(`Chapter "${chapter.title}" requested for full re-translation.`, 'info');
+        if (failedIndices.length === 0 && (activeChapter.translatedMarkdown || activeChapter.proofreadMarkdown)) {
+            addLog(`Chapter "${activeChapter.title}" requested for full re-translation.`, 'info');
             // Force ALL chunks to be retried
-            const sourceChunks = aiService.splitTextIntoChunks(chapter.markdown, config.enableProofreading ? 1800 : undefined);
+            const sourceChunks = aiService.splitTextIntoChunks(activeChapter.markdown, config.enableProofreading ? 1800 : undefined);
             failedIndices = sourceChunks.map((_, i) => i);
-            chapter.chunkGlossaries = new Array(sourceChunks.length).fill('');
+            activeChapter.chunkGlossaries = new Array(sourceChunks.length).fill('');
         }
         
         // Fetch the latest master glossary from DB for accurate retry
         const freshMap = await persistenceService.current.loadGlossary();
         const runningGlossary = glossaryToOutputStr(freshMap);
         
-        await processChapter(index, aiService, chapters, effectiveSystemInstruction, failedIndices, runningGlossary);
+        await processChapter(index, aiService, activeChapters, effectiveSystemInstruction, failedIndices, runningGlossary);
         
         // Update percentages
         const totalSteps = chapters.length;
@@ -1095,6 +1279,8 @@ const App: React.FC = () => {
           opfDir: opfDirRef.current,
           cssFiles: cssFilesRef.current,
           cssContents: cssContentsRef.current,
+          bookStyleRoles: bookStyleRolesRef.current,
+          bookStyleRolesAiDone: bookStyleRolesAiDoneRef.current,
           tokenStats: tokenStatsRef.current
       });
   };
@@ -1481,7 +1667,8 @@ const App: React.FC = () => {
           undefined,
           ctx.excludeFileNames,
           'none',
-          true
+          true,
+          bookStyleRolesRef.current
         );
         
         const downloadFileName = `${ctx.baseName}【TransLit-微信专版】.epub`;
@@ -1633,7 +1820,8 @@ const App: React.FC = () => {
           undefined,
           ctx.excludeFileNames,
           variant.mode,
-          variant.wereadMode
+          variant.wereadMode,
+          bookStyleRolesRef.current
         );
 
         const epubFileName = `${ctx.baseName}${variant.suffix}.epub`;
@@ -1700,7 +1888,8 @@ const App: React.FC = () => {
         undefined,
         ctx.excludeFileNames,
         mode,
-        wereadMode
+        wereadMode,
+        bookStyleRolesRef.current
       );
 
       const downloadFileName = `${ctx.baseName}${variant.suffix}.epub`;
@@ -1771,7 +1960,7 @@ const App: React.FC = () => {
         await persistenceService.current.saveImages(images);
         
         // Save initial session state
-        await persistenceService.current.saveSession({
+        const fallbackSession: SessionState = {
             status: AppStatus.PARSING,
             config,
             progress: 0,
@@ -1782,7 +1971,8 @@ const App: React.FC = () => {
             opfDir,
             cssFiles,
             cssContents: cssContents || []
-        });
+        };
+        await persistenceService.current.saveSession(fallbackSession);
 
         addLog(`Extracted ${extractedChapters.length} chapters and ${Object.keys(images).length} images.`, "success");
         if (coverPath) {
@@ -1813,6 +2003,24 @@ const App: React.FC = () => {
       driftFixesRef.current = [];
       footnotePoolRef.current.restoreFromChapters(chaptersRef.current);
       setStatus(AppStatus.TRANSLATING);
+
+      if (!bookStyleRolesAiDoneRef.current) {
+        if (config.apiKey && config.baseUrl) {
+          addLog("正在使用大模型识别全书 CSS 排版语义（1-Shot）...", "process");
+        }
+        await runBookStyleClassification(
+          chaptersRef.current,
+          cssContentsRef.current,
+          config,
+          { allowAi: true }
+        ).catch(() => {});
+        if (isPauseRequested.current) {
+          addLog("Process paused by user.", "info");
+          setStatus(AppStatus.PAUSED);
+          await saveSessionState(AppStatus.PAUSED);
+          return;
+        }
+      }
 
       for (let i = 0; i < chaptersRef.current.length; i++) {
         if (isPauseRequested.current) {
@@ -2539,6 +2747,7 @@ const App: React.FC = () => {
                                                         chapter={activeChapter}
                                                         displayMode={previewDisplayMode}
                                                         bookCssTexts={bookCssTexts}
+                                                        bookStyleRoles={bookStyleRoles}
                                                         opfDir={opfDirRef.current}
                                                         persistence={persistenceService.current}
                                                         isStreamingCurrentChapter={

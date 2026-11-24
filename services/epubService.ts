@@ -1,7 +1,7 @@
 import JSZip from 'jszip';
 import { marked } from 'marked';
 import katex from 'katex';
-import { Chapter, FootnoteNode, BilingualMode } from '../types';
+import { Chapter, FootnoteNode, BilingualMode, BookStyleRoleMap } from '../types';
 import {
   parseHtmlDocument,
   parseXmlDocument,
@@ -11,12 +11,13 @@ import {
 } from '../utils/domAdapter';
 import { FootnoteResolver } from './footnoteResolver';
 import { PageClassifier } from './pageClassifier';
-import { validateAndRepairSlots } from './footnotePool';
+import { stripLeakedFootnoteDefinitions, validateAndRepairSlots } from './footnotePool';
 import {
   DomMutationEngine,
   CssClassProfile,
+  EXCLUDED_PSEUDO_HEADING_CLASSES,
   parseEpubCssProfiles,
-  getHeadingMarkdownLevel,
+  resolveLeafHeadingAnalysis,
   applyHetiTextTypography,
   restoreHeadingPrefixesFromSource,
   buildFootnoteAsideHtml
@@ -119,7 +120,8 @@ export const EPUB3_POPUP_FOOTNOTE_CSS = `
   /* EPUB 3 Native Popup Footnotes & Universal Reader Fallback (WeRead, Apple Books, Duokan) */
   a.noteref, a.duokan-footnote, a.footnote {
     display: inline !important;
-    color: #2e5b60 !important;
+    color: inherit;
+    opacity: 0.78;
     text-decoration: none !important;
     border: none !important;
     border-bottom: none !important;
@@ -163,10 +165,11 @@ export const EPUB3_POPUP_FOOTNOTE_CSS = `
     display: block;
     margin-top: 1.5em;
     padding-top: 0.75em;
-    border-top: 1px dashed #A2906A;
+    border-top: 1px dashed rgba(128, 128, 128, 0.32);
     font-size: 0.9em;
     line-height: 1.6;
-    color: #4a4a4a;
+    color: inherit;
+    opacity: 0.80;
   }
   aside.footnote-popup p.footnote-content, .duokan-footnote-item {
     text-indent: 0;
@@ -174,8 +177,8 @@ export const EPUB3_POPUP_FOOTNOTE_CSS = `
     text-align: justify;
   }
   a.footnote-backref {
-    color: #2e5b60;
-    font-weight: bold;
+    color: inherit;
+    font-weight: 700;
     margin-right: 0.4em;
     text-decoration: none;
     border-bottom: none;
@@ -183,20 +186,22 @@ export const EPUB3_POPUP_FOOTNOTE_CSS = `
   .translit-zero-offset-placeholder {
     margin: 3em 1em;
     padding: 1.5em;
-    border: 1px dashed #A2906A;
-    color: #666;
+    border: 1px dashed rgba(128, 128, 128, 0.32);
+    color: inherit;
+    opacity: 0.75;
     font-size: 0.9em;
     text-align: center;
   }
 `;
 
 const HETI_SERIF_FONT_STACK =
-  '"Heti Song", "Songti SC", "STSong", "Source Han Serif SC", "Source Han Serif CN", "Noto Serif CJK SC", "SimSun", "PMingLiU", serif';
+  '"Heti Song", "Songti SC", "STSong", "Source Han Serif SC", "Source Han Serif CN", "Noto Serif SC", "Noto Serif CJK SC", "SimSun", "PMingLiU", serif';
 
 const HETI_SANS_FONT_STACK =
-  '"Heti Hei", "PingFang SC", "Source Han Sans CN", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif';
+  '"Heti Hei", "PingFang SC", "Hiragino Sans GB", "Source Han Sans SC", "Source Han Sans CN", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif';
 
-const HETI_KAI_FONT_STACK = '"KaiTi", "STKaiti", "FangSong", "fs2", serif';
+const HETI_KAI_FONT_STACK =
+  '"Kaiti SC", "STKaiti", "KaiTi", "BiauKai", "LXGW WenKai", "FangSong", "STFangsong", serif';
 
 const STATIC_HEADING_CLASSES = [
   'sec1-titlea',
@@ -267,23 +272,55 @@ const STATIC_HANGING_OR_SPECIAL_NO_INDENT_CLASSES = [
 ];
 
 /**
- * Builds Heti (赫蹏) + CLREQ-compliant Chinese typography CSS tailored to the EPUB's own classes.
- * Prevents cross-book Calibre class contamination (e.g. .calibre5/.calibre8 false italics),
- * protects centered/right-aligned blocks, pseudo-headings, and hanging indents from `text-indent: 2em !important`,
- * and prevents border/margin stacking on nested blockquotes.
+ * Builds Pure Heti (赫蹏) + CLREQ-compliant Chinese typography CSS tailored to the EPUB's
+ * own classes and optional whole-book semantic role mappings (`bookStyleRoles`).
+ * - Inherits host reader ink/paper colors cleanly across light, sepia, green, dark, and E-ink themes.
+ * - Uses typography hierarchy (typeface, scale, weight, whitespace) & opacity/alpha gray hairlines instead of hardcoded colors.
+ * - Separates genuine headings from bold body/callout paragraphs and preserves bold classes dynamically.
  */
-export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): string {
+export function buildAdaptiveChineseTypographyCss(
+  originalCssTexts?: string[],
+  bookStyleRoles?: BookStyleRoleMap
+): string {
   const hasProvidedCss = Array.isArray(originalCssTexts);
   const profiles: Map<string, CssClassProfile> = hasProvidedCss
     ? parseEpubCssProfiles(originalCssTexts)
     : new Map<string, CssClassProfile>();
 
   const italicSelectors = new Set<string>(['em', 'i', 'cite']);
+  const boldSelectors = new Set<string>(['strong', 'b']);
+  const dropcapSelectors = new Set<string>(['[data-translit-role="dropcap"]']);
+
   if (!hasProvidedCss) {
     italicSelectors.add('.calibre5');
     italicSelectors.add('.calibre8');
   } else {
     for (const [cls, profile] of profiles.entries()) {
+      const mapped = bookStyleRoles?.[cls];
+      if (mapped) {
+        if (mapped.role === 'emphasis') {
+          italicSelectors.add(`.${cls}`);
+        } else if (
+          mapped.role === 'strong' ||
+          mapped.weight === 'bold' ||
+          (profile.fontWeight === 'bold' &&
+            (mapped.role === 'callout' ||
+              mapped.role === 'body' ||
+              mapped.role === 'attribution' ||
+              mapped.role === 'meta'))
+        ) {
+          boldSelectors.add(`.${cls}`);
+        } else if (mapped.role === 'dropcap') {
+          dropcapSelectors.add(`.${cls}`);
+        }
+        continue;
+      }
+
+      if (/dropcap|stickupcap|initial|firstletter/i.test(cls)) {
+        dropcapSelectors.add(`.${cls}`);
+        continue;
+      }
+
       if (
         profile.fontStyle === 'italic' &&
         profile.fontWeight !== 'bold' &&
@@ -291,6 +328,12 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
         !/title|head|h[1-6]/i.test(cls)
       ) {
         italicSelectors.add(`.${cls}`);
+      } else if (
+        profile.fontWeight === 'bold' &&
+        (profile.fontSizeEm === undefined || profile.fontSizeEm < 1.15) &&
+        !/title|head|h[1-6]|cn|ct|fmbm_head/i.test(cls)
+      ) {
+        boldSelectors.add(`.${cls}`);
       }
     }
   }
@@ -300,6 +343,9 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
     headingSelectors.add(`.${cls}`);
   }
 
+  const dynamicHeadingNotRoles =
+    ':not([data-translit-role="body"]):not([data-translit-role="center"]):not([data-translit-role="right"]):not([data-translit-role="epigraph"]):not([data-translit-role="quote-line"]):not([data-translit-role="callout"]):not([data-translit-role="verse"]):not([data-translit-role="attribution"]):not([data-translit-role="meta"]):not([data-translit-role="hanging"]):not([data-translit-role="caption"])';
+
   const zeroIndentAlignClasses = new Set<string>(STATIC_ZERO_INDENT_ALIGN_CLASSES);
   const noIndentClasses = new Set<string>([
     ...STATIC_HEADING_CLASSES,
@@ -307,25 +353,69 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
     ...STATIC_HANGING_OR_SPECIAL_NO_INDENT_CLASSES
   ]);
 
+  if (bookStyleRoles) {
+    for (const [cls, mapped] of Object.entries(bookStyleRoles)) {
+      if (mapped.scope === 'inline' || mapped.role === 'ignore') continue;
+      if (
+        mapped.role === 'h1' ||
+        mapped.role === 'h2' ||
+        mapped.role === 'h3' ||
+        mapped.role === 'h4'
+      ) {
+        headingSelectors.add(`.${cls}${dynamicHeadingNotRoles}`);
+        noIndentClasses.add(cls);
+      } else if (mapped.role === 'body') {
+        if (mapped.indent === 'none' || mapped.align === 'center' || mapped.align === 'right') {
+          noIndentClasses.add(cls);
+          zeroIndentAlignClasses.add(cls);
+        }
+      } else {
+        noIndentClasses.add(cls);
+        if (
+          mapped.role === 'kicker' ||
+          mapped.role === 'subtitle' ||
+          mapped.role === 'epigraph' ||
+          mapped.role === 'attribution' ||
+          mapped.role === 'callout' ||
+          mapped.role === 'caption' ||
+          mapped.role === 'meta' ||
+          mapped.role === 'divider' ||
+          mapped.align === 'center' ||
+          mapped.align === 'right'
+        ) {
+          zeroIndentAlignClasses.add(cls);
+        }
+      }
+    }
+  }
+
   for (const [cls, profile] of profiles.entries()) {
+    const mapped = bookStyleRoles?.[cls];
+    if (mapped && mapped.role !== 'ignore') {
+      continue;
+    }
+
     const isHangingIndent = profile.textIndentEm !== undefined && profile.textIndentEm < 0;
     const isCenterOrRight = profile.textAlign === 'center' || profile.textAlign === 'right';
     const isZeroIndentSectionOpener =
       profile.textIndentEm === 0 && (profile.marginTopEm ?? 0) >= 2.0;
+    const isExcludedPseudoHeading = EXCLUDED_PSEUDO_HEADING_CLASSES.test(cls);
     const isVisualPseudoHeading =
       !isHangingIndent &&
-      ((profile.fontSizeEm !== undefined && profile.fontSizeEm >= 1.15) ||
-        (profile.fontWeight === 'bold' && profile.textIndentEm === 0));
+      !isExcludedPseudoHeading &&
+      !profile.isInlineOnly &&
+      profile.fontSizeEm !== undefined &&
+      profile.fontSizeEm >= 1.15;
 
     if (isHangingIndent) {
       noIndentClasses.add(cls);
     } else if (isVisualPseudoHeading) {
-      headingSelectors.add(`.${cls}`);
+      headingSelectors.add(`.${cls}${dynamicHeadingNotRoles}`);
       noIndentClasses.add(cls);
     } else if (isCenterOrRight) {
       zeroIndentAlignClasses.add(cls);
       noIndentClasses.add(cls);
-    } else if (isZeroIndentSectionOpener) {
+    } else if (isZeroIndentSectionOpener || (profile.fontWeight === 'bold' && profile.textIndentEm === 0)) {
       noIndentClasses.add(cls);
     }
   }
@@ -338,9 +428,11 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
     .map((cls) => `.${cls}`)
     .join(',\n  ');
   const italicSelectorList = Array.from(italicSelectors).join(', ');
+  const boldSelectorList = Array.from(boldSelectors).join(', ');
+  const dropcapSelectorList = Array.from(dropcapSelectors).join(', ');
 
   return `
-  /* TransLit Chinese Bookish Typography Enhancement (Pure Heti + CLREQ Semantic Preset) */
+  /* TransLit Chinese Bookish Typography Enhancement (Pure Heti + CLREQ Monochrome Preset) */
   body, .calibre {
     font-family: ${HETI_SERIF_FONT_STACK};
     font-size: 100%;
@@ -354,7 +446,6 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
     text-spacing-trim: space-first;
     text-autospace: normal;
     -webkit-font-smoothing: antialiased;
-    color: #2c2c2c;
     margin: 0;
     padding: 0;
   }
@@ -365,14 +456,23 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
   [data-translit-role="h3"], [data-translit-role="h4"] {
     font-family: ${HETI_SANS_FONT_STACK}, ${HETI_SERIF_FONT_STACK};
     font-weight: 700;
-    color: #2e5b60;
-    line-height: 1.5;
+    color: inherit;
+    line-height: 1.45;
     text-align: left;
     text-indent: 0 !important;
+    page-break-after: avoid;
+    break-after: avoid;
+  }
+  h1 a, h2 a, h3 a, h4 a,
+  [data-translit-role="h1"] a, [data-translit-role="h2"] a,
+  [data-translit-role="h3"] a, [data-translit-role="h4"] a {
+    color: inherit !important;
+    text-decoration: none !important;
   }
   h1, [data-translit-role="h1"] {
     font-size: 1.45em;
-    margin: 1.6em 0 0.85em;
+    letter-spacing: 0.04em;
+    margin: 1.8em 0 0.85em;
   }
   h2, [data-translit-role="h2"] {
     font-size: 1.22em;
@@ -385,6 +485,29 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
   h4, h5, h6, [data-translit-role="h4"] {
     font-size: 1em;
     margin: 1.1em 0 0.4em;
+  }
+  [data-translit-role="kicker"] {
+    font-family: ${HETI_SANS_FONT_STACK}, ${HETI_SERIF_FONT_STACK};
+    font-size: 0.88em;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    color: inherit;
+    opacity: 0.72;
+    margin: 1.8em 0 0.25em;
+    text-indent: 0 !important;
+    page-break-after: avoid;
+    break-after: avoid;
+  }
+  [data-translit-role="subtitle"] {
+    font-family: ${HETI_KAI_FONT_STACK};
+    font-size: 1.05em;
+    font-weight: 400;
+    color: inherit;
+    opacity: 0.78;
+    margin: -0.35em 0 1.2em;
+    text-indent: 0 !important;
+    page-break-after: avoid;
+    break-after: avoid;
   }
 
   /* Chapter Title Tables (e.g. Calibre table.title1 / table.title2) */
@@ -400,13 +523,13 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
   [data-translit-role="title-num"], table.title1 td.bor1, table.title2 td.bor1,
   table.title1 td.bor, table.title2 td.bor {
     border: none;
-    border-right: 2px solid #2e5b60;
+    border-right: 2px solid rgba(128, 128, 128, 0.45);
     padding: 0 0.65em 0 0;
     font-family: ${HETI_SANS_FONT_STACK}, ${HETI_SERIF_FONT_STACK};
     font-weight: 700;
     font-size: 1.45em;
     line-height: 1.4;
-    color: #2e5b60;
+    color: inherit;
     vertical-align: middle;
     width: auto;
     white-space: nowrap;
@@ -429,7 +552,7 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
     font-weight: 700;
     line-height: 1.4;
     margin: 0 !important;
-    color: #2e5b60;
+    color: inherit;
   }
   [data-translit-role="title-table"] [data-translit-role="h1"] small,
   table.title1 td.top small, table.title2 td.top small {
@@ -441,7 +564,8 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
     font-weight: 600;
     line-height: 1.5;
     margin: 0.35em 0 0 !important;
-    color: #4a6b6f;
+    color: inherit;
+    opacity: 0.78;
     font-family: ${HETI_SANS_FONT_STACK}, ${HETI_SERIF_FONT_STACK} !important;
   }
   [data-translit-role="title-table"] i,
@@ -453,26 +577,63 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
   /* Preserve non-indented centered, right-aligned, caption, and signature blocks */
   ${zeroIndentSelectorList},
   [data-translit-role="center"], [data-translit-role="right"],
-  [data-translit-role="caption"], [data-translit-role="divider"] {
+  [data-translit-role="attribution"], [data-translit-role="caption"],
+  [data-translit-role="divider"], [data-translit-role="meta"],
+  [data-translit-role="callout"] {
     text-indent: 0 !important;
   }
   [data-translit-role="center"] {
     text-align: center !important;
     margin: 1.1em 0;
   }
-  [data-translit-role="right"] {
+  [data-translit-role="center"] + [data-translit-role="center"] {
+    margin-top: 0.35em;
+  }
+  [data-translit-role="right"], [data-translit-role="attribution"] {
     text-align: right !important;
     font-family: ${HETI_KAI_FONT_STACK};
-    color: #4a4a4a;
-    margin: 0.8em 0 1.3em;
+    font-size: 0.9em;
+    color: inherit;
+    opacity: 0.78;
+    margin: 0.45em 0 1.2em;
   }
   [data-translit-role="epigraph"] {
     font-family: ${HETI_KAI_FONT_STACK};
-    font-size: 0.95em;
-    color: #4a4a4a;
-    margin: 1.2em 2em;
+    font-size: 0.94em;
+    color: inherit;
+    opacity: 0.85;
+    margin: 1.2em 1.8em;
     line-height: 1.75;
     text-indent: 0 !important;
+  }
+  [data-translit-role="verse"] {
+    font-family: ${HETI_KAI_FONT_STACK};
+    font-size: 0.95em;
+    color: inherit;
+    line-height: 1.7;
+    text-align: left !important;
+    padding-left: 2em !important;
+    text-indent: -2em !important;
+    margin: 0.15em 0;
+  }
+  [data-translit-role="callout"] {
+    font-family: ${HETI_SERIF_FONT_STACK};
+    font-size: 0.94em;
+    line-height: 1.72;
+    color: inherit;
+    padding: 0.8em 1em;
+    margin: 1.2em 0;
+    border: 1px solid rgba(128, 128, 128, 0.24);
+    background-color: rgba(128, 128, 128, 0.06);
+    text-indent: 0 !important;
+  }
+  [data-translit-role="meta"] {
+    font-size: 0.86em;
+    line-height: 1.62;
+    color: inherit;
+    opacity: 0.76;
+    text-indent: 0 !important;
+    margin: 0.35em 0;
   }
   [data-translit-role="hanging"] {
     padding-left: 2em !important;
@@ -480,6 +641,20 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
     font-size: 0.92em;
     line-height: 1.7;
     margin: 0.45em 0;
+    list-style: none !important;
+    list-style-type: none !important;
+  }
+
+  /* Neutralize Western dropcaps for Chinese typography */
+  ${dropcapSelectorList} {
+    float: none !important;
+    font-size: 1em !important;
+    font-weight: inherit !important;
+    line-height: inherit !important;
+    font-variant: normal;
+    margin: 0 !important;
+    padding: 0 !important;
+    vertical-align: baseline !important;
   }
 
   /* Chinese Typography Standard: Upright KaiTi/FangSong for italics without fake slanted CJK glyphs */
@@ -487,8 +662,21 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
     font-style: normal;
     font-family: ${HETI_KAI_FONT_STACK};
   }
-  strong, b {
-    font-weight: 600;
+  [data-translit-role="emphasis"] {
+    font-style: normal;
+    font-family: ${HETI_KAI_FONT_STACK};
+  }
+  ${boldSelectorList}, [data-translit-role="strong"], [data-translit-weight="bold"] {
+    font-family: ${HETI_SERIF_FONT_STACK};
+    font-weight: 700;
+    color: inherit;
+  }
+  [data-translit-role="code"] {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.88em;
+    background-color: rgba(128, 128, 128, 0.08);
+    padding: 0.1em 0.3em;
+    border-radius: 2px;
   }
 
   /* Heti Inline Details: Keep footnote superscripts from inflating line height & offset proper-noun underlines */
@@ -510,18 +698,17 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
     text-underline-offset: 0.25em;
   }
 
-  /* Blockquote: Chinese Publishing Standard - Upright KaiTi, warm dark plum (#412938), single elegant left rule */
+  /* Blockquote & Quote Lines: Pure Heti Upright KaiTi with hairline theme-adaptive border */
   blockquote {
     font-style: normal;
     font-family: ${HETI_KAI_FONT_STACK};
     font-size: 0.95em !important;
-    color: #412938;
+    color: inherit;
     margin: 1.4em 0 1.4em 0.8em !important;
-    padding: 0.6em 1em 0.6em 1.2em !important;
+    padding: 0.55em 1em 0.55em 1.15em !important;
     border: none !important;
-    border-left: 3px solid #A2906A !important;
-    background-color: rgba(162, 144, 106, 0.05);
-    border-radius: 2px;
+    border-left: 2px solid rgba(128, 128, 128, 0.38) !important;
+    background-color: rgba(128, 128, 128, 0.05);
   }
 
   /* Prevent border and box stacking inside nested blockquotes (e.g. Calibre multi-level blockquotes) */
@@ -541,6 +728,57 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
     margin: 0.5em 0 !important;
     text-indent: 2em !important;
   }
+  blockquote p[data-translit-role="center"],
+  blockquote p[data-translit-align="center"] {
+    text-indent: 0 !important;
+    text-align: center !important;
+  }
+
+  [data-translit-role="quote-line"] {
+    font-style: normal;
+    font-family: ${HETI_KAI_FONT_STACK} !important;
+    font-size: 0.95em !important;
+    font-weight: normal !important;
+    font-variant: normal !important;
+    color: inherit;
+    line-height: 1.75;
+    margin: 0 0 0 0.8em !important;
+    padding: 0.15em 1em 0.15em 1.15em !important;
+    border: none !important;
+    border-left: 2px solid rgba(128, 128, 128, 0.38) !important;
+    background-color: rgba(128, 128, 128, 0.05);
+    text-indent: 0 !important;
+  }
+  [data-translit-role="quote-line"][data-translit-quote-pos="first"] {
+    margin-top: 1.3em !important;
+    padding-top: 0.55em !important;
+  }
+  [data-translit-role="quote-line"][data-translit-quote-pos="last"] {
+    margin-bottom: 1.3em !important;
+    padding-bottom: 0.55em !important;
+  }
+  [data-translit-role="quote-line"][data-translit-quote-pos="single"] {
+    margin-top: 1.3em !important;
+    margin-bottom: 1.3em !important;
+    padding-top: 0.55em !important;
+    padding-bottom: 0.55em !important;
+  }
+  blockquote [data-translit-role="quote-line"] {
+    border-left: none !important;
+    background-color: transparent !important;
+    margin: 0.45em 0 !important;
+    padding: 0 !important;
+    font-size: 1em !important;
+  }
+
+  /* Invert nested emphasis inside KaiTi quote/epigraph/verse blocks back to upright SongTi */
+  blockquote em, blockquote i,
+  [data-translit-role="quote-line"] em, [data-translit-role="quote-line"] i,
+  [data-translit-role="epigraph"] em, [data-translit-role="epigraph"] i,
+  [data-translit-role="verse"] em, [data-translit-role="verse"] i {
+    font-family: ${HETI_SERIF_FONT_STACK} !important;
+    font-style: normal;
+  }
 
   /* Normalize lists for harmonious CJK reading */
   ol, ul {
@@ -559,9 +797,19 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
   li p {
     text-indent: 0 !important;
   }
+  ol[data-translit-list="none"], ul[data-translit-list="none"] {
+    list-style: none !important;
+    list-style-type: none !important;
+    padding-left: 0 !important;
+  }
+  ol[data-translit-list="none"] > li, ul[data-translit-list="none"] > li,
+  li[data-translit-list="none"], li[data-translit-role="hanging"] {
+    list-style: none !important;
+    list-style-type: none !important;
+  }
 
   /* Unified Chinese body paragraph indent while protecting headings, centered/right blocks, captions, and hanging indents */
-  p[data-translit-role="body"], p${notChain} {
+  p[data-translit-role="body"]:not([data-translit-indent="none"]):not([data-translit-align="center"]):not([data-translit-align="right"]), p${notChain} {
     font-size: 1em;
     text-indent: 2em !important;
     margin: 0.45em 0;
@@ -574,6 +822,25 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
     text-autospace: normal;
   }
 
+  /* Orthogonal modifier overrides */
+  [data-translit-align="center"] {
+    text-align: center !important;
+    text-indent: 0 !important;
+  }
+  [data-translit-align="right"] {
+    text-align: right !important;
+    text-indent: 0 !important;
+  }
+  [data-translit-align="left"] {
+    text-align: left !important;
+  }
+  [data-translit-indent="none"] {
+    text-indent: 0 !important;
+  }
+  [data-translit-merged="true"] {
+    display: none !important;
+  }
+
   /* Data tables, code, captions, dividers & media */
   [data-translit-role="data-table"] {
     width: 100%;
@@ -582,13 +849,13 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
     font-size: 0.92em;
   }
   [data-translit-role="data-table"] th, [data-translit-role="data-table"] td {
-    border: 1px solid #d4d4d4;
+    border: 1px solid rgba(128, 128, 128, 0.28);
     padding: 0.45em 0.75em;
     text-indent: 0 !important;
   }
   [data-translit-role="data-table"] th {
-    background-color: #f5f5f3;
-    font-weight: 600;
+    background-color: rgba(128, 128, 128, 0.07);
+    font-weight: 700;
   }
   table p, td p, th p {
     text-indent: 0 !important;
@@ -596,7 +863,7 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
   pre, code {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     font-size: 0.88em;
-    background-color: #f6f6f4;
+    background-color: rgba(128, 128, 128, 0.07);
     border-radius: 3px;
     text-indent: 0 !important;
   }
@@ -617,18 +884,21 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
     text-indent: 0 !important;
     text-align: center !important;
     font-size: 0.88em;
-    color: #5a5a5a;
+    color: inherit;
+    opacity: 0.76;
     font-family: ${HETI_KAI_FONT_STACK};
     margin: 0.5em 0 1.3em;
   }
   p.line, .line, [data-translit-role="divider"] {
     text-indent: 0 !important;
     text-align: center !important;
+    opacity: 0.65;
+    letter-spacing: 0.35em;
     margin: 1.5em 0;
   }
   hr {
     border: none;
-    border-top: 1px solid #d4d4d4;
+    border-top: 1px solid rgba(128, 128, 128, 0.28);
     margin: 1.8em auto;
     width: 40%;
   }
@@ -640,7 +910,7 @@ export function buildAdaptiveChineseTypographyCss(originalCssTexts?: string[]): 
 }
 
 export const BILINGUAL_EPUB_CSS = `
-  /* TransLit Bilingual Paragraph Alignment Styles (Heti + CLREQ Enhanced) */
+  /* TransLit Bilingual Paragraph Alignment Styles (Pure Heti + CLREQ Enhanced) */
   .bilingual-pair {
     margin-top: 1.4em;
     margin-bottom: 1.4em;
@@ -651,14 +921,15 @@ export const BILINGUAL_EPUB_CSS = `
     line-height: 1.55;
     word-break: normal;
     overflow-wrap: break-word;
-    color: #555555;
+    color: inherit;
+    opacity: 0.72;
     margin-top: 0.2em;
     margin-bottom: 0.35em;
   }
   .bilingual-source p {
     text-indent: 0;
     margin: 0.2em 0;
-    color: #555555;
+    color: inherit;
     font-family: inherit;
     font-size: inherit;
     line-height: inherit;
@@ -677,14 +948,14 @@ export const BILINGUAL_EPUB_CSS = `
     hanging-punctuation: allow-end;
     text-spacing-trim: space-first;
     text-autospace: normal;
-    color: #1a1a1a;
+    color: inherit;
     margin-top: 0.2em;
     margin-bottom: 0.35em;
   }
   .bilingual-target p {
     text-indent: 2em;
     margin: 0.2em 0;
-    color: #1a1a1a;
+    color: inherit;
     font-family: inherit;
     font-size: inherit;
     line-height: inherit;
@@ -715,7 +986,8 @@ export const BILINGUAL_EPUB_CSS = `
   .bilingual-heading .bilingual-source h3, .bilingual-heading .bilingual-source h4,
   .bilingual-heading .bilingual-source h5, .bilingual-heading .bilingual-source h6 {
     font-size: 0.88em;
-    color: #666666;
+    color: inherit;
+    opacity: 0.72;
     font-weight: normal;
     text-align: center;
     border-bottom: none;
@@ -739,7 +1011,8 @@ export const BILINGUAL_EPUB_CSS = `
   }
   .bilingual-source blockquote {
     font-style: italic;
-    color: #555555;
+    color: inherit;
+    opacity: 0.72;
   }
   .bilingual-source blockquote p {
     text-indent: 0;
@@ -748,13 +1021,12 @@ export const BILINGUAL_EPUB_CSS = `
   .bilingual-target blockquote {
     font-style: normal;
     font-family: ${HETI_KAI_FONT_STACK};
-    color: #412938;
+    color: inherit;
     border: none;
-    border-left: 3px solid #A2906A;
-    background-color: rgba(162, 144, 106, 0.05);
-    padding: 0.5em 1em 0.5em 1.2em;
+    border-left: 2px solid rgba(128, 128, 128, 0.38);
+    background-color: rgba(128, 128, 128, 0.05);
+    padding: 0.5em 1em 0.5em 1.15em;
     margin: 0.6em 0;
-    border-radius: 2px;
   }
   .bilingual-target blockquote blockquote {
     border-left: none;
@@ -1446,12 +1718,13 @@ export class EpubService {
           }
         }
 
-        if (!title && cssProfiles.size > 0) {
-          const candidateNodes = Array.from(
-            doc.querySelectorAll('p, div, blockquote, td')
-          ).slice(0, 15);
+        if (!title && cssProfiles.size > 0 && doc.body) {
+          const candidateNodes = this.domMutationEngine
+            .collectTranslatableLeafElements(doc.body)
+            .slice(0, 15);
+          const headingAnalysis = resolveLeafHeadingAnalysis(candidateNodes, cssProfiles);
           for (const cand of candidateNodes) {
-            if (getHeadingMarkdownLevel(cand, cssProfiles) > 0) {
+            if ((headingAnalysis.headingLevels.get(cand) || 0) > 0) {
               const candTitle = cand.textContent?.replace(/\s+/g, ' ').trim() || '';
               if (candTitle && !isGarbageTitle(candTitle)) {
                 title = candTitle;
@@ -1574,6 +1847,18 @@ export class EpubService {
         return '';
       }
     );
+    const knownBilingualIds = Object.keys(internalizedFootnotes);
+    if (knownBilingualIds.length > 0 && targetContent) {
+      const stripped = stripLeakedFootnoteDefinitions(targetContent, knownBilingualIds);
+      if (stripped.cleanedText !== targetContent) {
+        targetContent = stripped.cleanedText;
+        for (const [fnId, fnText] of Object.entries(stripped.extractedDefs)) {
+          if (!inlineTranslatedNotes[fnId] && fnText) {
+            inlineTranslatedNotes[fnId] = fnText;
+          }
+        }
+      }
+    }
 
     // Clean sourceContent tags as well
     sourceContent = sourceContent
@@ -1869,6 +2154,18 @@ export class EpubService {
         return '';
       }
     );
+    const knownMonoIds = Object.keys(internalizedFootnotes);
+    if (knownMonoIds.length > 0 && contentToUse) {
+      const stripped = stripLeakedFootnoteDefinitions(contentToUse, knownMonoIds);
+      if (stripped.cleanedText !== contentToUse) {
+        contentToUse = stripped.cleanedText;
+        for (const [fnId, fnText] of Object.entries(stripped.extractedDefs)) {
+          if (!inlineTranslatedNotes[fnId] && fnText) {
+            inlineTranslatedNotes[fnId] = fnText;
+          }
+        }
+      }
+    }
 
     // Validate and repair slots if sourceMarkdownWithSlots is available, and restore headings / Heti typography
     if (sourceMarkdownWithSlots) {
@@ -2022,7 +2319,8 @@ export class EpubService {
     cssOverrides?: string,
     excludeFileNames?: string[],
     bilingualMode: BilingualMode = 'none',
-    wereadMode: boolean = false
+    wereadMode: boolean = false,
+    bookStyleRoles?: BookStyleRoleMap
   ): Promise<Blob> {
     const zip = originalZip;
     const isChinese = targetLanguage.toLowerCase().includes('chinese');
@@ -2320,7 +2618,10 @@ export class EpubService {
 
     const cssProfiles = parseEpubCssProfiles(originalCssTexts);
     const adaptiveEnhancementCss = isChinese
-      ? buildAdaptiveChineseTypographyCss(originalCssTexts.length > 0 ? originalCssTexts : undefined)
+      ? buildAdaptiveChineseTypographyCss(
+          originalCssTexts.length > 0 ? originalCssTexts : undefined,
+          bookStyleRoles
+        )
       : '';
 
     const enhanceOriginalCss = (origCss: string): string => {
@@ -2435,6 +2736,7 @@ export class EpubService {
         wereadMode,
         imagesRelPath,
         cssProfiles,
+        bookStyleRoles,
         applyChineseTypography: hasTranslation && isChinese
       });
 

@@ -1,5 +1,6 @@
 import { FootnoteNode } from '../types';
 import { parseHtmlDocument } from '../utils/domAdapter';
+import { decodeBlocksFromWire } from '../utils/blockProtocol';
 import { DomMutationEngine } from './domMutationEngine';
 
 export const FOOTNOTE_SLOT_PROMPT_CONSTRAINT =
@@ -85,10 +86,111 @@ export function isPureUrlOrCode(text: string): boolean {
   return false;
 }
 
+export interface LeakedFootnoteStripResult {
+  cleanedText: string;
+  extractedDefs: Record<string, string>;
+}
+
+/**
+ * Strips leaked inline/end-of-body footnote definitions such as `(8-1) ...`, `(8 -1) ...`,
+ * `<sup>(8 -1)</sup> ...`, or `注 8-1：...` for known chapter footnote IDs from translated prose,
+ * returning both the cleaned prose and salvaged footnote definitions.
+ */
+export function stripLeakedFootnoteDefinitions(
+  text: string,
+  knownIds: string[]
+): LeakedFootnoteStripResult {
+  const extractedDefs: Record<string, string> = {};
+  if (!text || !knownIds || knownIds.length === 0) {
+    return { cleanedText: text, extractedDefs };
+  }
+
+  const normalizedIds = Array.from(
+    new Set(
+      knownIds
+        .map((id) => String(id || '').trim().replace(/^fn-/, ''))
+        .filter(Boolean)
+    )
+  );
+  if (normalizedIds.length === 0) {
+    return { cleanedText: text, extractedDefs };
+  }
+
+  // Count how many known IDs map to each natural suffix so unambiguous natural numbers
+  // with explicit keyword prefixes (e.g. "脚注 1：...", "注 2: ...") are also stripped safely.
+  const naturalSuffixCount = new Map<string, number>();
+  for (const cleanId of normalizedIds) {
+    const suffix = cleanId.includes('-') ? cleanId.split('-').pop()! : cleanId;
+    naturalSuffixCount.set(suffix, (naturalSuffixCount.get(suffix) || 0) + 1);
+  }
+
+  const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const buildIdTokenPattern = (cleanId: string): { markerPattern: string; flexId: string } => {
+    const isNamespaced = /^\d+-\d+$/.test(cleanId);
+    const flexId = isNamespaced
+      ? cleanId
+          .split('-')
+          .map((part) => escapeRegex(part))
+          .join('\\s*[-–—]\\s*')
+      : escapeRegex(cleanId);
+
+    const optOpenTags = '(?:<(?:sup|sub|span|b|strong|i|em)\\b[^>]*>\\s*)*';
+    const optCloseTags = '(?:\\s*<\\/(?:sup|sub|span|b|strong|i|em)>)*';
+    const explicitPrefix = '(?:注|注释|脚注|Footnote|Note)';
+
+    const suffix = cleanId.includes('-') ? cleanId.split('-').pop()! : cleanId;
+    const hasUniqueNaturalSuffix = isNamespaced && /^\d+$/.test(suffix) && naturalSuffixCount.get(suffix) === 1;
+    const escapedSuffix = escapeRegex(suffix);
+    const naturalKeywordAlt = hasUniqueNaturalSuffix
+      ? `|${explicitPrefix}\\s*[:：#]?\\s*${escapedSuffix}(?!\\d)(?=\\s*[:：.．、])|〔\\s*${escapedSuffix}(?!\\d)\\s*〕`
+      : '';
+
+    const markerPattern = isNamespaced
+      ? `${optOpenTags}(?:[\\(\\[\\uFF08【〔]\\s*(?:${explicitPrefix}\\s*)?${flexId}(?!\\d)\\s*[\\)\\]\\uFF09】〕]|${explicitPrefix}\\s*[:：#]?\\s*${flexId}(?!\\d)${naturalKeywordAlt})${optCloseTags}`
+      : `${optOpenTags}(?:[\\(\\[\\uFF08【〔]?\\s*${explicitPrefix}\\s*[:：#]?\\s*${flexId}(?!\\d)\\s*[\\)\\]\\uFF09】〕]?|〔\\s*${flexId}(?!\\d)\\s*〕)${optCloseTags}`;
+
+    return { markerPattern, flexId };
+  };
+
+  const allMarkerLookaheads = normalizedIds
+    .map((id) => buildIdTokenPattern(id).markerPattern)
+    .join('|');
+
+  let cleaned = text
+    .split('\n')
+    .map((line) =>
+      /^[ \t]*〔\s*\d+(?:\s*[-–—]\s*\d+)?\s*〕/.test(line)
+        ? line.replace(/(?<=[^\n])[ \t]*(?=〔\s*\d+(?:\s*[-–—]\s*\d+)?\s*〕)/g, '\n')
+        : line
+    )
+    .join('\n');
+
+  for (const cleanId of normalizedIds) {
+    const { markerPattern } = buildIdTokenPattern(cleanId);
+    const blockRegex = new RegExp(
+      `(?:^|\\n)[ \\t]*(?!#{1,6}\\s)${markerPattern}\\s*(?:[:：.．、])?[ \\t]*([\\s\\S]*?)(?=(?:\\n[ \\t]*\\n)|(?:\\n[ \\t]*(?:${allMarkerLookaheads}))|$)`,
+      'gi'
+    );
+
+    cleaned = cleaned.replace(blockRegex, (_full, bodyRaw) => {
+      const cleanedBody = String(bodyRaw || '')
+        .replace(/(?:__FN_REF_[A-Za-z0-9_-]+__|\[\^(?:fn-)?[A-Za-z0-9_-]+\])+\s*$/g, '')
+        .trim();
+      if (cleanedBody && !extractedDefs[cleanId]) {
+        extractedDefs[cleanId] = cleanedBody;
+      }
+      return '';
+    });
+  }
+
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
+  return { cleanedText: cleaned, extractedDefs };
+}
+
 /**
  * Validates that all __FN_REF_{id}__ slots from `originalText` are present in `translatedText`.
  * Automatically repairs casing/whitespace corruption (e.g. `__fn_ref_ 0-1 __`) and re-attaches
- * any accidentally dropped slot tokens so footnote links never break.
+ * any accidentally dropped slot tokens back to their corresponding paragraphs so footnote links never break.
  */
 export function validateAndRepairSlots(
   originalText: string,
@@ -179,6 +281,44 @@ export function validateAndRepairSlots(
     }
   );
 
+  // Normalize explicit localized inline footnote citations (e.g. "（脚注 1）", "(注 2)", "[Note 3]")
+  // and bare tortoise-shell footnote markers ("〔1〕") when matching an expected slot,
+  // leaving definitions (followed by colon) untouched.
+  const consumeMatchingSlotId = (rawId: string): string | null => {
+    const candidate = String(rawId).trim();
+    let matchIdx = remainingNeeded.indexOf(candidate);
+    if (matchIdx === -1) {
+      matchIdx = remainingNeeded.findIndex((id) => {
+        const naturalNum = id.split('-').pop();
+        return naturalNum === candidate || id === candidate;
+      });
+    }
+    if (matchIdx !== -1) {
+      return remainingNeeded.splice(matchIdx, 1)[0];
+    }
+    return null;
+  };
+
+  if (remainingNeeded.length > 0) {
+    repaired = repaired.replace(
+      /(?:\(|（|\[|【|〔)\s*(?:脚注|注释|注|Footnote|Note)\s*[:：#]?\s*([A-Za-z0-9_-]+)\s*(?:\)|）|\]|】|〕)(?!\s*[:：])/gi,
+      (fullMatch, rawId) => {
+        const matchedId = consumeMatchingSlotId(rawId);
+        return matchedId ? `__FN_REF_${matchedId}__` : fullMatch;
+      }
+    );
+  }
+
+  if (remainingNeeded.length > 0) {
+    repaired = repaired.replace(
+      /〔\s*([A-Za-z0-9_-]+)\s*〕(?!\s*[:：])/g,
+      (fullMatch, rawId) => {
+        const matchedId = consumeMatchingSlotId(rawId);
+        return matchedId ? `__FN_REF_${matchedId}__` : fullMatch;
+      }
+    );
+  }
+
   const afterNormalizeIds = extractFootnoteSlots(repaired);
   const missingIds: string[] = [];
   const repairedIds: string[] = [];
@@ -196,17 +336,99 @@ export function validateAndRepairSlots(
     }
   }
 
-  // Step 2: Re-inject any still-missing slots at the end of the corresponding paragraph or chunk
+  // Step 2: Re-inject any still-missing slots into their corresponding paragraphs (or end of text for single-block chunks)
   if (missingIds.length > 0) {
-    for (const missingId of missingIds) {
-      const slotToken = createFootnoteSlot(missingId);
-      const trimmed = repaired.trimEnd();
+    const origParas = originalText
+      .split(/\r?\n\s*\r?\n/)
+      .map((p) => p.trim())
+      .filter(Boolean);
+    const tgtParas = repaired
+      .split(/\r?\n\s*\r?\n/)
+      .map((p) => p.trim())
+      .filter(Boolean);
+
+    const appendSlotBeforeEndPunct = (para: string, slotToken: string): string => {
+      const trimmed = para.trimEnd();
       if (/[。！？.!?”"’']$/.test(trimmed)) {
-        repaired = `${trimmed.slice(0, -1)}${slotToken}${trimmed.slice(-1)}`;
-      } else {
-        repaired = `${trimmed}${slotToken}`;
+        return `${trimmed.slice(0, -1)}${slotToken}${trimmed.slice(-1)}`;
       }
-      repairedIds.push(missingId);
+      return `${trimmed}${slotToken}`;
+    };
+
+    if (origParas.length > 1 && tgtParas.length > 1) {
+      const origOccurById = new Map<string, number[]>();
+      origParas.forEach((p, pIdx) => {
+        for (const id of extractFootnoteSlots(p)) {
+          if (!origOccurById.has(id)) origOccurById.set(id, []);
+          origOccurById.get(id)!.push(pIdx);
+        }
+      });
+
+      tgtParas.forEach((p, tIdx) => {
+        const approxOrigIdx =
+          (tIdx / Math.max(1, tgtParas.length - 1)) * (origParas.length - 1);
+        for (const id of extractFootnoteSlots(p)) {
+          const list = origOccurById.get(id);
+          if (list && list.length > 0) {
+            let bestPos = 0;
+            let bestDist = Infinity;
+            for (let k = 0; k < list.length; k++) {
+              const dist = Math.abs(list[k] - approxOrigIdx);
+              if (dist < bestDist) {
+                bestDist = dist;
+                bestPos = k;
+              }
+            }
+            list.splice(bestPos, 1);
+          }
+        }
+      });
+
+      const remainingIdxById = new Map<string, number[]>();
+      for (const [id, list] of origOccurById.entries()) {
+        remainingIdxById.set(id, [...list]);
+      }
+
+      for (const missingId of missingIds) {
+        const slotToken = createFootnoteSlot(missingId);
+        const queue = remainingIdxById.get(missingId);
+        const origParaIdx =
+          queue && queue.length > 0 ? queue.shift()! : origParas.length - 1;
+
+        let tgtIdx =
+          origParas.length === tgtParas.length
+            ? origParaIdx
+            : Math.min(
+                tgtParas.length - 1,
+                Math.max(
+                  0,
+                  Math.round(
+                    (origParaIdx / Math.max(1, origParas.length - 1)) *
+                      (tgtParas.length - 1)
+                  )
+                )
+              );
+
+        const origIsHeading = /^#{1,6}\s/.test(origParas[origParaIdx] || '');
+        if (!origIsHeading && /^#{1,6}\s/.test(tgtParas[tgtIdx] || '')) {
+          if (tgtIdx + 1 < tgtParas.length && !/^#{1,6}\s/.test(tgtParas[tgtIdx + 1])) {
+            tgtIdx += 1;
+          } else if (tgtIdx - 1 >= 0 && !/^#{1,6}\s/.test(tgtParas[tgtIdx - 1])) {
+            tgtIdx -= 1;
+          }
+        }
+
+        tgtParas[tgtIdx] = appendSlotBeforeEndPunct(tgtParas[tgtIdx], slotToken);
+        repairedIds.push(missingId);
+      }
+
+      repaired = tgtParas.join('\n\n');
+    } else {
+      for (const missingId of missingIds) {
+        const slotToken = createFootnoteSlot(missingId);
+        repaired = appendSlotBeforeEndPunct(repaired, slotToken);
+        repairedIds.push(missingId);
+      }
     }
   }
 
@@ -587,6 +809,14 @@ export class FootnotePool {
       .replace(/(?:^|\n)(?:\[|【|〔)\s*\^\s*(?:fn-)?([^\]】〕]+?)\s*(?:\]|】|〕)[:：][ \t]*[\s\S]*?(?=(?:\n(?:\[|【|〔)\s*\^\s*(?:fn-)?)|(?:\n\n(?!\s{2,}))|$)/g, '')
       .trim();
 
+    // Strip any leaked inline/end-of-body definitions for known pending footnote IDs (e.g. `(8 -1) ...`)
+    const pendingKnownIds = pendingFootnotes.flatMap((fn) => [
+      (fn.namespaceId || fn.originalId).replace(/^fn-/, ''),
+      fn.originalId.replace(/^fn-/, '')
+    ]);
+    const strippedLeakRes = stripLeakedFootnoteDefinitions(extractedBody, pendingKnownIds);
+    extractedBody = strippedLeakRes.cleanedText;
+
     // 4-level matching and position sequence fallback for pending footnotes
     const usedDefs = new Set<ExtractedDef>();
 
@@ -603,6 +833,17 @@ export class FootnotePool {
       if (def) {
         usedDefs.add(def);
         translatedFootnotes[cleanId] = def.text;
+      }
+    }
+
+    // Also adopt definitions salvaged by stripLeakedFootnoteDefinitions for unmatched notes
+    for (const fn of pendingFootnotes) {
+      const cleanId = (fn.namespaceId || fn.originalId).replace(/^fn-/, '');
+      if (translatedFootnotes[cleanId]) continue;
+      const origClean = fn.originalId.replace(/^fn-/, '');
+      const salvaged = strippedLeakRes.extractedDefs[cleanId] || strippedLeakRes.extractedDefs[origClean];
+      if (salvaged) {
+        translatedFootnotes[cleanId] = salvaged;
       }
     }
 
@@ -648,7 +889,7 @@ export class FootnotePool {
       }
     }
 
-    // Level 4: Enhanced fuzzyPattern in rawResponse
+    // Level 4: Strict explicit-marker fuzzyPattern in rawResponse (never bare line-start digits!)
     for (const fn of pendingFootnotes) {
       const cleanId = (fn.namespaceId || fn.originalId).replace(/^fn-/, '');
       if (translatedFootnotes[cleanId]) continue;
@@ -659,15 +900,25 @@ export class FootnotePool {
       const idPattern = escapedTokens.join('|');
 
       if (idPattern) {
+        const explicitMarker = `(?:(?:注|注释|脚注|Footnote|Note)\\s*[:：#]?\\s*(?:${idPattern})(?!\\d)\\s*(?:[:：.．、]|(?=\\s))|(?:\\[|【|\\(|（)\\s*(?:${idPattern})(?!\\d)\\s*(?:\\]|】|\\)|）)\\s*[:：]|〔\\s*(?:${idPattern})(?!\\d)\\s*〕\\s*[:：]?)`;
+        const stopLookahead = `(?:注|注释|脚注|Footnote|Note)\\s*[:：#]?\\s*\\d+(?!\\d)\\s*[:：.．、]|(?:\\[|【|\\(|（)\\s*(?:\\d+|${idPattern})(?!\\d)\\s*(?:\\]|】|\\)|）)\\s*[:：]|〔\\s*(?:\\d+|${idPattern})(?!\\d)\\s*〕`;
         const fuzzyPattern = new RegExp(
-          `(?:^|\\n)[ \\t]*(?:(?:\\[|【|\\()?\\s*(?:注|注释|脚注|Footnote|Note)?\\s*(?:${idPattern})\\s*(?:\\]|】|\\))?[:：.、]?)[ \\t]*([^\\n]+(?:\\n(?!\\n|[ \\t]*(?:\\[|【|\\()?(?:注|注释|脚注|Footnote|Note)?\\s*(?:\\d+|${idPattern}))[^\\n]+)*)`,
+          `(?:^|\\n)[ \\t]*(?!#{1,6}\\s)${explicitMarker}[ \\t]*([^\\n]+(?:\\n(?!\\n|[ \\t]*(?:${stopLookahead}))[^\\n]+)*)`,
           'i'
         );
         const fuzzyMatch = rawResponse.match(fuzzyPattern);
         if (fuzzyMatch && fuzzyMatch[1]) {
           const candidateText = fuzzyMatch[1].trim();
-          if (candidateText && (candidateText !== fn.plainText || isPureUrlOrCode(fn.plainText))) {
+          const trimmedFull = fuzzyMatch[0].trim();
+          if (
+            candidateText &&
+            !/^#{1,6}\s/.test(trimmedFull) &&
+            (candidateText !== fn.plainText || isPureUrlOrCode(fn.plainText))
+          ) {
             translatedFootnotes[cleanId] = candidateText;
+            if (extractedBody.includes(trimmedFull)) {
+              extractedBody = extractedBody.replace(fuzzyMatch[0], '').replace(/\n{3,}/g, '\n\n').trim();
+            }
           }
         }
       }
@@ -679,6 +930,15 @@ export class FootnotePool {
       if (!translatedFootnotes[cleanId]) {
         translatedFootnotes[cleanId] = fn.plainText;
       }
+    }
+
+    const expectedBlockCount = expectedBodyOriginal
+      .split(/\r?\n\s*\r?\n/)
+      .map((p) => p.trim())
+      .filter(Boolean).length;
+    const blockDecoded = decodeBlocksFromWire(extractedBody, expectedBlockCount);
+    if (blockDecoded.usedBlockProtocol) {
+      extractedBody = blockDecoded.decodedText;
     }
 
     const slotValidation = validateAndRepairSlots(expectedBodyOriginal, extractedBody);

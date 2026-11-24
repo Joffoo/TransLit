@@ -1,5 +1,5 @@
 
-import { AppConfig, FootnoteNode, TokenUsage } from "../types";
+import { AppConfig, BookStyleRoleMap, FootnoteNode, TokenUsage } from "../types";
 import { 
     TRANSLATION_PROMPT_NOTES, 
     TRANSLATION_PROMPT_GLOSSARY_PRINCIPLES, 
@@ -18,6 +18,22 @@ import {
   validateAndRepairSlots
 } from "./footnotePool";
 import { LightweightPagePayload, LightweightAiVerdict } from "./pageClassifier";
+import {
+  BookStyleCandidate,
+  buildStyleClassificationPrompt,
+  parseStyleClassificationResponse
+} from "./styleClassifier";
+import { encodeBlocksForWire, decodeBlocksFromWire } from "../utils/blockProtocol";
+
+/**
+ * Counts Unicode replacement characters (\uFFFD) emitted by corrupted model tokens.
+ * Intentionally ignores ordinary geometric square characters such as `■`.
+ */
+export function countReplacementChars(text: string): number {
+  if (!text) return 0;
+  const matches = text.match(/\uFFFD/g);
+  return matches ? matches.length : 0;
+}
 
 /**
  * Splits text into manageable chunks respecting paragraph and line boundaries.
@@ -26,52 +42,88 @@ export function splitTextIntoChunks(text: string, customSize: number = 3000): st
   const size = customSize > 0 ? customSize : 3000;
   if (!text || text.length <= size) return [text];
 
+  const isMarkdownHeadingPara = (p: string): boolean => /^#{1,6}\s+\S/.test(p.trim());
+
   const chunks: string[] = [];
-  let currentChunk = '';
+  let currentParagraphs: string[] = [];
+  let currentLength = 0;
+
+  const pushOversizedParagraph = (paragraph: string) => {
+    const lines = paragraph.split('\n');
+    let currentLineChunk = '';
+
+    for (const line of lines) {
+      if ((currentLineChunk.length + line.length + 1) > size) {
+        if (currentLineChunk) {
+          chunks.push(currentLineChunk);
+          currentLineChunk = '';
+        }
+        if (line.length > size) {
+          let remaining = line;
+          while (remaining.length > 0) {
+            chunks.push(remaining.substring(0, size));
+            remaining = remaining.substring(size);
+          }
+        } else {
+          currentLineChunk = line;
+        }
+      } else {
+        currentLineChunk += (currentLineChunk ? '\n' : '') + line;
+      }
+    }
+    if (currentLineChunk) chunks.push(currentLineChunk);
+  };
 
   const paragraphs = text.split(/\n\n/);
 
   for (const paragraph of paragraphs) {
-    if ((currentChunk.length + paragraph.length + 2) > size) {
-      if (currentChunk) {
-        chunks.push(currentChunk);
-        currentChunk = '';
+    const addedLen = (currentLength > 0 ? 2 : 0) + paragraph.length;
+    const isSingleHeadingWithRoom =
+      currentParagraphs.length === 1 &&
+      isMarkdownHeadingPara(currentParagraphs[0]) &&
+      !isMarkdownHeadingPara(paragraph) &&
+      (currentLength + addedLen) <= size * 1.35;
+
+    if (currentLength > 0 && (currentLength + addedLen) > size && !isSingleHeadingWithRoom) {
+      let carriedHeading: string | undefined;
+      if (
+        currentParagraphs.length > 1 &&
+        isMarkdownHeadingPara(currentParagraphs[currentParagraphs.length - 1])
+      ) {
+        carriedHeading = currentParagraphs.pop();
       }
 
-      if (paragraph.length > size) {
-        const lines = paragraph.split('\n');
-        let currentLineChunk = '';
+      if (currentParagraphs.length > 0) {
+        chunks.push(currentParagraphs.join('\n\n'));
+      }
+      currentParagraphs = carriedHeading ? [carriedHeading] : [];
+      currentLength = carriedHeading ? carriedHeading.length : 0;
 
-        for (const line of lines) {
-          if ((currentLineChunk.length + line.length + 1) > size) {
-            if (currentLineChunk) {
-              chunks.push(currentLineChunk);
-              currentLineChunk = '';
-            }
-            if (line.length > size) {
-              let remaining = line;
-              while (remaining.length > 0) {
-                chunks.push(remaining.substring(0, size));
-                remaining = remaining.substring(size);
-              }
-            } else {
-              currentLineChunk = line;
-            }
-          } else {
-            currentLineChunk += (currentLineChunk ? '\n' : '') + line;
-          }
+      if (carriedHeading) {
+        const pairedAddedLen = 2 + paragraph.length;
+        if (!isMarkdownHeadingPara(paragraph) && (currentLength + pairedAddedLen) <= size * 1.35) {
+          currentParagraphs.push(paragraph);
+          currentLength += pairedAddedLen;
+          continue;
         }
-        if (currentLineChunk) chunks.push(currentLineChunk);
-      } else {
-        currentChunk = paragraph;
       }
+    }
+
+    if (paragraph.length > size) {
+      if (currentParagraphs.length > 0) {
+        chunks.push(currentParagraphs.join('\n\n'));
+        currentParagraphs = [];
+        currentLength = 0;
+      }
+      pushOversizedParagraph(paragraph);
     } else {
-      currentChunk += (currentChunk ? '\n\n' : '') + paragraph;
+      currentParagraphs.push(paragraph);
+      currentLength = currentParagraphs.length === 1 ? paragraph.length : currentLength + 2 + paragraph.length;
     }
   }
 
-  if (currentChunk) {
-    chunks.push(currentChunk);
+  if (currentParagraphs.length > 0) {
+    chunks.push(currentParagraphs.join('\n\n'));
   }
 
   return chunks;
@@ -179,6 +231,13 @@ export async function fetchViaProxyOrDirect(
       headers: proxyHeaders,
     });
     if (proxyRes.headers.get('x-translit-proxy') === '1') {
+      if (proxyRes.status === 502 && proxyRes.headers.get('x-translit-proxy-error') === '1') {
+        try {
+          return await fetch(targetUrl, init);
+        } catch {
+          return proxyRes;
+        }
+      }
       return proxyRes;
     }
 
@@ -253,6 +312,17 @@ export class AiService {
   constructor(config: AppConfig, onUsage?: (usage: TokenUsage) => void) {
     this.config = config;
     this.onUsage = onUsage;
+  }
+
+  /**
+   * 1-Shot Book Style Semantic Classifier:
+   * Maps all styled CSS classes of a book into orthogonal Pure Heti publishing roles.
+   */
+  async classifyBookStyles(candidates: BookStyleCandidate[]): Promise<BookStyleRoleMap> {
+    if (!candidates || candidates.length === 0) return {};
+    const { systemPrompt, userPrompt } = buildStyleClassificationPrompt(candidates);
+    const result = await this.generate(userPrompt, systemPrompt, 0.1);
+    return parseStyleClassificationResponse(result.translation, candidates);
   }
 
   /**
@@ -617,7 +687,7 @@ export class AiService {
       chunkResult: string,
       updatedGlossary?: string,
       isFallback?: boolean,
-      stats?: { originalCount: number; filteredCount: number },
+      stats?: { originalCount: number; filteredCount: number; corruptedCharCount?: number },
       chunkFootnotes?: Record<string, string>,
       chunkUsage?: TokenUsage
     ) => Promise<void | string>,
@@ -627,7 +697,7 @@ export class AiService {
     fullPosteriorText: string = "",
     internalizedFootnotes: Record<string, FootnoteNode> = {},
     footnotePool?: FootnotePool
-  ): Promise<{ content: string; glossary: string; translatedFootnotes: Record<string, string>; driftFixes: GlossaryDriftFix[] }> {
+  ): Promise<{ content: string; glossary: string; translatedFootnotes: Record<string, string>; driftFixes: GlossaryDriftFix[]; corruptedCharCount: number }> {
     
     const activePool = footnotePool || this.defaultFootnotePool;
     const customChunkSize = this.config.enableProofreading ? 1800 : this.CHUNK_SIZE;
@@ -637,6 +707,7 @@ export class AiService {
     const translatedChunks: string[] = [...existingChunks];
     const chapterTranslatedFootnotes: Record<string, string> = {};
     const chapterDriftFixes: GlossaryDriftFix[] = [];
+    let totalCorruptedChars = 0;
 
     // Ensure array is large enough
     while (translatedChunks.length < chunks.length) {
@@ -727,8 +798,9 @@ export class AiService {
             pendingFootnotes.push(fnNode);
         }
 
+        const { encodedText: encodedChunk, blockCount: chunkBlockCount } = encodeBlocksForWire(chunk);
         const effectiveChunkPayload = activePool.formatDualChannelPayload(
-            chunk,
+            encodedChunk,
             pendingFootnotes,
             referenceOnlyFootnotes
         );
@@ -737,7 +809,7 @@ export class AiService {
             ? `[Note: This is part ${i + 1} of ${chunks.length} of the chapter. Maintain strict terminology and stylistic consistency with previous parts.]\n\n`
             : '';
 
-        const prompt = `${chunkPartNote}Translate the following text into ${targetLanguage}. Return clean paragraph prose without markdown headings or blockquote markers.\n\nCONTENT:\n${effectiveChunkPayload}`;
+        const prompt = `${chunkPartNote}Translate the following text into ${targetLanguage}. Return clean paragraph prose without markdown headings or blockquote markers. Preserve every [B1], [B2], ... block ID prefix at the start of its block 1-to-1 in order—never merge, drop, split across blank lines, or reorder blocks.\n\nCONTENT:\n${effectiveChunkPayload}`;
 
         try {
             const result = await this.generate(prompt, chunkInstruction, 0.3);
@@ -765,10 +837,13 @@ export class AiService {
                 chunkFootnotes[cleanId] = trText;
             }
 
-            let finalChunkText =
-                pendingFootnotes.length > 0 || referenceOnlyFootnotes.length > 0
-                    ? parsedDual.translatedBody
-                    : validateAndRepairSlots(chunk, result.translation).repairedText;
+            let finalChunkText: string;
+            if (pendingFootnotes.length > 0 || referenceOnlyFootnotes.length > 0) {
+                finalChunkText = parsedDual.translatedBody;
+            } else {
+                const decodedNoFn = decodeBlocksFromWire(result.translation, chunkBlockCount).decodedText;
+                finalChunkText = validateAndRepairSlots(chunk, decodedNoFn).repairedText;
+            }
 
             let deltaGlossary = result.glossary || "";
             let stats = { originalCount: 0, filteredCount: 0 };
@@ -804,6 +879,14 @@ export class AiService {
                 stats = { originalCount: filterRes.originalCount, filteredCount: filterRes.filteredCount };
             }
 
+            const chunkCorrupted =
+                countReplacementChars(finalChunkText) +
+                Object.values(chunkFootnotes).reduce((acc, txt) => acc + countReplacementChars(txt || ''), 0);
+            if (chunkCorrupted > 0) {
+                totalCorruptedChars += chunkCorrupted;
+                console.warn(`Detected ${chunkCorrupted} Unicode replacement character(s) (\\uFFFD) in translated chunk ${i + 1}/${chunks.length}.`);
+            }
+
             translatedChunks[i] = finalChunkText;
 
             if (deltaGlossary) {
@@ -811,7 +894,16 @@ export class AiService {
             }
             
             if (onProgress) {
-                const syncedGlossary = await onProgress(i + 1, chunks.length, finalChunkText, deltaGlossary, false, stats, chunkFootnotes, result.usage);
+                const syncedGlossary = await onProgress(
+                    i + 1,
+                    chunks.length,
+                    finalChunkText,
+                    deltaGlossary,
+                    false,
+                    { ...stats, corruptedCharCount: chunkCorrupted },
+                    chunkFootnotes,
+                    result.usage
+                );
                 if (typeof syncedGlossary === 'string') {
                     currentGlossary = syncedGlossary;
                 }
@@ -851,7 +943,8 @@ export class AiService {
         content: translatedChunks.join('\n\n'),
         glossary: currentGlossary,
         translatedFootnotes: chapterTranslatedFootnotes,
-        driftFixes: chapterDriftFixes
+        driftFixes: chapterDriftFixes,
+        corruptedCharCount: totalCorruptedChars
     };
   }
 }

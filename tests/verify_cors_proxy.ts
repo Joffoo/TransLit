@@ -362,6 +362,82 @@ async function main() {
         );
         assert.deepEqual(fallbackModels, ['deepseek-ai/deepseek-v3.2', 'minimaxai/minimax-m2.1']);
       }
+
+      // Scenario D: Proxy-originated 502 (x-translit-proxy: 1 + x-translit-proxy-error: 1) falls back to direct fetch;
+      //             upstream 502 without x-translit-proxy-error does NOT double-fetch;
+      //             if direct fetch also fails (CORS/network), caller receives original proxy 502 detail.
+      {
+        let directCalls = 0;
+        globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+          if (typeof input === 'string' && input.startsWith('/__api_proxy')) {
+            return new Response(JSON.stringify({ error: 'Proxy error', detail: 'fetch failed (ECONNREFUSED)' }), {
+              status: 502,
+              headers: {
+                'content-type': 'application/json',
+                'x-translit-proxy': '1',
+                'x-translit-proxy-error': '1',
+              },
+            });
+          }
+          directCalls += 1;
+          return originalFetch(input, init);
+        };
+
+        const recovered = await fetchViaProxyOrDirect(`${upstreamOrigin}/v1/models`, {
+          method: 'GET',
+          headers: { Authorization: 'Bearer sk-test-valid' },
+        });
+        assert.equal(directCalls, 1, 'Should retry directly once on proxy-originated 502');
+        assert.equal(recovered.status, 200);
+        const recData = await recovered.json();
+        assert.equal(recData.data.length, 2);
+
+        // When direct fallback also fails (e.g. CORS error thrown), preserve original 502 proxy diagnostic
+        globalThis.fetch = async (input: RequestInfo | URL): Promise<Response> => {
+          if (typeof input === 'string' && input.startsWith('/__api_proxy')) {
+            return new Response(JSON.stringify({ error: 'Proxy error', detail: 'fetch failed (ETIMEDOUT)' }), {
+              status: 502,
+              headers: {
+                'content-type': 'application/json',
+                'x-translit-proxy': '1',
+                'x-translit-proxy-error': '1',
+              },
+            });
+          }
+          throw new TypeError('Failed to fetch (simulated CORS error)');
+        };
+
+        const preserved502 = await fetchViaProxyOrDirect(`${upstreamOrigin}/v1/models`, {
+          method: 'GET',
+          headers: { Authorization: 'Bearer sk-test-valid' },
+        });
+        assert.equal(preserved502.status, 502);
+        const errBody = await preserved502.json();
+        assert.equal(errBody.detail, 'fetch failed (ETIMEDOUT)');
+
+        // Upstream 502 without x-translit-proxy-error must NOT trigger redundant direct fetch
+        let upstreamDirectCalls = 0;
+        globalThis.fetch = async (input: RequestInfo | URL): Promise<Response> => {
+          if (typeof input === 'string' && input.startsWith('/__api_proxy')) {
+            return new Response('Bad Gateway from upstream', {
+              status: 502,
+              headers: {
+                'content-type': 'text/plain',
+                'x-translit-proxy': '1',
+              },
+            });
+          }
+          upstreamDirectCalls += 1;
+          return originalFetch(input);
+        };
+
+        const upstream502 = await fetchViaProxyOrDirect(`${upstreamOrigin}/v1/models`, {
+          method: 'GET',
+          headers: { Authorization: 'Bearer sk-test-valid' },
+        });
+        assert.equal(upstreamDirectCalls, 0, 'Upstream 502 without x-translit-proxy-error must not re-fetch');
+        assert.equal(upstream502.status, 502);
+      }
     } finally {
       globalThis.fetch = originalFetch;
       if (originalWindow === undefined) {

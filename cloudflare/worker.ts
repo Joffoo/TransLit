@@ -171,6 +171,8 @@ export async function handleApiProxyRequest(request: Request): Promise<Response>
         headers: {
           ...baseHeaders,
           'content-type': 'application/json',
+          'x-translit-proxy-error': '1',
+          'access-control-expose-headers': 'x-translit-proxy, x-translit-proxy-error',
         },
       }
     );

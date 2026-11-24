@@ -8,7 +8,8 @@
     "build": "vite build",
     "lint": "tsc --noEmit",
     "preview": "vite preview",
-    "test": "npx tsx tests/run_all.ts"
+    "test": "npx tsx tests/run_all.ts",
+    "cli": "npx tsx scripts/translit-cli.ts"
   },
   "dependencies": {
     "franc-min": "^6.2.0",

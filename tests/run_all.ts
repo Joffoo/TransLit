@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 
 const TESTS = [
   'tests/verify_api_profiles.ts',
+  'tests/verify_block_protocol.ts',
   'tests/verify_cors_proxy.ts',
   'tests/verify_bilingual_alignment.ts',
   'tests/verify_dom_mutation.ts',
@@ -12,6 +13,7 @@ const TESTS = [
   'tests/verify_heti_and_pseudo_headings.ts',
   'tests/verify_language_detection.ts',
   'tests/verify_skip_and_reference.ts',
+  'tests/verify_style_classifier.ts',
 ];
 
 const passed: string[] = [];

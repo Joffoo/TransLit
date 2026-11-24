@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import JSZip from 'jszip';
-import { DomMutationEngine, computeStructuralTreeDiff } from '../services/domMutationEngine';
+import {
+  DomMutationEngine,
+  computeStructuralTreeDiff,
+  parseEpubCssProfiles,
+  sanitizeInlineXhtmlForLeaf
+} from '../services/domMutationEngine';
 import { EpubService } from '../services/epubService';
 import { FootnoteResolver } from '../services/footnoteResolver';
 import { parseHtmlDocument, parseXmlDocument } from '../utils/domAdapter';
@@ -427,9 +432,183 @@ async function runSeam3Tests() {
   assert.equal(bodyText.includes('First paragraph of same-page footnote'), false, 'First para of internalized same-page note must be removed from body');
   assert.equal(bodyText.includes('Second continuation paragraph of same-page footnote'), false, 'Continuation para of internalized same-page note must also be removed from body');
 
+  // 3d. Inline XHTML grammar barrier rescues malformed LLM tags & protects XHTML well-formedness
+  assert.equal(
+    sanitizeInlineXhtmlForLeaf('<span class="“stickupcap”" 站</span>在一历史纪念牌前'),
+    '站在一历史纪念牌前',
+    'Malformed unclosed opening <span ... 站</span> must rescue inner text without broken attributes'
+  );
+  assert.equal(
+    sanitizeInlineXhtmlForLeaf('<span class="“stickupcap”" 站<="" span="">在一历史纪念牌前'),
+    '站在一历史纪念牌前',
+    'Browser-serialized broken <span ... <="" span=""> must also rescue inner text'
+  );
+  assert.equal(
+    sanitizeInlineXhtmlForLeaf('<i class="calibre5">Asahi Shinbun</i>'),
+    '<i class="calibre5">Asahi Shinbun</i>',
+    'Valid inline <i class="calibre5"> tag must be preserved'
+  );
+  assert.equal(
+    sanitizeInlineXhtmlForLeaf('x < y & z > 0'),
+    'x &lt; y &amp; z &gt; 0',
+    'Literal comparison operators and bare & must be XML-escaped'
+  );
+  assert.equal(
+    sanitizeInlineXhtmlForLeaf('文本</span>结束与<i><b>混合</i>'),
+    '文本结束与<i>混合</i>',
+    'Orphan closing and unclosed inner tags must be stripped cleanly'
+  );
+
+  // 3e. Single-newline list & heading boundary recovery aligns Notes items 1-to-1
+  const notesXhtml = `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+  <h1 class="cnab">Notes</h1>
+  <p class="notes-intro">Unless otherwise indicated, all quotations are from the text.</p>
+  <h2 class="notes-sec">INTRODUCTION</h2>
+  <ol class="notes-list">
+    <li class="note"><span class="note-num">1.</span> Note item one.</li>
+    <li class="note"><span class="note-num">2.</span> Note item two.</li>
+    <li class="note"><span class="note-num">3.</span> Note item three.</li>
+    <li class="note"><span class="note-num">4.</span> Note item four.</li>
+    <li class="note"><span class="note-num">5.</span> Note item five.</li>
+    <li class="note"><span class="note-num">6.</span> Note item six.</li>
+  </ol>
+</body>
+</html>`;
+  const singleNewlineNotesTranslation = [
+    '# 注释',
+    '除非另有说明，所有引文均出自正文。',
+    [
+      '引言',
+      '1. 第一条注释。',
+      '2. 第二条注释。',
+      '3. 第三条注释。',
+      '4. 第四条注释。',
+      '5. 第五条注释。',
+      '6. 第六条注释。'
+    ].join('\n')
+  ].join('\n\n');
+  const notesEngine = new DomMutationEngine();
+  const mutatedNotes = notesEngine.mutateDomInPlace(notesXhtml, singleNewlineNotesTranslation);
+  assert.equal(
+    parseXmlDocument(`<html xmlns="http://www.w3.org/1999/xhtml"><body>${mutatedNotes}</body></html>`).getElementsByTagName('parsererror').length,
+    0,
+    'Mutated Notes XHTML must parse with zero XML errors'
+  );
+  const notesDoc = parseHtmlDocument(mutatedNotes);
+  assert.equal(notesDoc.querySelector('h2.notes-sec')?.textContent?.trim(), '引言');
+  const noteItems = Array.from(notesDoc.querySelectorAll('li.note'));
+  assert.equal(noteItems.length, 6, 'Notes list must retain 6 <li> items');
+  assert.equal(noteItems[0].textContent?.trim(), '1. 第一条注释。', 'First <li> must NOT swallow items 2..6');
+  assert.equal(noteItems[1].textContent?.trim(), '2. 第二条注释。');
+  assert.equal(noteItems[5].textContent?.trim(), '6. 第六条注释。');
+
+  // 3f. Non-noteref <a role="doc-backlink" id="en000"> must unwrap cleanly at input, preserve #en000 on write-back, and strip shell <a> on output
+  const backlinkNotesXhtml = `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+  <ol class="notes-list">
+    <li class="note"><a class="a1" href="9780063446625_Introduction.xhtml#ren000" id="en000" role="doc-backlink"><span class="a2">1</span></a>.<span class="spn"></span><i>The Tonight Show</i>: Bill Gates.</li>
+  </ol>
+</body>
+</html>`;
+  const extractedBacklink = notesEngine.extractTranslatablePayload(backlinkNotesXhtml);
+  assert.equal(
+    extractedBacklink.blocks[0].slottedText,
+    '1.<i>The Tonight Show</i>: Bill Gates.',
+    'extractLeafBlockContent must unwrap non-noteref doc-backlink <a> and inner decorative spans'
+  );
+  assert.equal(
+    sanitizeInlineXhtmlForLeaf('<a class="a1" href="Intro.xhtml#ren000" id="en000" role="doc-backlink">1</a>.<i>《今夜秀》</i>：比尔·盖茨。'),
+    '1.<i>《今夜秀》</i>：比尔·盖茨。',
+    'sanitizeInlineXhtmlForLeaf must strip disallowed shell <a> tags instead of escaping them into literal text'
+  );
+  const mutatedBacklink = notesEngine.mutateDomInPlace(
+    backlinkNotesXhtml,
+    '<a class="a1" href="Intro.xhtml#ren000" id="en000">1</a>.<i>《今夜秀》</i>：比尔·盖茨。'
+  );
+  assert.equal(
+    computeStructuralTreeDiff(
+      backlinkNotesXhtml,
+      `<html xmlns="http://www.w3.org/1999/xhtml"><body>${mutatedBacklink}</body></html>`
+    ).diffCount,
+    0,
+    'Notes backlink mutation must keep structural Tree-Diff == 0'
+  );
+  const backlinkDoc = parseHtmlDocument(mutatedBacklink);
+  assert.ok(backlinkDoc.querySelector('li.note a#en000'), 'Preserved empty <a id="en000"> anchor must survive write-back');
+  assert.ok(!mutatedBacklink.includes('&lt;a'), `Exported XHTML must not contain escaped &lt;a, got: ${mutatedBacklink}`);
+
+  // 3f-2. Publisher CSS list-style-type: none + empty spacer .spn { padding-left: 0.5em } + hand-numbered fallback without CSS
+  const notesCssProfiles = parseEpubCssProfiles([
+    '.note-list { list-style-type: none; padding: 0em; } .note { text-indent: -1.25em; } .spn { padding-left: 0.5em; }'
+  ]);
+  const extractedWithCss = notesEngine.extractTranslatablePayload(backlinkNotesXhtml, {}, notesCssProfiles);
+  assert.equal(
+    extractedWithCss.blocks[0].slottedText,
+    '1. <i>The Tonight Show</i>: Bill Gates.',
+    'Empty horizontal spacer <span class="spn"></span> must emit a single space instead of cramping 1.Text'
+  );
+  const mutatedListWithCss = notesEngine.mutateDomInPlace(
+    backlinkNotesXhtml,
+    '1. <i>《今夜秀》</i>：比尔·盖茨。',
+    { cssProfiles: notesCssProfiles }
+  );
+  assert.equal(
+    parseHtmlDocument(mutatedListWithCss).querySelector('ol.notes-list')?.getAttribute('data-translit-list'),
+    'none',
+    'CSS-less hand-numbered or hanging <ol.notes-list> must receive data-translit-list="none"'
+  );
+  const noteListXhtmlWithCss = backlinkNotesXhtml.replace('class="notes-list"', 'class="note-list"');
+  const mutatedNoteList = notesEngine.mutateDomInPlace(
+    noteListXhtmlWithCss,
+    '1. <i>《今夜秀》</i>：比尔·盖茨。',
+    { cssProfiles: notesCssProfiles }
+  );
+  assert.equal(
+    parseHtmlDocument(mutatedNoteList).querySelector('ol.note-list')?.getAttribute('data-translit-list'),
+    'none',
+    '<ol class="note-list"> with list-style-type: none must receive data-translit-list="none"'
+  );
+  const manualNoCssOl = `<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><body><ol><li>1. First note.</li><li>2. Second note.</li></ol></body></html>`;
+  const mutatedManualNoCss = notesEngine.mutateDomInPlace(manualNoCssOl, '1. 第一条。\n\n2. 第二条。');
+  assert.equal(
+    parseHtmlDocument(mutatedManualNoCss).querySelector('ol')?.getAttribute('data-translit-list'),
+    'none',
+    'Hand-numbered <ol> without CSS must still receive data-translit-list="none"'
+  );
+
+  // 3g. N === M adjacent heading/body inversion guard protects Introduction-style swapped paragraph + <h2>
+  const introSwapXhtml = `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+  <p class="indent">Was my life really going to be better with AI everywhere? How was I even supposed to put AI everywhere? Or was I about to find out that this AI narrative is Silicon Valley betting big?</p>
+  <h2 class="h3">1. Why Would Anyone Choose to Live This Way?</h2>
+  <p class="noindent">Because the future! I wanted to live in the future that everyone kept insisting was right around the corner.</p>
+</body>
+</html>`;
+  const swappedTranslation = [
+    '为什么会有人选择这样生活？',
+    '当人工智能无处不在时，我的生活真的会更好吗？我到底该怎么让人工智能无处不在？还是说我即将发现，这整套叙事不过是硅谷的又一次大胆豪赌？',
+    '因为未来！我想生活在每个人都坚称近在眼前的那个未来里。'
+  ].join('\n\n');
+  const repairedIntro = notesEngine.mutateDomInPlace(introSwapXhtml, swappedTranslation);
+  const introDoc = parseHtmlDocument(repairedIntro);
+  assert.equal(
+    introDoc.querySelector('h2.h3')?.textContent?.trim(),
+    '为什么会有人选择这样生活？',
+    'Swapped short heading must be restored back into <h2>'
+  );
+  assert.ok(
+    (introDoc.querySelector('p.indent')?.textContent || '').includes('当人工智能无处不在时'),
+    'Swapped long body paragraph must be restored back into <p.indent>'
+  );
+
   console.log('  [OK] Zero-CSS EPUB fallback stylesheet generation & XHTML linkage verified');
   console.log('  [OK] KaTeX inline formula vs currency ($10 and $20) separation verified');
   console.log('  [OK] Multi-paragraph same-page footnote cleanup verified');
+  console.log('  [OK] Inline XHTML grammar barrier, backlink <a> purification, heading swap guard & Notes recovery verified');
   console.log('✓ Seam 3 passed!');
 }
 
