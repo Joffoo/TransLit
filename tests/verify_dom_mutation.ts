@@ -408,7 +408,10 @@ async function runSeam3Tests() {
     {},
     {}
   );
-  assert.ok(mathAndCurrencyHtml.includes('<math'), 'True inline LaTeX $E = mc^2$ must render MathML');
+  assert.ok(
+    mathAndCurrencyHtml.includes('<svg') && mathAndCurrencyHtml.includes('translit-math-svg'),
+    'True inline LaTeX $E = mc^2$ must render self-contained SVG'
+  );
   assert.ok(
     mathAndCurrencyHtml.includes('$10 and $20'),
     `Currency values must remain plain text without math parsing, got: ${mathAndCurrencyHtml}`

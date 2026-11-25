@@ -1,6 +1,11 @@
 import JSZip from 'jszip';
 import { marked } from 'marked';
 import katex from 'katex';
+import {
+  convertLatexInTextToSvg,
+  convertMathElementsInXhtmlToSvg,
+  renderLatexToSvg
+} from './mathSvgService';
 import { Chapter, FootnoteNode, BilingualMode, BookStyleRoleMap } from '../types';
 import {
   parseHtmlDocument,
@@ -46,14 +51,14 @@ const mathExtension = {
       },
       renderer(token: any) {
         try {
+          return renderLatexToSvg(token.text, true);
+        } catch (e) {
+          console.warn('MathJax block render error:', e);
           return katex.renderToString(token.text, {
             displayMode: true,
             output: 'mathml',
             throwOnError: false
           });
-        } catch (e) {
-          console.warn('KaTeX block render error:', e);
-          return token.raw;
         }
       }
     },
@@ -76,13 +81,13 @@ const mathExtension = {
       },
       renderer(token: any) {
         try {
+          return renderLatexToSvg(token.text, false);
+        } catch {
           return katex.renderToString(token.text, {
             displayMode: false,
             output: 'mathml',
             throwOnError: false
           });
-        } catch {
-          return token.raw;
         }
       }
     }
@@ -197,9 +202,6 @@ export const EPUB3_POPUP_FOOTNOTE_CSS = `
 export const HETI_SERIF_FONT_STACK =
   '"Heti Song", "Songti SC", "STSong", "Source Han Serif SC", "Source Han Serif CN", "Noto Serif SC", "Noto Serif CJK SC", "SimSun", "PMingLiU", serif';
 
-const HETI_SANS_FONT_STACK =
-  '"Heti Hei", "PingFang SC", "Hiragino Sans GB", "Source Han Sans SC", "Source Han Sans CN", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif';
-
 const HETI_KAI_FONT_STACK =
   '"Kaiti SC", "STKaiti", "KaiTi", "楷体", "SimKai", "BiauKai", "FZKai-Z03S", "DK-Kaiti", "LXGW WenKai", "FangSong", "STFangsong", serif';
 
@@ -245,8 +247,6 @@ const STATIC_ZERO_INDENT_ALIGN_CLASSES = [
   'textright',
   'center',
   'right',
-  'noindent',
-  'no-indent',
   'dedication',
   'epigraph',
   'copyright',
@@ -454,7 +454,6 @@ export function buildAdaptiveChineseTypographyCss(
   ${headingSelectorList},
   [data-translit-role="h1"], [data-translit-role="h2"],
   [data-translit-role="h3"], [data-translit-role="h4"] {
-    font-family: ${HETI_SANS_FONT_STACK};
     font-weight: 700;
     color: inherit;
     line-height: 1.45;
@@ -487,7 +486,6 @@ export function buildAdaptiveChineseTypographyCss(
     margin: 1.1em 0 0.4em;
   }
   [data-translit-role="kicker"] {
-    font-family: ${HETI_SANS_FONT_STACK};
     font-size: 0.88em;
     font-weight: 600;
     letter-spacing: 0.12em;
@@ -525,7 +523,6 @@ export function buildAdaptiveChineseTypographyCss(
     border: none;
     border-right: 2px solid rgba(128, 128, 128, 0.45);
     padding: 0 0.65em 0 0;
-    font-family: ${HETI_SANS_FONT_STACK};
     font-weight: 700;
     font-size: 1.45em;
     line-height: 1.4;
@@ -566,7 +563,6 @@ export function buildAdaptiveChineseTypographyCss(
     margin: 0.35em 0 0 !important;
     color: inherit;
     opacity: 0.78;
-    font-family: ${HETI_SANS_FONT_STACK} !important;
   }
   [data-translit-role="title-table"] i,
   [data-translit-role="title-table"] em {
@@ -794,6 +790,7 @@ export function buildAdaptiveChineseTypographyCss(
   }
   li p {
     text-indent: 0 !important;
+    margin: 0.25em 0;
   }
   ol[data-translit-list="none"], ul[data-translit-list="none"] {
     list-style: none !important;
@@ -807,7 +804,8 @@ export function buildAdaptiveChineseTypographyCss(
   }
 
   /* Unified Chinese body paragraph indent while protecting headings, centered/right blocks, captions, and hanging indents */
-  p[data-translit-role="body"]:not([data-translit-indent="none"]):not([data-translit-align="center"]):not([data-translit-align="right"]), p${notChain} {
+  p[data-translit-role="body"]:not([data-translit-indent="none"]):not([data-translit-align="center"]):not([data-translit-align="right"]),
+  p:where(${notChain}) {
     font-size: 1em;
     text-indent: 2em !important;
     margin: 0.45em 0;
@@ -855,8 +853,24 @@ export function buildAdaptiveChineseTypographyCss(
     background-color: rgba(128, 128, 128, 0.07);
     font-weight: 700;
   }
+  [data-translit-role="table-header"] {
+    font-weight: 700;
+    font-size: 0.94em;
+    line-height: 1.6;
+    text-indent: 0 !important;
+    margin: 0.2em 0;
+  }
+  [data-translit-role="table-cell"] {
+    font-size: 0.94em;
+    line-height: 1.6;
+    text-indent: 0 !important;
+    text-align: left;
+    margin: 0.2em 0;
+  }
   table p, td p, th p {
     text-indent: 0 !important;
+    line-height: 1.6;
+    margin: 0.2em 0;
   }
   pre, code {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -900,9 +914,27 @@ export function buildAdaptiveChineseTypographyCss(
     margin: 1.8em auto;
     width: 40%;
   }
-  img, svg {
+  img, svg:not(.translit-math-svg) {
     max-width: 100%;
     height: auto;
+  }
+  .translit-math-svg-inline {
+    display: inline-block;
+    max-width: 100%;
+  }
+  .translit-math-block {
+    display: block;
+    text-align: center;
+    text-indent: 0 !important;
+    margin: 1em auto;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  [data-translit-role="math-block"] {
+    text-indent: 0 !important;
+    text-align: center !important;
+    margin: 1em 0;
   }
 `;
 }
@@ -2331,7 +2363,7 @@ export class EpubService {
    * Ensures an XHTML string declares `xmlns:epub="http://www.idpf.org/2007/ops"` on `<html>`.
    */
   public ensureEpub3XhtmlNamespace(xhtml: string): string {
-    if (/xmlns:epub=["']http:\/\/www\.idpf\.org\/2007\/ops["']/i.test(xhtml)) {
+    if (/\bxmlns:epub\s*=/i.test(xhtml)) {
       return xhtml;
     }
     if (/<html\b[^>]*>/i.test(xhtml)) {
@@ -2802,6 +2834,8 @@ export class EpubService {
       if (isChinese) {
         newXhtml = stripInlineFontFamilyForChineseEpub(newXhtml);
       }
+      newXhtml = convertLatexInTextToSvg(newXhtml);
+      newXhtml = convertMathElementsInXhtmlToSvg(newXhtml);
       zip.file(fullPath, newXhtml);
     }
 

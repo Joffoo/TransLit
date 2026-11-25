@@ -848,7 +848,7 @@ export class AiService {
             let deltaGlossary = result.glossary || "";
             let stats = { originalCount: 0, filteredCount: 0 };
             
-            if (this.config.enableGlossary && deltaGlossary) {
+            if (this.config.enableGlossary && currentGlossary) {
                 const driftRes = reconcileGlossaryDrift(finalChunkText, deltaGlossary, currentGlossary, chunkFootnotes);
                 if (driftRes.fixes.length > 0) {
                     finalChunkText = driftRes.fixedText;
@@ -870,7 +870,9 @@ export class AiService {
                     }
                     chapterDriftFixes.push(...driftRes.fixes);
                 }
+            }
 
+            if (this.config.enableGlossary && deltaGlossary) {
                 const lowerChapterPosterior = lowerChunks.slice(i + 1).join('\n');
                 const filterRes = this.filterDeltaByPosterior(deltaGlossary, currentGlossary, {
                     lowerTexts: [lowerChapterPosterior, lowerFullPosterior]

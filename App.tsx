@@ -43,6 +43,7 @@ import {
   parseGlossaryValue,
   safeReplaceKeyword,
   detectGlossaryChanges,
+  filterSafeCascadeChanges,
   mergeChunkGlossaries,
   TermChange
 } from './utils/glossaryUtils';
@@ -426,6 +427,10 @@ const App: React.FC = () => {
 
         const optimizedText = await aiService.optimizeGlossary(currentGlossaryText);
         const finalMap = parseGlossaryStr(optimizedText);
+        if (termCount > 0 && Object.keys(finalMap).length === 0) {
+          addLog(`[Agent] Smart Cleanup skipped: optimizer returned empty result, preserved existing ${termCount} terms.`, 'error');
+          return;
+        }
         await persistenceService.current.replaceGlossary(finalMap);
         savedGlossaryMapRef.current = { ...finalMap };
         setGlossaryMap(finalMap);
@@ -457,12 +462,33 @@ const App: React.FC = () => {
     }
     if (Object.keys(queuedDeltaTerms).length > 0) {
       try {
+        const prevMap = { ...savedGlossaryMapRef.current };
         const addedCount = await persistenceService.current.saveGlossaryTerms(queuedDeltaTerms);
         if (addedCount > 0) {
           const masterGlossary = await persistenceService.current.loadGlossary();
           savedGlossaryMapRef.current = { ...masterGlossary };
           setGlossaryMap(masterGlossary);
           updateLiveGlossary(glossaryToOutputStr(masterGlossary));
+
+          const newlyAddedFromQueue: Record<string, string> = {};
+          const prevLower = new Set(Object.keys(prevMap).map(k => k.toLowerCase()));
+          for (const [k, v] of Object.entries(masterGlossary)) {
+            if (!prevLower.has(k.toLowerCase())) {
+              newlyAddedFromQueue[k] = v;
+            }
+          }
+          const cascadeChanges = filterSafeCascadeChanges(
+            detectGlossaryChanges({}, newlyAddedFromQueue)
+          );
+          if (cascadeChanges.length > 0) {
+            const cascadedCount = await syncGlossaryChangesToChapters(
+              cascadeChanges,
+              { caseInsensitive: true }
+            );
+            if (cascadedCount > 0) {
+              addLog(`  > [术语回溯] 队列新词已回溯统一前文 ${cascadedCount} 处未译残留`, 'info');
+            }
+          }
         }
       } catch (err) {
         console.error("Failed to flush pending glossary queue:", err);
@@ -941,9 +967,13 @@ const App: React.FC = () => {
     }
     let updated = false;
     let currentGlossary = startGlossary;
+    const freshMap = await persistenceService.current.loadGlossary();
+    savedGlossaryMapRef.current = { ...freshMap };
     if (!currentGlossary) {
-        const freshMap = await persistenceService.current.loadGlossary();
         currentGlossary = glossaryToOutputStr(freshMap);
+    } else {
+        const prevOrder = Object.keys(parseGlossaryStr(currentGlossary));
+        currentGlossary = glossaryToOutputStr(freshMap, prevOrder);
     }
     
     // Skip empty chapters usually
@@ -1027,25 +1057,58 @@ const App: React.FC = () => {
                   if (updatedGlossary) {
                       const deltaTerms = parseGlossaryStr(updatedGlossary);
                       if (Object.keys(deltaTerms).length > 0) {
-                          if (isCleaningGlossaryRef.current) {
-                              pendingGlossaryQueueRef.current.push(deltaTerms);
-                          } else {
-                              const addedCount = await persistenceService.current.saveGlossaryTerms(deltaTerms);
-                              if (addedCount > 0) {
-                                  // 收集待审查新词
-                                  Object.assign(unreviewedTermsRef.current, deltaTerms);
+                          const existingLower = new Set([
+                              ...Object.keys(savedGlossaryMapRef.current).map(k => k.toLowerCase()),
+                              ...Object.keys(parseGlossaryStr(currentGlossary)).map(k => k.toLowerCase())
+                          ]);
+                          const trulyNewTerms: Record<string, string> = {};
+                          for (const [k, v] of Object.entries(deltaTerms)) {
+                              const lower = k.toLowerCase();
+                              if (!existingLower.has(lower)) {
+                                  existingLower.add(lower);
+                                  trulyNewTerms[k] = v;
+                              }
+                          }
 
-                                  const masterGlossary = await persistenceService.current.loadGlossary();
-                                  savedGlossaryMapRef.current = { ...masterGlossary };
-                                  setGlossaryMap(masterGlossary);
+                          if (Object.keys(trulyNewTerms).length > 0) {
+                              if (isCleaningGlossaryRef.current) {
+                                  pendingGlossaryQueueRef.current.push(trulyNewTerms);
+                                  // Keep in-memory currentGlossary up-to-date so subsequent chunks don't lose newly discovered terms
+                                  const mergedMap = { ...parseGlossaryStr(currentGlossary), ...trulyNewTerms };
                                   const prevOrder = Object.keys(parseGlossaryStr(currentGlossary));
-                                  const fullStr = glossaryToOutputStr(masterGlossary, prevOrder);
-                                  updateLiveGlossary(fullStr);
-                                  currentGlossary = fullStr;
+                                  currentGlossary = glossaryToOutputStr(mergedMap, prevOrder);
+                              } else {
+                                  const addedCount = await persistenceService.current.saveGlossaryTerms(trulyNewTerms);
+                                  if (addedCount > 0) {
+                                      // 收集待审查新词（仅包含真正新增的词条）
+                                      Object.assign(unreviewedTermsRef.current, trulyNewTerms);
 
-                                  // 检查是否达到 50 条阈值，异步触发增量清理
-                                  if (Object.keys(unreviewedTermsRef.current).length >= 50) {
-                                      triggerIncrementalCleanup();
+                                      const masterGlossary = await persistenceService.current.loadGlossary();
+                                      savedGlossaryMapRef.current = { ...masterGlossary };
+                                      setGlossaryMap(masterGlossary);
+                                      const prevOrder = Object.keys(parseGlossaryStr(currentGlossary));
+                                      const fullStr = glossaryToOutputStr(masterGlossary, prevOrder);
+                                      updateLiveGlossary(fullStr);
+                                      currentGlossary = fullStr;
+
+                                      // 自动将新发现的术语回溯替换到前文已译章节/分片中的未译英文残留
+                                      const cascadeChanges = filterSafeCascadeChanges(
+                                          detectGlossaryChanges({}, trulyNewTerms)
+                                      );
+                                      if (cascadeChanges.length > 0) {
+                                          const cascadedCount = await syncGlossaryChangesToChapters(
+                                              cascadeChanges,
+                                              { caseInsensitive: true }
+                                          );
+                                          if (cascadedCount > 0) {
+                                              addLog(`  > [术语回溯] 新增术语已回溯统一前文 ${cascadedCount} 处未译残留`, 'info');
+                                          }
+                                      }
+
+                                      // 检查是否达到 50 条阈值，异步触发增量清理
+                                      if (Object.keys(unreviewedTermsRef.current).length >= 50) {
+                                          triggerIncrementalCleanup();
+                                      }
                                   }
                               }
                           }
@@ -1285,7 +1348,10 @@ const App: React.FC = () => {
       });
   };
 
-  const syncGlossaryChangesToChapters = async (changes: TermChange[]) => {
+  const syncGlossaryChangesToChapters = async (
+    changes: TermChange[],
+    options?: { caseInsensitive?: boolean }
+  ) => {
     if (changes.length === 0) return 0;
 
     let totalReplaced = 0;
@@ -1300,7 +1366,7 @@ const App: React.FC = () => {
       let chapterCount = 0;
 
       for (const change of changes) {
-        const res = safeReplaceKeyword(ch.translatedMarkdown, change.oldTarget, change.newTarget);
+        const res = safeReplaceKeyword(ch.translatedMarkdown, change.oldTarget, change.newTarget, options);
         if (res.count > 0) {
           ch.translatedMarkdown = res.replacedText;
           chapterCount += res.count;
@@ -1308,7 +1374,7 @@ const App: React.FC = () => {
         }
 
         if (ch.proofreadMarkdown) {
-          const pRes = safeReplaceKeyword(ch.proofreadMarkdown, change.oldTarget, change.newTarget);
+          const pRes = safeReplaceKeyword(ch.proofreadMarkdown, change.oldTarget, change.newTarget, options);
           if (pRes.count > 0) {
             ch.proofreadMarkdown = pRes.replacedText;
             chapterChanged = true;
@@ -1318,7 +1384,7 @@ const App: React.FC = () => {
         if (ch.translatedChunks && ch.translatedChunks.length > 0) {
           ch.translatedChunks = ch.translatedChunks.map(chunk => {
             if (!chunk) return chunk;
-            const cRes = safeReplaceKeyword(chunk, change.oldTarget, change.newTarget);
+            const cRes = safeReplaceKeyword(chunk, change.oldTarget, change.newTarget, options);
             return cRes.replacedText;
           });
         }
@@ -1326,7 +1392,7 @@ const App: React.FC = () => {
         if (ch.proofreadChunks && ch.proofreadChunks.length > 0) {
           ch.proofreadChunks = ch.proofreadChunks.map(chunk => {
             if (!chunk) return chunk;
-            const pRes = safeReplaceKeyword(chunk, change.oldTarget, change.newTarget);
+            const pRes = safeReplaceKeyword(chunk, change.oldTarget, change.newTarget, options);
             return pRes.replacedText;
           });
         }
@@ -1335,7 +1401,7 @@ const App: React.FC = () => {
           for (const fnKey of Object.keys(ch.translatedFootnotes)) {
             const raw = ch.translatedFootnotes[fnKey];
             if (raw) {
-              const fnRes = safeReplaceKeyword(raw, change.oldTarget, change.newTarget);
+              const fnRes = safeReplaceKeyword(raw, change.oldTarget, change.newTarget, options);
               if (fnRes.count > 0) {
                 ch.translatedFootnotes[fnKey] = fnRes.replacedText;
                 chapterChanged = true;

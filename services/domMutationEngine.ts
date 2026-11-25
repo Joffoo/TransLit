@@ -749,6 +749,9 @@ function detectHeadingWithLayer(
 
   const cls = el.getAttribute('class') || '';
   const parentTable = el.closest('table');
+  if (parentTable && !isStructuralTitleTable(parentTable)) {
+    return { level: 0, layer: 'native', isHeadingLikeAnchor: false };
+  }
   if (parentTable && isStructuralTitleTable(parentTable)) {
     if (isImmutableNumberCell(el) || /\b(bor1?|num)\b/i.test(cls)) {
       return { level: 0, layer: 'native', isHeadingLikeAnchor: false };
@@ -1090,7 +1093,7 @@ export function resolveLeafHeadingAnalysis(
   let i = 0;
   while (i < leafElements.length) {
     const mapped = resolveElementBookStyleMapping(leafElements[i], bookStyleRoles);
-    if (mapped?.role === 'quote' && !leafElements[i].closest('blockquote')) {
+    if (mapped?.role === 'quote' && !leafElements[i].closest('blockquote, table')) {
       const run: Element[] = [leafElements[i]];
       let j = i + 1;
       while (j < leafElements.length) {
@@ -1098,7 +1101,7 @@ export function resolveLeafHeadingAnalysis(
         const nextMapped = resolveElementBookStyleMapping(nextEl, bookStyleRoles);
         if (
           nextMapped?.role !== 'quote' ||
-          nextEl.closest('blockquote') ||
+          nextEl.closest('blockquote, table') ||
           hasSeparatorBetween(leafElements[j - 1], nextEl)
         ) {
           break;
@@ -1200,7 +1203,7 @@ export function applyHetiTextTypography(htmlOrText: string): string {
   if (!htmlOrText) return htmlOrText;
 
   const tokenRegex =
-    /(<[^>]+>|https?:\/\/[^\s)>\]]+|__FN_REF_[A-Za-z0-9_-]+__|\{\{TRANSLITFNSLOT:[A-Za-z0-9_-]+\}\}|\[\^(?:fn-)?[A-Za-z0-9_-]+\]|\[注\d+\](?:\([^)]*\))?|&[a-zA-Z0-9#]+;)/g;
+    /(<[^>]+>|https?:\/\/[^\s)>\]]+|__FN_REF_[A-Za-z0-9_-]+__|__IMG_\d+__|__MATH_\d+__|\{\{TRANSLITFNSLOT:[A-Za-z0-9_-]+\}\}|\[\^(?:fn-)?[A-Za-z0-9_-]+\]|\[注\d+\](?:\([^)]*\))?|&[a-zA-Z0-9#]+;)/g;
   const parts = htmlOrText.split(tokenRegex);
 
   for (let i = 0; i < parts.length; i += 2) {
@@ -2079,6 +2082,7 @@ export class DomMutationEngine {
     leadingAnchorHtmls: string[];
     footnoteIds: string[];
     inlineImageHtmls: string[];
+    inlineMathHtmls: string[];
   } {
     const clone = el.cloneNode(true) as Element;
     const leadingAnchorHtmls: string[] = [];
@@ -2137,6 +2141,16 @@ export class DomMutationEngine {
       const imgIdx = inlineImageHtmls.length;
       inlineImageHtmls.push(imgOuter);
       img.replaceWith(targetContainer.ownerDocument!.createTextNode(`__IMG_${imgIdx}__`));
+    }
+
+    // 3.6. Replace inline <math> elements with opaque __MATH_{idx}__ slots so LLM never corrupts or escapes MathML tags
+    const inlineMathHtmls: string[] = [];
+    for (const mathEl of Array.from(targetContainer.querySelectorAll('math'))) {
+      if (mathEl.parentElement?.closest('math')) continue;
+      const mathOuter = (mathEl.cloneNode(true) as Element).outerHTML;
+      const mathIdx = inlineMathHtmls.length;
+      inlineMathHtmls.push(mathOuter);
+      mathEl.replaceWith(targetContainer.ownerDocument!.createTextNode(`__MATH_${mathIdx}__`));
     }
 
     // 4. Strip mid-paragraph invisible pagebreak spans and empty metadata anchors so the LLM never sees or hallucinates on them
@@ -2277,7 +2291,8 @@ export class DomMutationEngine {
       slottedText,
       leadingAnchorHtmls,
       footnoteIds,
-      inlineImageHtmls
+      inlineImageHtmls,
+      inlineMathHtmls
     };
   }
 
@@ -2339,7 +2354,21 @@ export class DomMutationEngine {
       const tag = (el.tagName || '').toUpperCase();
       const cls = el.getAttribute('class') || '';
       const parentTable = el.closest('table');
-      if (parentTable && isStructuralTitleTable(parentTable)) {
+      if (parentTable) {
+        if (isStructuralTitleTable(parentTable)) {
+          continue;
+        }
+        const isHeaderCell = Boolean(el.closest('th, thead'));
+        setRole(el, isHeaderCell ? 'table-header' : 'table-cell');
+        const cellStyle = resolveElementVisualStyle(el, cssProfiles);
+        const mappedCell = resolveElementBookStyleMapping(el, bookStyleRoles);
+        const effAlign = mappedCell?.align || cellStyle.textAlign;
+        if (effAlign === 'center' || effAlign === 'right' || effAlign === 'left') {
+          el.setAttribute('data-translit-align', effAlign);
+        }
+        if (mappedCell?.weight === 'bold' || cellStyle.fontWeight === 'bold') {
+          el.setAttribute('data-translit-weight', 'bold');
+        }
         continue;
       }
 
@@ -2393,6 +2422,9 @@ export class DomMutationEngine {
         }
 
         const mappedRole = mappedStyle.role === 'quote' ? 'quote-line' : mappedStyle.role;
+        if (tag === 'LI' && mappedRole === 'hanging') {
+          continue;
+        }
         if (
           mappedRole !== 'body' ||
           (tag === 'P' && !el.closest('blockquote, li, table, figcaption'))
@@ -2432,8 +2464,9 @@ export class DomMutationEngine {
       }
 
       if (
-        (style.textIndentEm !== undefined && style.textIndentEm < 0) ||
-        /(?:^|[\s_-])(?:bib|ref|reference|ind|inda|toc|hang)\d*(?:$|[\s_-])/i.test(cls)
+        tag !== 'LI' &&
+        ((style.textIndentEm !== undefined && style.textIndentEm < 0) ||
+          /(?:^|[\s_-])(?:bib|ref|reference|ind|inda|toc|hang)\d*(?:$|[\s_-])/i.test(cls))
       ) {
         setRole(el, 'hanging');
         continue;
@@ -2725,11 +2758,8 @@ export class DomMutationEngine {
     this.stampSemanticRoleClasses(doc.body, leafElements, cssProfiles, bookStyleRoles, headingAnalysis);
 
     const extractedSourceBlocks = leafElements.map((el, idx) => {
-      const { slottedText, leadingAnchorHtmls, footnoteIds, inlineImageHtmls } = this.extractLeafBlockContent(
-        el,
-        bookStyleRoles,
-        cssProfiles
-      );
+      const { slottedText, leadingAnchorHtmls, footnoteIds, inlineImageHtmls, inlineMathHtmls } =
+        this.extractLeafBlockContent(el, bookStyleRoles, cssProfiles);
       return {
         index: idx,
         el,
@@ -2737,6 +2767,7 @@ export class DomMutationEngine {
         leadingAnchorHtmls,
         footnoteIds,
         inlineImageHtmls,
+        inlineMathHtmls,
         isHeadingLike: Boolean(headingAnalysis.isHeadingLikeMap.get(el))
       };
     });
@@ -2892,14 +2923,29 @@ export class DomMutationEngine {
         .replace(/\[\^(?:fn-)?([A-Za-z0-9_-]+)\]/g, replacer);
     };
 
-    const renderInlineImageSlots = (htmlFragment: string, inlineImageHtmls: string[]): string => {
-      if (!inlineImageHtmls || inlineImageHtmls.length === 0) return htmlFragment;
-      let out = htmlFragment.replace(/__IMG_\s*(\d+)\s*__/gi, (full, idxStr) => {
-        const idx = Number(idxStr);
-        return inlineImageHtmls[idx] ?? full;
-      });
-      if (inlineImageHtmls.length === 1 && !/<img\b/i.test(out)) {
-        out = `${inlineImageHtmls[0]}${out}`;
+    const renderInlineImageSlots = (
+      htmlFragment: string,
+      inlineImageHtmls: string[],
+      inlineMathHtmls?: string[]
+    ): string => {
+      let out = htmlFragment;
+      if (inlineImageHtmls && inlineImageHtmls.length > 0) {
+        out = out.replace(/__IMG_\s*(\d+)\s*__/gi, (full, idxStr) => {
+          const idx = Number(idxStr);
+          return inlineImageHtmls[idx] ?? full;
+        });
+        if (inlineImageHtmls.length === 1 && !/<img\b/i.test(out)) {
+          out = `${inlineImageHtmls[0]}${out}`;
+        }
+      }
+      if (inlineMathHtmls && inlineMathHtmls.length > 0) {
+        out = out.replace(/__MATH_\s*(\d+)\s*__/gi, (full, idxStr) => {
+          const idx = Number(idxStr);
+          return inlineMathHtmls[idx] ?? full;
+        });
+        if (inlineMathHtmls.length === 1 && !/<math\b/i.test(out)) {
+          out = `${out}${inlineMathHtmls[0]}`;
+        }
       }
       return out;
     };
@@ -2928,7 +2974,8 @@ export class DomMutationEngine {
             shouldFormatTargetHeti ? applyHetiTextTypography(formattedTarget) : formattedTarget,
             false
           ),
-          blockInfo.inlineImageHtmls
+          blockInfo.inlineImageHtmls,
+          blockInfo.inlineMathHtmls
         );
         this.writeHtmlIntoLeafElement(el, renderedTargetHtml);
       } else {
@@ -2938,7 +2985,8 @@ export class DomMutationEngine {
             this.formatInlineMarkup(blockInfo.slottedText),
             true
           ),
-          blockInfo.inlineImageHtmls
+          blockInfo.inlineImageHtmls,
+          blockInfo.inlineMathHtmls
         );
         if (isMergedEmpty) {
           el.classList.add('bilingual-source');
@@ -2951,7 +2999,8 @@ export class DomMutationEngine {
             shouldFormatTargetHeti ? applyHetiTextTypography(formattedTarget) : formattedTarget,
             false
           ),
-          blockInfo.inlineImageHtmls
+          blockInfo.inlineImageHtmls,
+          blockInfo.inlineMathHtmls
         );
 
         // If source and target are identical (e.g. pure number "1" in table.title2 td.bor1), do not duplicate!

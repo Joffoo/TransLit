@@ -511,6 +511,10 @@ export function parseStyleClassificationResponse(
     }
 
     if (!BLOCK_STYLE_ROLES.has(rawRole as BlockStyleRole)) continue;
+    const isLiOnly = candidate.tags.length > 0 && candidate.tags.every((t) => t === 'li');
+    if (isLiOnly && rawRole === 'hanging') {
+      continue;
+    }
     const mapping: CssClassSemanticMapping = {
       role: rawRole,
       scope: 'block'
@@ -589,8 +593,9 @@ export function deriveLocalStyleRoles(candidates: BookStyleCandidate[]): BookSty
       };
       continue;
     }
+    const isLiOnly = c.tags.length > 0 && c.tags.every((t) => t === 'li');
     if (
-      (p.textIndentEm !== undefined && p.textIndentEm < 0) ||
+      (!isLiOnly && p.textIndentEm !== undefined && p.textIndentEm < 0) ||
       /(?:^|[\s_-])(?:bib|ref|reference|ind|inda|toc|hang)\d*(?:$|[\s_-])/i.test(cls)
     ) {
       roles[cls] = { role: 'hanging', scope: 'block' };

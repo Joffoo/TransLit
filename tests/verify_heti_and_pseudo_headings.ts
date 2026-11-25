@@ -701,6 +701,80 @@ async function runTests() {
   );
   console.log('  [OK] Scene H passed');
 
+  // Scene I: Heading font inheritance, .noindent body indent, LI negative-indent preservation, and data-table cell isolation
+  console.log('  [Scene I] Testing heading font inheritance, .noindent, list bullets, and data-table isolation...');
+  const sceneICss = `
+    .noindent { text-indent: 0; margin: 0; }
+    .bul1 { text-indent: -1em; margin-left: 1.5em; }
+    .tabp { font-size: 0.9em; text-indent: 0; }
+    .tabh { font-size: 0.95em; font-weight: bold; text-align: center; text-indent: 0; }
+  `;
+  const sceneICssProfiles = parseEpubCssProfiles([sceneICss]);
+  const sceneIAdaptiveCss = buildAdaptiveChineseTypographyCss([sceneICss]);
+
+  assert.ok(
+    !/font-family\s*:/i.test(extractCssBlock(sceneIAdaptiveCss, '[data-translit-role="h4"] {')),
+    'Headings must NOT declare font-family so Boox/e-readers switch heading fonts along with body'
+  );
+  assert.ok(
+    !/font-family\s*:/i.test(extractCssBlock(sceneIAdaptiveCss, '[data-translit-role="kicker"] {')),
+    'Kicker must NOT declare font-family'
+  );
+  assert.ok(
+    sceneIAdaptiveCss.includes('p:where('),
+    'Fallback p selector must use :where(...) to avoid high specificity overriding table p / li p'
+  );
+  assert.ok(
+    !allZeroIndentSelectors.includes('.noindent'),
+    '.noindent must NOT be forced into zero-indent list'
+  );
+  assert.ok(
+    sceneIAdaptiveCss.includes('[data-translit-role="table-cell"]') &&
+      sceneIAdaptiveCss.includes('[data-translit-role="table-header"]'),
+    'Adaptive CSS must include dedicated table-cell and table-header rules'
+  );
+
+  const sceneIXhtml = `<?xml version="1.0" encoding="utf-8"?>
+  <html xmlns="http://www.w3.org/1999/xhtml">
+  <body>
+    <h1 class="h1">Chapter One</h1>
+    <p class="noindent">First body paragraph should still indent in Chinese.</p>
+    <ul>
+      <li class="bul1">First bullet item</li>
+      <li class="bul1"><p>Second bullet item with nested paragraph</p></li>
+    </ul>
+    <table>
+      <thead><tr><th><p class="tabh">Col A</p></th><th><p class="tabh">Col B</p></th></tr></thead>
+      <tbody><tr><td><p class="tabp">Cell 1</p></td><td><p class="tabp">Cell 2</p></td></tr></tbody>
+    </table>
+  </body>
+  </html>`;
+
+  const extractedI = engine.extractTranslatablePayload(sceneIXhtml, {}, sceneICssProfiles);
+  const translatedMarkdownI = extractedI.blocks.map((b) => `[译]${b.slottedText}`).join('\n\n');
+  const appliedI = engine.mutateDomInPlace(sceneIXhtml, translatedMarkdownI, {
+    cssProfiles: sceneICssProfiles,
+    applyChineseTypography: true
+  });
+  const docI = parseHtmlDocument(appliedI);
+
+  const firstPara = docI.querySelector('p.noindent');
+  assert.equal(firstPara?.getAttribute('data-translit-role'), 'body', 'p.noindent should be stamped as body');
+  assert.notEqual(firstPara?.getAttribute('data-translit-indent'), 'none', 'p.noindent should NOT get indent="none"');
+
+  const ulEl = docI.querySelector('ul');
+  assert.notEqual(ulEl?.getAttribute('data-translit-list'), 'none', 'Standard ul with .bul1 li must keep list markers');
+  const firstLi = docI.querySelector('li.bul1');
+  assert.notEqual(firstLi?.getAttribute('data-translit-role'), 'hanging', 'LI with negative text-indent must NOT be misclassified as hanging');
+
+  const tableEl = docI.querySelector('table');
+  assert.equal(tableEl?.getAttribute('data-translit-role'), 'data-table');
+  const thP = docI.querySelector('thead p.tabh');
+  assert.equal(thP?.getAttribute('data-translit-role'), 'table-header', 'Header cell p must be table-header, not h2 or quote-line');
+  const tdP = docI.querySelector('tbody p.tabp');
+  assert.equal(tdP?.getAttribute('data-translit-role'), 'table-cell', 'Body cell p must be table-cell, not body or quote-line');
+  console.log('  [OK] Scene I passed');
+
   console.log('ALL HETI & PSEUDO-HEADING TESTS PASSED!');
 }
 

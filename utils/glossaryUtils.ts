@@ -296,6 +296,8 @@ export function stripTrailingParenNote(val: string): string {
  * Detects terminology drift where deltaGlossary proposes a different translation
  * for a key already established in currentGlossary, and unifies occurrences in
  * the translated chunk (and optional footnotes) back to the established translation.
+ * Also guards against untranslated ASCII glossary source-key leaks (e.g. "Ash" or
+ * lowercase speaker label "ash：" when "Ash=阿什" is already established).
  */
 export function reconcileGlossaryDrift(
   translatedText: string,
@@ -303,7 +305,7 @@ export function reconcileGlossaryDrift(
   currentGlossaryText: string,
   chunkFootnotes?: Record<string, string>
 ): ReconcileDriftResult {
-  if (!deltaGlossaryText || !currentGlossaryText) {
+  if (!currentGlossaryText) {
     return { fixedText: translatedText, fixes: [] };
   }
 
@@ -313,46 +315,84 @@ export function reconcileGlossaryDrift(
     baseLowerMap.set(k.toLowerCase(), v);
   }
 
-  const deltaMap = parseGlossaryStr(deltaGlossaryText);
   let fixedText = translatedText;
   const fixes: GlossaryDriftFix[] = [];
 
-  for (const [key, rawNewVal] of Object.entries(deltaMap)) {
-    const rawOldVal = baseLowerMap.get(key.toLowerCase());
-    if (!rawOldVal) continue;
+  // Pass 1: Reconcile conflicting translations proposed in deltaGlossary
+  if (deltaGlossaryText) {
+    const deltaMap = parseGlossaryStr(deltaGlossaryText);
+    for (const [key, rawNewVal] of Object.entries(deltaMap)) {
+      const rawOldVal = baseLowerMap.get(key.toLowerCase());
+      if (!rawOldVal) continue;
 
-    const oldVal = stripTrailingParenNote(rawOldVal);
-    const newVal = stripTrailingParenNote(rawNewVal);
-    if (!oldVal || !newVal || oldVal === newVal) continue;
+      const oldVal = stripTrailingParenNote(rawOldVal);
+      const newVal = stripTrailingParenNote(rawNewVal);
+      if (!oldVal || !newVal || oldVal === newVal) continue;
 
-    // Guard against single-character false replacements in prose
-    if (newVal.length < 2) continue;
+      // Guard against single-character false replacements in prose
+      if (newVal.length < 2) continue;
 
-    const escaped = escapeRegExp(newVal);
-    const re = new RegExp(escaped, 'g');
+      let count = 0;
+      const bodyRes = safeReplaceKeyword(fixedText, newVal, oldVal);
+      if (bodyRes.count > 0) {
+        fixedText = bodyRes.replacedText;
+        count += bodyRes.count;
+      }
+
+      if (chunkFootnotes) {
+        for (const fnId of Object.keys(chunkFootnotes)) {
+          const fnVal = chunkFootnotes[fnId];
+          if (fnVal) {
+            const fnRes = safeReplaceKeyword(fnVal, newVal, oldVal);
+            if (fnRes.count > 0) {
+              chunkFootnotes[fnId] = fnRes.replacedText;
+              count += fnRes.count;
+            }
+          }
+        }
+      }
+
+      if (count > 0) {
+        fixes.push({ key, oldVal, newVal, count });
+      }
+    }
+  }
+
+  // Pass 2: Guard against untranslated ASCII source-key leaks for established glossary entries
+  for (const [rawKey, rawEstablishedVal] of Object.entries(baseMap)) {
+    const key = rawKey.trim();
+    const establishedVal = stripTrailingParenNote(rawEstablishedVal);
+    if (!key || !establishedVal) continue;
+    if (key.length < 3) continue;
+    if (!/^[A-Za-z][A-Za-z0-9\s\-'.]*$/.test(key)) continue;
+
+    const lowerKey = key.toLowerCase();
+    const lowerEst = establishedVal.toLowerCase();
+    // Skip pass-through terms (e.g. Waymo=Waymo) and self-containing glosses (e.g. LLM=大语言模型（LLM）)
+    if (lowerKey === lowerEst || lowerEst.includes(lowerKey)) continue;
+
     let count = 0;
-
-    if (fixedText.includes(newVal)) {
-      fixedText = fixedText.replace(re, () => {
-        count++;
-        return oldVal;
-      });
+    const bodyRes = safeReplaceKeyword(fixedText, key, establishedVal, { caseInsensitive: true });
+    if (bodyRes.count > 0) {
+      fixedText = bodyRes.replacedText;
+      count += bodyRes.count;
     }
 
     if (chunkFootnotes) {
       for (const fnId of Object.keys(chunkFootnotes)) {
         const fnVal = chunkFootnotes[fnId];
-        if (fnVal && fnVal.includes(newVal)) {
-          chunkFootnotes[fnId] = fnVal.replace(re, () => {
-            count++;
-            return oldVal;
-          });
+        if (fnVal) {
+          const fnRes = safeReplaceKeyword(fnVal, key, establishedVal, { caseInsensitive: true });
+          if (fnRes.count > 0) {
+            chunkFootnotes[fnId] = fnRes.replacedText;
+            count += fnRes.count;
+          }
         }
       }
     }
 
     if (count > 0) {
-      fixes.push({ key, oldVal, newVal, count });
+      fixes.push({ key, oldVal: establishedVal, newVal: key, count });
     }
   }
 
@@ -367,24 +407,30 @@ export interface TermChange {
 
 /**
  * Safely replaces a keyword in translated content while protecting markdown syntax,
- * code blocks, images, links, HTML tags, and footnote slots/definitions.
+ * code blocks, images, links, HTML tags, parenthetical English glosses after CJK text,
+ * and footnote slots/definitions.
  */
 export function safeReplaceKeyword(
   content: string,
   oldWord: string,
-  newWord: string
+  newWord: string,
+  options?: { caseInsensitive?: boolean }
 ): { replacedText: string; count: number } {
   if (!content || !oldWord || !oldWord.trim() || oldWord === newWord) {
     return { replacedText: content, count: 0 };
   }
   const protectedPattern =
-    /(```[\s\S]*?```|`[^`\n]+`|!\[[^\]]*\]\([^)]+\)|\]\([^)\s]+\)|<[^>]+>|\{\{TRANSLITFNSLOT:[A-Za-z0-9_-]+\}\}|__FN_REF_[A-Za-z0-9_-]+__|\[\^[^\]]+\]|(?:\[|【)\s*FN_DEF[:：][\s\S]*?(?:(?:\[|【)\s*[\/／]\s*FN_DEF\s*(?:\]|】)|$))/g;
+    /(```[\s\S]*?```|`[^`\n]+`|!\[[^\]]*\]\([^)]+\)|\]\([^)\s]+\)|<[^>]+>|\{\{TRANSLITFNSLOT:[A-Za-z0-9_-]+\}\}|__FN_REF_[A-Za-z0-9_-]+__|\[\^[^\]]+\]|(?:\[|【)\s*FN_DEF[:：][\s\S]*?(?:(?:\[|【)\s*[\/／]\s*FN_DEF\s*(?:\]|】)|$)|(?<=[\u4e00-\u9fff])\s*[（(][A-Za-z0-9][A-Za-z0-9\s\-'.]{0,40}[)）])/g;
 
-  const isAsciiWord = /^[\w-]+$/.test(oldWord);
+  const trimmedOld = oldWord.trim();
+  const isAsciiPhrase =
+    /^[A-Za-z0-9]$/.test(trimmedOld) ||
+    /^[A-Za-z0-9][A-Za-z0-9\s\-'.]*[A-Za-z0-9]$/.test(trimmedOld);
+  const flags = options?.caseInsensitive ? 'gi' : 'g';
   const createRegex = () =>
-    isAsciiWord
-      ? new RegExp(`\\b${escapeRegExp(oldWord)}\\b`, 'g')
-      : new RegExp(escapeRegExp(oldWord), 'g');
+    isAsciiPhrase
+      ? new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(trimmedOld)}(?![A-Za-z0-9])`, flags)
+      : new RegExp(escapeRegExp(oldWord), flags);
 
   let count = 0;
   const parts: string[] = [];
@@ -450,6 +496,24 @@ export function detectGlossaryChanges(
     }
   }
   return changes;
+}
+
+/**
+ * Filters term changes for safe automatic retroactive cascading to prior chunks/chapters.
+ * Prevents short-word false positives and self-containing nested replacements (e.g. LLM -> 大语言模型（LLM）).
+ */
+export function filterSafeCascadeChanges(changes: TermChange[]): TermChange[] {
+  return changes.filter(c => {
+    const oldT = c.oldTarget.trim();
+    const newT = c.newTarget.trim();
+    if (!oldT || !newT) return false;
+    const lowerOld = oldT.toLowerCase();
+    const lowerNew = newT.toLowerCase();
+    if (lowerOld === lowerNew) return false;
+    if (lowerNew.includes(lowerOld)) return false;
+    if (/^[A-Za-z0-9\s\-'.]+$/.test(oldT) && oldT.length < 3) return false;
+    return oldT.length >= 2;
+  });
 }
 
 /**

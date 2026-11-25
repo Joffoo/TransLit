@@ -251,16 +251,20 @@ export class PersistenceService {
         const store = transaction.objectStore(STORES.GLOSSARY);
         
         let addedCount = 0;
-
-        entries.forEach(([term, translation]) => {
-            const getReq = store.get(term);
-            getReq.onsuccess = () => {
-                if (getReq.result === undefined) {
+        const keysReq = store.getAllKeys();
+        keysReq.onsuccess = () => {
+            const existingLower = new Set(
+                (keysReq.result || []).map(k => String(k).toLowerCase())
+            );
+            for (const [term, translation] of entries) {
+                const lower = term.toLowerCase();
+                if (!existingLower.has(lower)) {
+                    existingLower.add(lower);
                     store.put(translation, term);
                     addedCount++;
                 }
-            };
-        });
+            }
+        };
 
         transaction.oncomplete = () => resolve(addedCount);
         transaction.onerror = () => reject(transaction.error);
