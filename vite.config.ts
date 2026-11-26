@@ -188,6 +188,10 @@ function apiProxyPlugin(): Plugin {
 
 export default defineConfig(() => {
     return {
+      define: {
+        // Prevent mathjax-full/js/components/version.js from falling back to eval('require') in browser bundles
+        PACKAGE_VERSION: JSON.stringify('3.2.2'),
+      },
       server: {
         port: 3000,
         host: '127.0.0.1',
