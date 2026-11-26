@@ -199,7 +199,10 @@ export class FootnoteResolver {
   private isLikelyCitationLink(link: Element): boolean {
     const role = link.getAttribute('role') || link.getAttribute('epub:type') || '';
     const cls = link.getAttribute('class') || '';
-    if (/backlink|backref|doc-backlink|indref/i.test(`${role} ${cls}`)) {
+    if (/backlink|backref|doc-backlink|indref|\brearnote\b/i.test(`${role} ${cls}`)) {
+      return false;
+    }
+    if (link.closest('[epub\\:type~="endnotes"], [epub\\:type~="footnotes"], [epub\\:type~="footnote"], [epub\\:type~="rearnote"], [role="doc-endnotes"], [role="doc-footnote"]')) {
       return false;
     }
     if (/\b(noteref|doc-noteref|footnote-ref|fnref)\b/i.test(`${role} ${cls}`)) {
@@ -282,8 +285,12 @@ export class FootnoteResolver {
       // Gather candidate elements with ID (or <a name="...">)
       const allIdElements = Array.from(doc.body?.querySelectorAll('[id], a[name]') || []);
 
-      // First determine which elements are footnote start candidates
-      const candidateMap = new Map<Element, string>(); // blockElement -> id
+      // First determine which elements are footnote start candidates, preserving all alias IDs per block
+      const blockCandidates = new Map<
+        Element,
+        { primaryId: string; aliasIds: string[]; isTargeted: boolean }
+      >();
+      const candidateMap = new Map<Element, string>(); // blockElement -> primaryId
       for (const el of allIdElements) {
         const id = el.getAttribute('id') || el.getAttribute('name') || '';
         if (!id) continue;
@@ -301,21 +308,46 @@ export class FootnoteResolver {
           ) {
             continue;
           }
-          if (!candidateMap.has(blockEl)) {
+          const existing = blockCandidates.get(blockEl);
+          if (!existing) {
+            blockCandidates.set(blockEl, {
+              primaryId: id,
+              aliasIds: [id],
+              isTargeted: isTargetedFromBody
+            });
             candidateMap.set(blockEl, id);
+          } else {
+            if (!existing.aliasIds.includes(id)) {
+              existing.aliasIds.push(id);
+            }
+            const shouldUpgradePrimary =
+              (isTargetedFromBody && !existing.isTargeted) ||
+              (isTargetedFromBody === existing.isTargeted &&
+                this.isFootnoteId(id) &&
+                !this.isFootnoteId(existing.primaryId));
+            if (shouldUpgradePrimary) {
+              existing.primaryId = id;
+              candidateMap.set(blockEl, id);
+            }
+            if (isTargetedFromBody) {
+              existing.isTargeted = true;
+            }
           }
         }
       }
 
       // Extract each candidate along with its multi-paragraph sibling continuation
-      for (const [startBlock, id] of candidateMap.entries()) {
+      for (const [startBlock, entry] of blockCandidates.entries()) {
         if (consumedBlocks.has(startBlock)) continue;
 
+        const id = entry.primaryId;
         const key = `${filePath}#${id}`;
+        const aliasSet = new Set(entry.aliasIds);
         const { paragraphs, rawHtmlParts, consumed } = this.extractMultiParagraphFootnote(
           startBlock,
           id,
-          candidateMap
+          candidateMap,
+          aliasSet
         );
 
         consumed.forEach((c) => consumedBlocks.add(c));
@@ -328,7 +360,7 @@ export class FootnoteResolver {
 
         const label = this.extractFootnoteLabel(startBlock, id);
 
-        topology.set(key, {
+        const node: FootnoteNode = {
           key,
           sourceFile: filePath,
           originalId: id,
@@ -337,7 +369,11 @@ export class FootnoteResolver {
           plainText: cleanParagraphs.join('\n\n'),
           paragraphs: cleanParagraphs,
           referencedByChapters: []
-        });
+        };
+
+        for (const aliasId of entry.aliasIds) {
+          topology.set(`${filePath}#${aliasId}`, node);
+        }
       }
 
       extractedElementsByFile.set(filePath, consumedBlocks);
@@ -494,7 +530,8 @@ export class FootnoteResolver {
   private extractMultiParagraphFootnote(
     startBlock: Element,
     id: string,
-    candidateMap: Map<Element, string>
+    candidateMap: Map<Element, string>,
+    sameBlockAliasIds?: Set<string>
   ): {
     paragraphs: string[];
     rawHtmlParts: string[];
@@ -511,7 +548,7 @@ export class FootnoteResolver {
     const hasOtherCandidateInside = Array.from(startBlock.querySelectorAll('[id]')).some(
       (inner) => {
         const innerId = inner.getAttribute('id');
-        return innerId && innerId !== id && this.isFootnoteId(innerId);
+        return innerId && innerId !== id && !sameBlockAliasIds?.has(innerId) && this.isFootnoteId(innerId);
       }
     );
 
@@ -893,9 +930,12 @@ export class FootnoteResolver {
   ): Set<string> {
     const footnoteSourceFiles = new Set<string>();
 
-    // Group footnotes by source file
+    // Group unique FootnoteNode instances by source file (avoid double-counting alias keys)
     const notesByFile = new Map<string, FootnoteNode[]>();
+    const seenNodes = new Set<FootnoteNode>();
     for (const node of topology.values()) {
+      if (seenNodes.has(node)) continue;
+      seenNodes.add(node);
       if (!notesByFile.has(node.sourceFile)) {
         notesByFile.set(node.sourceFile, []);
       }

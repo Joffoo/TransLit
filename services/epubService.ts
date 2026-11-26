@@ -1786,7 +1786,7 @@ export class EpubService {
 
         if (!title && cssProfiles.size > 0 && doc.body) {
           const candidateNodes = this.domMutationEngine
-            .collectTranslatableLeafElements(doc.body)
+            .collectTranslatableLeafElements(doc.body, cssProfiles)
             .slice(0, 15);
           const headingAnalysis = resolveLeafHeadingAnalysis(candidateNodes, cssProfiles);
           for (const cand of candidateNodes) {

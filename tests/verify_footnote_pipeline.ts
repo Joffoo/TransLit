@@ -10,7 +10,7 @@ import {
   stripLeakedFootnoteDefinitions,
   isPureUrlOrCode
 } from '../services/footnotePool';
-import { DomMutationEngine } from '../services/domMutationEngine';
+import { DomMutationEngine, parseEpubCssProfiles } from '../services/domMutationEngine';
 import { EpubService } from '../services/epubService';
 import { Chapter, FootnoteNode, AppConfig } from '../types';
 import { AiService, countReplacementChars } from '../services/geminiService';
@@ -1389,6 +1389,70 @@ async function runSlice8LeakStripAndEncodingTests() {
   console.log('✓ Slice 8 passed!');
 }
 
+async function runSlice9MultiAnchorAndHiddenTagTests() {
+  console.log('--- Running Slice 9: Multi-Anchor Footnote & display:none Hidden Tag Guard ---');
+
+  const files: Record<string, string> = {
+    'OEBPS/xhtml/009_chapter_002.xhtml': `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<head><title>Chapter 2</title></head>
+<body>
+  <section epub:type="bodymatter chapter" role="doc-chapter">
+    <h1 class="CN" id="ji_264">Chapter 2</h1>
+    <p class="TX" id="ji_269">Mary Portas described IVF.<span class="EN_REF"><a epub:type="noteref" href="024_BM_004.xhtml#note114" id="note_114" role="doc-noteref">1</a></span></p>
+    <p class="hidden-tag1" epub:type="rearnote" id="note-en195"><a href="024_BM_004.xhtml#note_en195"><sup>82</sup></a></p>
+  </section>
+</body>
+</html>`,
+    'OEBPS/xhtml/024_BM_004.xhtml': `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<head><title>Notes</title></head>
+<body>
+  <section epub:type="backmatter endnotes" id="sec-bm24" role="doc-endnotes">
+    <h1 class="BMH" id="ji_1137">NOTES</h1>
+    <h2 class="BM1" id="ji_1255">Chapter 2: Reproduction</h2>
+    <ol class="none">
+      <li class="N_TX" id="ji_1256"><a epub:type="rearnote" href="009_chapter_002.xhtml#note_114" id="note114">1</a>. The headline put “father” in quotes.</li>
+    </ol>
+  </section>
+</body>
+</html>`
+  };
+
+  const resolver = new FootnoteResolver();
+  const res = resolver.resolveAll(files, [
+    'OEBPS/xhtml/009_chapter_002.xhtml',
+    'OEBPS/xhtml/024_BM_004.xhtml'
+  ]);
+
+  const ch2 = res.chapters['OEBPS/xhtml/009_chapter_002.xhtml'];
+  assert.equal(
+    Object.keys(ch2.internalizedFootnotes).length,
+    1,
+    'Multi-anchor <li id="ji_1256"><a id="note114">...</li> must resolve and internalize #note114'
+  );
+  const fnNode = Object.values(ch2.internalizedFootnotes)[0];
+  assert.equal(fnNode.originalId, 'note114', 'Targeted anchor ID note114 must win over container ID ji_1256');
+  assert.ok(fnNode.plainText.includes('The headline put'), 'Extracted footnote text must match');
+  assert.ok(
+    res.footnoteSourceFiles.has('OEBPS/xhtml/024_BM_004.xhtml'),
+    'Non-standard filename 024_BM_004.xhtml must be detected as standalone footnote source file'
+  );
+
+  // Verify CSS display:none (.hidden-tag1) is skipped by DomMutationEngine
+  const cssProfiles = parseEpubCssProfiles(['.hidden-tag1 { display: none; visibility: hidden; }']);
+  const engine = new DomMutationEngine();
+  const extracted = engine.extractTranslatablePayload(ch2.html, ch2.internalizedFootnotes, cssProfiles);
+  assert.equal(
+    extracted.blocks.length,
+    2,
+    `Expected 2 visible blocks (h1 + p.TX) with .hidden-tag1 skipped, got ${extracted.blocks.length}`
+  );
+  assert.ok(!extracted.payloadText.includes('82'), 'Hidden rearnote <sup>82</sup> must not be extracted');
+
+  console.log('✓ Slice 9 passed!');
+}
+
 async function main() {
   await runSlice1Tests();
   await runSlice2Tests();
@@ -1397,6 +1461,7 @@ async function main() {
   await runSlice6RealWorldEpub3RegressionTests();
   await runSlice7Tests();
   await runSlice8LeakStripAndEncodingTests();
+  await runSlice9MultiAnchorAndHiddenTagTests();
   console.log('\n[PASS] ALL_PIPELINE_VERIFICATIONS_SUCCESSFUL');
 }
 

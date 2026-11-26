@@ -448,6 +448,72 @@ export class AiService {
   }
 
   /**
+   * Detects catastrophic protocol, meta-response, or length collapse (e.g. model greeting,
+   * "no content received", partial block wipeout, or upstream proxy dropping the user payload)
+   * so it never silently overwrites source blocks.
+   */
+  private detectTranslationCollapse(
+    sourceChunk: string,
+    sourceBlockCount: number,
+    rawTranslation: string,
+    decodedBody: string
+  ): { collapsed: boolean; reason?: string } {
+    const trimmedBody = decodedBody.trim();
+    if (!trimmedBody) {
+      return { collapsed: true, reason: 'Empty translated body' };
+    }
+
+    const srcTrimmed = sourceChunk.trim();
+    const srcLen = srcTrimmed.length;
+    const wireCheck = decodeBlocksFromWire(rawTranslation, sourceBlockCount);
+    const bodyWithoutSlots = trimmedBody.replace(/__FN_REF_[a-zA-Z0-9_-]+__/g, '').replace(/\s+/g, ' ').trim();
+    const snippet = bodyWithoutSlots.slice(0, 80);
+
+    const ASSISTANT_META_RESPONSE_RE =
+      /(?:^\s*(?:hi|hello|hey|greetings)\b[\s!,.:;]*(?:there\b[\s!,.:;]*)?(?:how\s+(?:can|may)\s+i\s+(?:help|assist)\s+you|what\s+can\s+i\s+(?:help|do)\s+for\s+you)|\b(?:did\s+not|didn['’]?t|haven['’]?t|have\s+not)\s+receive(?:d)?\s+(?:any\s+)?(?:text|content|message|input|passage|paragraph)\b|\bno\s+(?:text|content|input)\s+(?:was\s+)?(?:provided|received|included|found)\b|\bit\s+(?:looks|seems)\s+like\s+you\s+(?:didn['’]?t|did\s+not)\s+(?:include|provide|send|paste)\b|\bplease\s+(?:provide|send|paste|share|enter)\s+(?:the\s+)?(?:text|content|passage)\s+(?:you\s+would\s+like|to\s+(?:be\s+)?translat)|(?:你好|您好)[\s！!，,。.]*(?:请问)?有什么(?:可以|能)(?:帮您|帮助您|为您|帮到您)|(?:没有|未|没能?)\s*收到(?:任何)?(?:需要翻译的)?(?:文本|内容|文字|原文|正文)|(?:您|你)?(?:没有|未|似乎没有)(?:提供|发送|附上|输入)(?:任何)?(?:需要翻译的)?(?:文本|内容|文字|原文)|请(?:提供|发送|粘贴|输入)(?:需要|要|待)?翻译的(?:文本|内容|文字|原文))/i;
+
+    if ((!wireCheck.usedBlockProtocol || wireCheck.matchedIds.length === 0) && bodyWithoutSlots.length <= 240) {
+      if (ASSISTANT_META_RESPONSE_RE.test(bodyWithoutSlots) && !ASSISTANT_META_RESPONSE_RE.test(srcTrimmed)) {
+        return { collapsed: true, reason: `Anomalous assistant meta-response ("${snippet}")` };
+      }
+    }
+
+    if (wireCheck.usedBlockProtocol) {
+      if (
+        sourceBlockCount >= 4 &&
+        wireCheck.matchedIds.length <= Math.floor(sourceBlockCount * 0.35) &&
+        trimmedBody.length < srcLen * 0.18
+      ) {
+        return {
+          collapsed: true,
+          reason: `Severe block drop (${wireCheck.matchedIds.length}/${sourceBlockCount} blocks, "${snippet}")`
+        };
+      }
+      return { collapsed: false };
+    }
+
+    if (srcLen < 200) {
+      return { collapsed: false };
+    }
+
+    const outParagraphs = trimmedBody.split(/\r?\n\s*\r?\n/).filter((p) => p.trim().length > 0).length;
+    if (sourceBlockCount >= 3 && outParagraphs <= 2 && trimmedBody.length < Math.max(100, srcLen * 0.14)) {
+      return {
+        collapsed: true,
+        reason: `Protocol lost and content collapsed (${trimmedBody.length}/${srcLen} chars, "${snippet}")`
+      };
+    }
+    if (srcLen >= 400 && trimmedBody.length < srcLen * 0.10) {
+      return {
+        collapsed: true,
+        reason: `Severe length collapse (${trimmedBody.length}/${srcLen} chars, "${snippet}")`
+      };
+    }
+
+    return { collapsed: false };
+  }
+
+  /**
    * Splits text into manageable chunks.
    */
   public splitTextIntoChunks(text: string, customSize?: number): string[] {
@@ -687,7 +753,7 @@ export class AiService {
       chunkResult: string,
       updatedGlossary?: string,
       isFallback?: boolean,
-      stats?: { originalCount: number; filteredCount: number; corruptedCharCount?: number },
+      stats?: { originalCount: number; filteredCount: number; corruptedCharCount?: number; fallbackReason?: string },
       chunkFootnotes?: Record<string, string>,
       chunkUsage?: TokenUsage
     ) => Promise<void | string>,
@@ -812,12 +878,36 @@ export class AiService {
         const prompt = `${chunkPartNote}Translate the following text into ${targetLanguage}. Return clean paragraph prose without markdown headings or blockquote markers. Preserve every [B1], [B2], ... block ID prefix at the start of its block 1-to-1 in order—never merge, drop, split across blank lines, or reorder blocks.\n\nCONTENT:\n${effectiveChunkPayload}`;
 
         try {
-            const result = await this.generate(prompt, chunkInstruction, 0.3);
-            const parsedDual = activePool.parseDualChannelResponse(
+            let result = await this.generate(prompt, chunkInstruction, 0.3);
+            let parsedDual = activePool.parseDualChannelResponse(
                 result.translation,
                 chunk,
                 pendingFootnotes
             );
+            let candidateBody = (pendingFootnotes.length > 0 || referenceOnlyFootnotes.length > 0)
+                ? parsedDual.translatedBody
+                : decodeBlocksFromWire(result.translation, chunkBlockCount).decodedText;
+
+            const collapseCheck = this.detectTranslationCollapse(chunk, chunkBlockCount, result.translation, candidateBody);
+            if (collapseCheck.collapsed) {
+                console.warn(`Chunk ${i + 1}/${chunks.length} failed integrity check (${collapseCheck.reason}); retrying with compact self-contained prompt...`);
+                const refNoteGuard = referenceOnlyFootnotes.length > 0 ? ' Do NOT repeat [FOOTNOTES_REFERENCE_ONLY] entries.' : '';
+                const compactUserPrompt = `${chunkPartNote}Translate the following text into ${targetLanguage}. Preserve every [B1], [B2], ... block ID prefix at the start of its block 1-to-1 in order, and preserve any __FN_REF_{id}__ / [FN_DEF:{id}] tags.${refNoteGuard} Wrap the output in <translation>...</translation>.\n\nCONTENT:\n${effectiveChunkPayload}`;
+                result = await this.generate(compactUserPrompt, `You are a professional translator translating into ${targetLanguage}.`, 0.2);
+                parsedDual = activePool.parseDualChannelResponse(
+                    result.translation,
+                    chunk,
+                    pendingFootnotes
+                );
+                candidateBody = (pendingFootnotes.length > 0 || referenceOnlyFootnotes.length > 0)
+                    ? parsedDual.translatedBody
+                    : decodeBlocksFromWire(result.translation, chunkBlockCount).decodedText;
+
+                const retryCheck = this.detectTranslationCollapse(chunk, chunkBlockCount, result.translation, candidateBody);
+                if (retryCheck.collapsed) {
+                    throw new Error(`Translation integrity check failed: ${retryCheck.reason}`);
+                }
+            }
 
             for (const fnNode of pendingFootnotes) {
                 const cleanId = (fnNode.namespaceId || fnNode.originalId).replace(/^fn-/, '');
@@ -841,8 +931,7 @@ export class AiService {
             if (pendingFootnotes.length > 0 || referenceOnlyFootnotes.length > 0) {
                 finalChunkText = parsedDual.translatedBody;
             } else {
-                const decodedNoFn = decodeBlocksFromWire(result.translation, chunkBlockCount).decodedText;
-                finalChunkText = validateAndRepairSlots(chunk, decodedNoFn).repairedText;
+                finalChunkText = validateAndRepairSlots(chunk, candidateBody).repairedText;
             }
 
             let deltaGlossary = result.glossary || "";
@@ -918,7 +1007,12 @@ export class AiService {
             console.error(`Error translating chunk ${i + 1}/${chunks.length}:`, error);
             translatedChunks[i] = chunk;
             if (onProgress) {
-                await onProgress(i + 1, chunks.length, chunk, "", true);
+                const fallbackReason = error instanceof Error ? error.message : String(error);
+                await onProgress(i + 1, chunks.length, chunk, "", true, {
+                    originalCount: 0,
+                    filteredCount: 0,
+                    fallbackReason
+                });
             }
         }
     };

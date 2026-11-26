@@ -2022,7 +2022,10 @@ export class DomMutationEngine {
    * Preserves exact element references so we can either extract their inline HTML
    * or mutate them in-place without losing any parent containers, tables, or classes.
    */
-  public collectTranslatableLeafElements(body: Element): Element[] {
+  public collectTranslatableLeafElements(
+    body: Element,
+    cssProfiles?: Map<string, CssClassProfile>
+  ): Element[] {
     const results: Element[] = [];
 
     const walk = (el: Element) => {
@@ -2031,6 +2034,11 @@ export class DomMutationEngine {
       const tag = (el.tagName || '').toUpperCase();
       if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'SVG' || tag === 'MATH') {
         return;
+      }
+
+      if (el !== body) {
+        if (el.hasAttribute('hidden')) return;
+        if (resolveElementVisualStyle(el, cssProfiles).displayNone === true) return;
       }
 
       const childElements = Array.from(el.children).filter((c) => !isFootnotePopupElement(c));
@@ -2619,7 +2627,7 @@ export class DomMutationEngine {
     this.decomposeBlockquotes(doc.body);
     this.normalizeMixedContentContainers(doc.body);
 
-    const leafElements = this.collectTranslatableLeafElements(doc.body);
+    const leafElements = this.collectTranslatableLeafElements(doc.body, cssProfiles);
     const analysis = resolveLeafHeadingAnalysis(leafElements, cssProfiles, bookStyleRoles);
     const blocks: TranslatableDomBlock[] = [];
 
@@ -2749,7 +2757,7 @@ export class DomMutationEngine {
       }
     }
 
-    const leafElements = this.collectTranslatableLeafElements(doc.body);
+    const leafElements = this.collectTranslatableLeafElements(doc.body, cssProfiles);
     if (leafElements.length === 0) {
       return { html: doc.body.innerHTML, leafCount: 0 };
     }

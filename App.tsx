@@ -1048,7 +1048,8 @@ const App: React.FC = () => {
                     throw new Error("PAUSE_SIGNAL");
                 }
                 if (isFallback) {
-                  addLog(`  > ⚠️ API returned empty/error for part ${current}/${total} of "${chapter.title}". Kept original.`, 'error');
+                  const reasonSuffix = stats?.fallbackReason ? ` (${stats.fallbackReason})` : '';
+                  addLog(`  > ⚠️ API returned empty/error for part ${current}/${total} of "${chapter.title}"${reasonSuffix}. Kept original.`, 'error');
                   if (!chapter.fallbackChunks!.includes(current - 1)) {
                       chapter.fallbackChunks!.push(current - 1);
                   }

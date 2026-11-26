@@ -4,9 +4,9 @@ import {
   decodeBlocksFromWire,
   stripBlockProtocolMarkers
 } from '../utils/blockProtocol';
-import { splitTextIntoChunks } from '../services/geminiService';
+import { AiService, splitTextIntoChunks } from '../services/geminiService';
 import { FootnotePool } from '../services/footnotePool';
-import { FootnoteNode } from '../types';
+import { AppConfig, FootnoteNode } from '../types';
 
 async function main() {
   console.log('--- Running Block-ID Protocol & Heading-Aware Chunking Verification ---');
@@ -171,6 +171,113 @@ async function main() {
   assert.equal(dualRes.translatedFootnotes['0-1'], '比尔·盖茨在《今夜秀》上的访谈。');
   assert.equal(dualRes.translatedFootnotes['0-2'], '谷歌 CEO 关于 AI 重要性的演讲。');
   console.log('  [OK] FootnotePool + Block-ID + 〔n〕 end-to-end coordination verified');
+
+  // 5. AiService collapse guard: greeting retry recovery, short-chunk meta-response isolation, and partial block drop
+  const mockConfig: AppConfig = {
+    apiKey: 'test-key',
+    baseUrl: 'https://mock.translit.local/v1',
+    modelName: 'mock-model',
+    sourceLanguage: 'English',
+    enableGlossary: false,
+    enableProofreading: false,
+    smartSkip: true,
+    useRecommendedPrompts: true,
+    additionalContext: ''
+  };
+  const origFetch = globalThis.fetch;
+  try {
+    // 5a: Long multi-block chunk gets "Hello! How can I help you today?" -> retries with compact prompt -> succeeds
+    let callIdx = 0;
+    (globalThis as any).fetch = async () => {
+      callIdx++;
+      const content =
+        callIdx === 1
+          ? 'Hello! How can I help you today?'
+          : '<translation>\n[B1] 第二章\n\n[B2] 生殖\n\n[B3] 这是关于现代社会与生殖技术的引言段落，篇幅较长用于验证。\n</translation>';
+      return new Response(
+        JSON.stringify({ choices: [{ message: { content } }] }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    };
+    const svcA = new AiService(mockConfig);
+    const longChunk = [
+      'Chapter 2',
+      'REPRODUCTION',
+      'Here is a long introductory paragraph about modern reproductive technologies and moral economics that easily exceeds two hundred characters in total length.'
+    ].join('\n\n');
+    let fallbackA = false;
+    const resA = await svcA.translateContent(
+      longChunk,
+      'Chinese (Simplified)',
+      'Translate carefully.',
+      async (_cur, _tot, _chunkRes, _g, isFallback) => {
+        if (isFallback) fallbackA = true;
+      }
+    );
+    assert.equal(callIdx, 2, 'Collapsed greeting response must trigger compact-prompt retry');
+    assert.equal(fallbackA, false, 'Successful retry must clear fallback');
+    assert.ok(resA.content.includes('第二章') && resA.content.includes('生殖'));
+
+    // 5b: Short chunk (< 120 chars) getting Chinese "no content received" -> isolated as fallback with reason
+    (globalThis as any).fetch = async () =>
+      new Response(
+        JSON.stringify({ choices: [{ message: { content: '抱歉，我没有收到需要翻译的内容，请提供文本。' } }] }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    const svcB = new AiService(mockConfig);
+    const shortChunk = 'Mary Portas: My brother is the father of my son.';
+    let fallbackB = false;
+    let reasonB = '';
+    const resB = await svcB.translateContent(
+      shortChunk,
+      'Chinese (Simplified)',
+      'Translate carefully.',
+      async (_cur, _tot, _chunkRes, _g, isFallback, stats) => {
+        if (isFallback) {
+          fallbackB = true;
+          reasonB = stats?.fallbackReason || '';
+        }
+      }
+    );
+    assert.equal(fallbackB, true, 'Short-chunk meta-response must trigger fallback isolation');
+    assert.ok(reasonB.includes('没有收到需要翻译的内容'), `Expected snippet in fallbackReason, got: ${reasonB}`);
+    assert.equal(resB.content, shortChunk, 'Fallback must preserve original source chunk');
+
+    // 5c: Partial [B1]-only drop on a 6-block chunk -> isolated as fallback
+    (globalThis as any).fetch = async () =>
+      new Response(
+        JSON.stringify({ choices: [{ message: { content: '<translation>\n[B1] 第二章\n</translation>' } }] }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    const svcC = new AiService(mockConfig);
+    const sixBlocks = [
+      'Chapter 2',
+      'REPRODUCTION',
+      'Paragraph one with substantial English prose discussing the historical context of assisted reproduction.',
+      'Paragraph two discussing legal frameworks and cross-border fertility clinics in California.',
+      'Paragraph three examining moral repugnance and market boundaries in modern society.',
+      'Paragraph four concluding the introductory section of the second chapter.'
+    ].join('\n\n');
+    let fallbackC = false;
+    let reasonC = '';
+    const resC = await svcC.translateContent(
+      sixBlocks,
+      'Chinese (Simplified)',
+      'Translate carefully.',
+      async (_cur, _tot, _chunkRes, _g, isFallback, stats) => {
+        if (isFallback) {
+          fallbackC = true;
+          reasonC = stats?.fallbackReason || '';
+        }
+      }
+    );
+    assert.equal(fallbackC, true, 'Partial 1/6 block drop must trigger fallback isolation');
+    assert.ok(reasonC.includes('Severe block drop'), `Expected Severe block drop reason, got: ${reasonC}`);
+    assert.equal(resC.content, sixBlocks, 'Partial block drop fallback must preserve original blocks');
+    console.log('  [OK] AiService collapse guard (greeting retry, short meta-response, partial block drop) verified');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
 
   console.log('\n[PASS] ALL_BLOCK_PROTOCOL_TESTS_SUCCESSFUL');
 }
