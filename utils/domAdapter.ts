@@ -30,13 +30,61 @@ export function ensureDomGlobals(): void {
   }
 }
 
+const HTML5_VOID_ELEMENTS = new Set([
+  'area',
+  'base',
+  'br',
+  'col',
+  'embed',
+  'hr',
+  'img',
+  'input',
+  'link',
+  'meta',
+  'param',
+  'source',
+  'track',
+  'wbr'
+]);
+
+/**
+ * Expands XHTML self-closing non-void elements (e.g. `<script .../>`, `<span .../>`, `<style .../>`)
+ * into explicit open/close pairs before HTML5 `text/html` parsing, while preserving HTML5 void elements
+ * and foreign `<svg>` / `<math>` subtrees untouched.
+ */
+export function expandXhtmlSelfClosingTags(html: string): string {
+  if (!html || !html.includes('/>')) return html || '';
+
+  const preservedForeignBlocks: string[] = [];
+  const masked = html.replace(/<(svg|math)\b[\s\S]*?<\/\1>/gi, (match) => {
+    const idx = preservedForeignBlocks.length;
+    preservedForeignBlocks.push(match);
+    return `<!--TRANSLIT_FOREIGN_${idx}-->`;
+  });
+
+  const expanded = masked.replace(
+    /<([a-zA-Z][a-zA-Z0-9:-]*)(\s(?:[^>"']|"[^"]*"|'[^']*')*?)?\s*\/>/g,
+    (full, tag: string, attrs?: string) => {
+      if (HTML5_VOID_ELEMENTS.has(tag.toLowerCase())) {
+        return full;
+      }
+      return `<${tag}${attrs || ''}></${tag}>`;
+    }
+  );
+
+  if (preservedForeignBlocks.length === 0) {
+    return expanded;
+  }
+
+  return expanded.replace(/<!--TRANSLIT_FOREIGN_(\d+)-->/g, (_, idxStr) => {
+    return preservedForeignBlocks[Number(idxStr)] ?? '';
+  });
+}
+
 export function parseHtmlDocument(html: string): Document {
   ensureDomGlobals();
   const parser = new DOMParser();
-  const normalizedHtml = (html || '').replace(
-    /<(span|a|div|p|section|aside|sup|sub|em|i|b|strong|small|li|td|th|h[1-6]|blockquote|cite|q|dfn|abbr|code|pre|ol|ul|dl|dt|dd|nav|header|footer|main|article|figure|figcaption)(\s[^>]*)?\/>/gi,
-    '<$1$2></$1>'
-  );
+  const normalizedHtml = expandXhtmlSelfClosingTags(html || '');
   return parser.parseFromString(normalizedHtml, 'text/html');
 }
 

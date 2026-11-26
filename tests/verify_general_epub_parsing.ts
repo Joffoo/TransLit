@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { DomMutationEngine, parseEpubCssProfiles } from '../services/domMutationEngine';
 import { EpubService, buildAdaptiveChineseTypographyCss } from '../services/epubService';
+import { expandXhtmlSelfClosingTags } from '../utils/domAdapter';
 
 async function runTests() {
   const engine = new DomMutationEngine();
@@ -105,6 +106,52 @@ async function runTests() {
     assert.ok(mutated.includes('<p class="CO" data-translit-role="body">'), `Expected long p.CO to get data-translit-role="body", got:\n${mutated}`);
 
     console.log('[OK] Slice 3: Body class p.CO not misclassified as heading in CSS or DOM');
+  }
+
+  // Slice 4: Self-closing non-void XHTML tags (<script .../>, <style .../>) must NOT swallow <body>,
+  // while foreign <svg><path .../></svg> remains untouched
+  {
+    const koboXhtml = `<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="ja" class="vrtl">
+<head>
+  <meta charset="UTF-8"/>
+  <title>言語化するための小説思考</title>
+  <script xmlns="http://www.w3.org/1999/xhtml" type="text/javascript" src="../../js/kobo.js"/>
+  <style type="text/css"/>
+</head>
+<body class="main-top">
+  <div class="main">
+    <p><span class="koboSpan" id="kobo.1.1">将棋の放送対局を見ていると、画面上にＡＩによる形勢判断が表示される。</span></p>
+    <p><span class="koboSpan" id="kobo.2.1">「この機能、小説にもあったらなあ」</span></p>
+    <p><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><path d="M0 0"/></svg></p>
+    <p>図版の説明文</p>
+  </div>
+</body>
+</html>`;
+
+    const expanded = expandXhtmlSelfClosingTags(koboXhtml);
+    assert.ok(expanded.includes('></script>'), 'Self-closing <script .../> must be expanded');
+    assert.ok(expanded.includes('></style>'), 'Self-closing <style .../> must be expanded');
+    assert.ok(expanded.includes('<path d="M0 0"/>'), 'Foreign <svg><path .../></svg> must remain self-closing in expandXhtmlSelfClosingTags');
+
+    const extracted = engine.extractTranslatablePayload(koboXhtml);
+    assert.equal(
+      extracted.blocks.length,
+      3,
+      `Expected 3 body blocks despite <script .../> in <head>, got ${extracted.blocks.length}`
+    );
+    assert.ok(extracted.payloadText.includes('将棋の放送対局'));
+    assert.ok(extracted.payloadText.includes('図版の説明文'));
+
+    const mutated = engine.mutateDomInPlace(
+      koboXhtml,
+      '看将棋电视转播时，屏幕上会显示 AI 的形势判断。\n\n“要是小说也能有这个功能就好了”\n\n插图说明文字',
+      { bilingualMode: 'none' }
+    );
+    assert.ok(mutated.includes('<svg') && mutated.includes('d="M0 0"'), 'Standalone <svg> block must remain intact');
+    assert.ok(mutated.includes('看将棋电视转播时'), 'Body text must be mutated in-place');
+
+    console.log('[OK] Slice 4: Self-closing <script .../> & <style .../> expanded without swallowing <body>');
   }
 }
 

@@ -245,8 +245,10 @@ export const EpubFinishedPreview: React.FC<EpubFinishedPreviewProps> = ({
       }
     );
 
-    // Strip any raw <script> tags from publisher HTML for preview safety
-    return mutated.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '');
+    // Strip any raw <script> tags (paired or self-closing) from publisher HTML for preview safety
+    return mutated
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
+      .replace(/<script\b[^>]*\/>/gi, '');
   }, [
     chapter.content,
     chapter.slottedMarkdown,
