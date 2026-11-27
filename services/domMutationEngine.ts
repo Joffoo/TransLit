@@ -608,6 +608,22 @@ function escapeXml(unsafe: any): string {
   });
 }
 
+/**
+ * Returns an element's visible text with Japanese/CJK `<ruby>` phonetic annotations
+ * (`<rt>`, `<rp>`, `<rtc>`) excluded. Fast-paths to `el.textContent` when no ruby nodes exist.
+ */
+export function getCleanElementText(el: Element | null | undefined): string {
+  if (!el) return '';
+  if (!el.querySelector('rt, rp, rtc')) {
+    return el.textContent || '';
+  }
+  const clone = el.cloneNode(true) as Element;
+  for (const rubyMeta of Array.from(clone.querySelectorAll('rt, rp, rtc'))) {
+    rubyMeta.remove();
+  }
+  return clone.textContent || '';
+}
+
 function isFootnotePopupElement(el: Element): boolean {
   const tagName = (el.tagName || '').toUpperCase();
   const epubType = el.getAttribute('epub:type') || el.getAttribute('role') || '';
@@ -825,7 +841,7 @@ function detectHeadingWithLayer(
     return { level: 0, layer: 'none', isHeadingLikeAnchor: false };
   }
 
-  const rawText = (el.textContent || '').replace(/[\s\u00a0]+/g, ' ').trim();
+  const rawText = getCleanElementText(el).replace(/[\s\u00a0]+/g, ' ').trim();
   if (rawText.length === 0 || rawText.length > 120) {
     return { level: 0, layer: 'none', isHeadingLikeAnchor: false };
   }
@@ -967,7 +983,7 @@ function getQuoteVisualSignature(
   if ((tag !== 'P' && tag !== 'DIV') || el.closest('blockquote')) return null;
   const cls = el.getAttribute('class') || '';
   if (EXCLUDED_PSEUDO_HEADING_CLASSES.test(cls)) return null;
-  const rawText = (el.textContent || '').replace(/[\s\u00a0]+/g, ' ').trim();
+  const rawText = getCleanElementText(el).replace(/[\s\u00a0]+/g, ' ').trim();
   if (rawText.length === 0 || rawText.length > 120) return null;
 
   const style = resolveElementVisualStyle(el, cssProfiles);
@@ -1659,6 +1675,16 @@ function sanitizeInlineXhtmlCore(text: string, options: InlineXhtmlSanitizeOptio
     .join('');
 }
 
+function stripRubyMarkup(html: string): string {
+  if (!html || !/<\/?(?:ruby|rt|rp|rb|rtc)\b/i.test(html)) return html;
+  return html
+    .replace(/<(?:rt|rp|rtc)\b[^>]*\/\s*>/gi, '')
+    .replace(/<rtc\b[^>]*>[\s\S]*?<\/\s*rtc\s*>/gi, '')
+    .replace(/<(rt|rp)\b[^>]*>[\s\S]*?<\/\s*\1\s*>/gi, '')
+    .replace(/<(?:rt|rp|rtc)\b[^>]*>[^<]*(?=<\/?\s*(?:ruby|rb|rt|rp|rtc)\b)/gi, '')
+    .replace(/<\/?\s*(?:ruby|rb|rt|rp|rtc)\b[^>]*>/gi, '');
+}
+
 /**
  * Sanitizes footnote prose so it is strictly well-formed XHTML inside `<aside>` elements:
  * - Escapes bare `&` characters not part of valid XML entities.
@@ -1666,7 +1692,7 @@ function sanitizeInlineXhtmlCore(text: string, options: InlineXhtmlSanitizeOptio
  * - Escapes unclosed, mismatched, or arbitrary angle-bracket text (e.g. `<internal>`, `x < y`).
  */
 export function sanitizeFootnoteTextForXhtml(text: string): string {
-  return sanitizeInlineXhtmlCore(text, {
+  return sanitizeInlineXhtmlCore(stripRubyMarkup(text), {
     allowedTags: FOOTNOTE_INLINE_TAG_SET,
     allowClassAttr: false,
     stripUnmatchedAllowedTags: false
@@ -1676,6 +1702,7 @@ export function sanitizeFootnoteTextForXhtml(text: string): string {
 /**
  * Sanitizes inline markup inside translated leaf blocks so arbitrary LLM output is guaranteed
  * to be well-formed XHTML:
+ * - Strips any leaked `<ruby>` / `<rt>` / `<rp>` / `<rtc>` furigana tags while keeping base text.
  * - Rescues unclosed opening tags missing `>` before text + closing tag (e.g. `<span class="“stickupcap”" 站</span>`).
  * - Normalizes curly quotes inside allowed `class` attributes and strips unsafe/unknown attributes.
  * - Preserves balanced inline formatting tags (`i`, `em`, `b`, `strong`, `sup`, `sub`, `u`, `small`, `code`, `span`) and `<br/>`.
@@ -1683,7 +1710,7 @@ export function sanitizeFootnoteTextForXhtml(text: string): string {
  */
 export function sanitizeInlineXhtmlForLeaf(html: string): string {
   if (!html) return '';
-  const rescued = html
+  const rescued = stripRubyMarkup(html)
     .replace(
       /<(span|i|em|b|strong|sup|sub|u|small|code)\b[^<>]*?\s+([^<>\s=]+)<=""\s*\1="">/gi,
       '$2'
@@ -2175,6 +2202,16 @@ export class DomMutationEngine {
     for (const anchor of Array.from(targetContainer.querySelectorAll('a')).reverse()) {
       if (!anchor.parentNode || isNoterefAnchor(anchor)) continue;
       anchor.replaceWith(...Array.from(anchor.childNodes));
+    }
+
+    // 4.6. Strip Japanese/CJK <ruby> furigana annotations (<rt>, <rp>, <rtc>) and unwrap <ruby>/<rb>
+    // so phonetic readings never leak into translatable LLM payloads or break glossary matching.
+    for (const rubyMeta of Array.from(targetContainer.querySelectorAll('rt, rp, rtc'))) {
+      rubyMeta.remove();
+    }
+    for (const rubyWrap of Array.from(targetContainer.querySelectorAll('ruby, rb')).reverse()) {
+      if (!rubyWrap.parentNode) continue;
+      rubyWrap.replaceWith(...Array.from(rubyWrap.childNodes));
     }
 
     // 5. Purify remaining <span> elements (deepest-first) using CSS profiles + AI style roles:

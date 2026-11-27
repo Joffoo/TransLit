@@ -6,6 +6,7 @@ import {
 } from '../types';
 import { parseHtmlDocument, normalizeEpubFilePath } from '../utils/domAdapter';
 import { isChapterNonTranslatable } from '../utils/chapterUtils';
+import { getCleanElementText } from './domMutationEngine';
 
 export interface LightweightPagePayload {
   title: string;
@@ -65,7 +66,7 @@ export class PageClassifier {
   ): Chapter {
     const doc = parseHtmlDocument(chapter.content || '');
     const body = doc.body;
-    const rawText = (body?.textContent || chapter.markdown || '')
+    const rawText = (getCleanElementText(body) || chapter.markdown || '')
       .replace(/\s+/g, ' ')
       .trim();
     const wordCount = this.countWords(rawText);
@@ -149,7 +150,7 @@ export class PageClassifier {
 
     // 5. Ambiguous Transition Page (Dedication, Blurb, Foreword, Preface, Acknowledgments, Appendix, etc.)
     const headingText = Array.from(body?.querySelectorAll('h1, h2, h3') || [])
-      .map((h) => h.textContent || '')
+      .map((h) => getCleanElementText(h))
       .join(' ');
     const isTransitionCandidate =
       AMBIGUOUS_TRANSITION_KEYWORDS.test(lowerTitle) ||
@@ -252,7 +253,7 @@ export class PageClassifier {
    */
   public buildLightweightPayload(chapter: Chapter): LightweightPagePayload {
     const doc = parseHtmlDocument(chapter.content || '');
-    const rawText = (doc.body?.textContent || chapter.markdown || '')
+    const rawText = (getCleanElementText(doc.body) || chapter.markdown || '')
       .replace(/\s+/g, ' ')
       .trim();
     return {
@@ -342,7 +343,7 @@ export class PageClassifier {
     const links = Array.from(body.querySelectorAll('a[href]'));
     if (links.length >= 4 && rawText.length > 0) {
       const linkTextLen = links.reduce(
-        (sum, a) => sum + (a.textContent || '').trim().length,
+        (sum, a) => sum + getCleanElementText(a).trim().length,
         0
       );
       if (linkTextLen / rawText.length > 0.65) {

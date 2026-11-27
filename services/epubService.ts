@@ -25,7 +25,8 @@ import {
   resolveLeafHeadingAnalysis,
   applyHetiTextTypography,
   restoreHeadingPrefixesFromSource,
-  buildFootnoteAsideHtml
+  buildFootnoteAsideHtml,
+  getCleanElementText
 } from './domMutationEngine';
 import { detectBookLanguage, LanguageDetectionSource } from './languageDetectionService';
 
@@ -1539,7 +1540,7 @@ export class EpubService {
   public refreshChapterPayloadIfNeeded(chapter: Chapter): boolean {
     if (!chapter.content) return false;
     const combinedMarkdown = `${chapter.markdown || ''}\n${chapter.slottedMarkdown || ''}`;
-    const hasLegacyArtifacts = /!\[.*?\]\(.*?\)|<img\b|^[ \t]*>+|>>+/m.test(combinedMarkdown);
+    const hasLegacyArtifacts = /!\[.*?\]\(.*?\)|<img\b|<ruby\b|<rt\b|^[ \t]*>+|>>+/m.test(combinedMarkdown);
     if (hasLegacyArtifacts) {
       const res = this.domMutationEngine.extractTranslatablePayload(
         chapter.content,
@@ -1653,7 +1654,7 @@ export class EpubService {
           const navDoc = parseHtmlDocument(navHtml);
           const links = navDoc.querySelectorAll('nav[epub\\:type="toc"] a, nav#toc a');
           links.forEach((a) => {
-            const label = a.textContent?.trim();
+            const label = getCleanElementText(a).trim();
             const src = a.getAttribute('href');
             if (label && src) {
               const rawHref = src.split('#')[0];
@@ -1766,18 +1767,18 @@ export class EpubService {
         };
 
         if (headings.length > 0) {
-          const headTitle = headings[0].textContent?.trim() || '';
+          const headTitle = getCleanElementText(headings[0]).trim();
           if (!isGarbageTitle(headTitle)) {
             title = headTitle;
           }
         }
 
         if (!title) {
-          const pseudoHeading = doc
-            .querySelector(
-              '.top, .top-int, .part-title, .fm-title, .bm-title1a, .bm-title, .sec1-titlea, .book-title, .halftitle, .half-title, .chap-title, .h1, .h2'
-            )
-            ?.textContent?.replace(/\s+/g, ' ')
+          const pseudoHeadingEl = doc.querySelector(
+            '.top, .top-int, .part-title, .fm-title, .bm-title1a, .bm-title, .sec1-titlea, .book-title, .halftitle, .half-title, .chap-title, .h1, .h2'
+          );
+          const pseudoHeading = getCleanElementText(pseudoHeadingEl)
+            .replace(/\s+/g, ' ')
             .trim();
           if (pseudoHeading && !isGarbageTitle(pseudoHeading)) {
             title = pseudoHeading;
@@ -1791,7 +1792,7 @@ export class EpubService {
           const headingAnalysis = resolveLeafHeadingAnalysis(candidateNodes, cssProfiles);
           for (const cand of candidateNodes) {
             if ((headingAnalysis.headingLevels.get(cand) || 0) > 0) {
-              const candTitle = cand.textContent?.replace(/\s+/g, ' ').trim() || '';
+              const candTitle = getCleanElementText(cand).replace(/\s+/g, ' ').trim();
               if (candTitle && !isGarbageTitle(candTitle)) {
                 title = candTitle;
                 break;

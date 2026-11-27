@@ -34,7 +34,7 @@ import {
   resolveRelativeEpubHref,
   serializeXmlNode
 } from '../utils/domAdapter';
-import { isChapterNonTranslatable } from '../utils/chapterUtils';
+import { isChapterNonTranslatable, buildPosteriorTextForChapter } from '../utils/chapterUtils';
 
 const FORBIDDEN_HARDCODED_HEX = [
   '#2e5b60',
@@ -1642,10 +1642,12 @@ async function cmdTranslate(positionals: string[], flags: Record<string, string 
 
   for (let idx = 0; idx < targetChapters.length; idx++) {
     const ch = targetChapters[idx];
-    const posteriorText = targetChapters
-      .slice(idx + 1)
-      .map((c) => c.slottedMarkdown || c.markdown || '')
-      .join('\n\n');
+    const fullBookIdx = parsed.chapters.indexOf(ch);
+    const posteriorText = buildPosteriorTextForChapter(
+      parsed.chapters,
+      fullBookIdx >= 0 ? fullBookIdx : ch.index,
+      true
+    );
     if (!flags.json) {
       console.log(`Translating [${ch.index}] ${ch.fileName} ("${ch.title}")...`);
     }

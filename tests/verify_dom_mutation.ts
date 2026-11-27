@@ -4,10 +4,12 @@ import {
   DomMutationEngine,
   computeStructuralTreeDiff,
   parseEpubCssProfiles,
+  sanitizeFootnoteTextForXhtml,
   sanitizeInlineXhtmlForLeaf
 } from '../services/domMutationEngine';
 import { EpubService } from '../services/epubService';
 import { FootnoteResolver } from '../services/footnoteResolver';
+import { PageClassifier } from '../services/pageClassifier';
 import { parseHtmlDocument, parseXmlDocument } from '../utils/domAdapter';
 import { FootnoteNode } from '../types';
 
@@ -671,6 +673,128 @@ async function runSeam3Tests() {
     0,
     'Mixed-content <li> normalization must keep structural Tree-Diff == 0'
   );
+
+  // 3j. Japanese <ruby> furigana annotations (<rt>, <rp>, <rtc>) must be stripped cleanly across DOM, bilingual mode, footnotes & cache refresh
+  const japaneseRubyXhtml = `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+  <h1><ruby><span class="koboSpan">序</span><rt>じょ</rt><span class="koboSpan">章</span><rt>しょう</rt></ruby></h1>
+  <p><ruby><span class="koboSpan" id="kobo.16.1">伽</span><rt>とぎ</rt><span class="koboSpan" id="kobo.17.1">話</span><rt>ばなし</rt></ruby>と<ruby><rb>宮内悠介</rb><rp>（</rp><rt>みやうちゆうすけ</rt><rp>）</rp><rtc>みょうじ</rtc></ruby>の作品を読む。</p>
+</body>
+</html>`;
+  const rubyExtracted = notesEngine.extractTranslatablePayload(japaneseRubyXhtml);
+  assert.equal(rubyExtracted.blocks.length, 2);
+  assert.equal(rubyExtracted.blocks[0].slottedText, '# 序章', 'Heading <ruby> must strip <rt> readings cleanly');
+  assert.equal(
+    rubyExtracted.blocks[1].slottedText,
+    '伽話と宮内悠介の作品を読む。',
+    'Body <ruby> must strip <rt>/<rp>/<rtc> and unwrap <ruby>/<rb>/<span> cleanly'
+  );
+  assert.equal(/<ruby|<rt|<rp|<rtc/i.test(rubyExtracted.payloadText), false, 'Payload must contain zero ruby markup');
+
+  const rubyMonoMutated = notesEngine.mutateDomInPlace(
+    japaneseRubyXhtml,
+    '序章\n\n阅读童话故事与宫内悠介的作品。'
+  );
+  assert.equal(
+    computeStructuralTreeDiff(
+      japaneseRubyXhtml,
+      `<html xmlns="http://www.w3.org/1999/xhtml"><body>${rubyMonoMutated}</body></html>`
+    ).diffCount,
+    0,
+    'Japanese ruby monolingual mutation must keep structural Tree-Diff == 0'
+  );
+  assert.equal(
+    parseXmlDocument(`<html xmlns="http://www.w3.org/1999/xhtml"><body>${rubyMonoMutated}</body></html>`).getElementsByTagName('parsererror').length,
+    0,
+    'Japanese ruby monolingual XHTML must parse with zero XML errors'
+  );
+
+  const rubyBilingualMutated = notesEngine.mutateDomInPlace(
+    japaneseRubyXhtml,
+    '序章\n\n阅读童话故事与宫内悠介的作品。',
+    { bilingualMode: 'source_first' }
+  );
+  assert.equal(
+    rubyBilingualMutated.includes('&lt;ruby') || rubyBilingualMutated.includes('&lt;rt'),
+    false,
+    `Bilingual source must NOT leak escaped &lt;ruby&gt;/&lt;rt&gt;, got: ${rubyBilingualMutated}`
+  );
+  assert.ok(
+    rubyBilingualMutated.includes('伽話と宮内悠介の作品を読む。') &&
+      rubyBilingualMutated.includes('阅读童话故事与宫内悠介的作品。'),
+    'Bilingual mode must preserve clean Japanese source and Chinese target'
+  );
+
+  assert.equal(
+    sanitizeInlineXhtmlForLeaf('<ruby>伽<rt>とぎ</rt>話<rt>ばなし</rt></ruby>を読む'),
+    '伽話を読む',
+    'sanitizeInlineXhtmlForLeaf must strip leaked <ruby>/<rt> markup'
+  );
+  assert.equal(
+    sanitizeInlineXhtmlForLeaf('<ruby>漢<rt/>字<rt>じ</rt></ruby>と<ruby>漢<rt>かん<rb>字<rt>じ</ruby>'),
+    '漢字と漢字',
+    'stripRubyMarkup must handle self-closing <rt/> and HTML5 optional-closing <rt> without deleting base kanji or leaking furigana'
+  );
+  assert.equal(
+    sanitizeFootnoteTextForXhtml('<ruby>三条宗近<rp>(</rp><rt>さんじょうむねちか</rt><rp>)</rp></ruby>注'),
+    '三条宗近注',
+    'sanitizeFootnoteTextForXhtml must strip leaked <ruby>/<rt>/<rp> markup'
+  );
+
+  // Nested inline formatting and footnote anchor inside <ruby>
+  const nestedRubyXhtml = `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<body>
+  <p><ruby><b>漢</b><rt>かん</rt></ruby>と<ruby><a epub:type="noteref" data-fn-id="0-1" href="#fn-0-1">注</a><rt>ちゅう</rt></ruby>の確認。</p>
+</body>
+</html>`;
+  const nestedRubyExtracted = notesEngine.extractTranslatablePayload(nestedRubyXhtml);
+  assert.equal(
+    nestedRubyExtracted.blocks[0].slottedText,
+    '<b>漢</b>と__FN_REF_0-1__の確認。',
+    'Nested <b> and noteref <a> inside <ruby> must survive furigana stripping'
+  );
+
+  const jpFnHtml = `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+  <p>本文<a href="#fn-1">[1]</a></p>
+  <p id="fn-1">[1] <ruby>伽<rt>とぎ</rt>話<rt>ばなし</rt></ruby>の解説。</p>
+</body>
+</html>`;
+  const jpTopo = resolver.scanTopology({ 'jp.xhtml': jpFnHtml });
+  assert.equal(
+    jpTopo.get('jp.xhtml#fn-1')?.plainText,
+    '伽話の解説。',
+    'FootnoteResolver must strip <rt> furigana from Japanese footnote plainText'
+  );
+
+  const legacyRubyChapter = {
+    id: 'jp1',
+    index: 0,
+    fileName: 'jp1.xhtml',
+    title: '序章',
+    content: japaneseRubyXhtml,
+    markdown: '# <ruby>序<rt>じょ</rt>章<rt>しょう</rt></ruby>\n\n<ruby>伽<rt>とぎ</rt>話<rt>ばなし</rt></ruby>',
+    slottedMarkdown: '# <ruby>序<rt>じょ</rt>章<rt>しょう</rt></ruby>\n\n<ruby>伽<rt>とぎ</rt>話<rt>ばなし</rt></ruby>'
+  };
+  assert.equal(
+    epubService.refreshChapterPayloadIfNeeded(legacyRubyChapter),
+    true,
+    'refreshChapterPayloadIfNeeded must refresh legacy cached chapters containing <ruby>/<rt>'
+  );
+  assert.equal(legacyRubyChapter.markdown.includes('<rt>'), false);
+  assert.ok(legacyRubyChapter.markdown.includes('伽話と宮内悠介の作品を読む。'));
+
+  const pageClassifier = new PageClassifier();
+  const rubyPayload = pageClassifier.buildLightweightPayload(legacyRubyChapter);
+  assert.equal(
+    rubyPayload.snippet.includes('とぎ') || rubyPayload.snippet.includes('みやうち'),
+    false,
+    `PageClassifier snippet must exclude <rt> furigana, got: ${rubyPayload.snippet}`
+  );
+  assert.ok(rubyPayload.snippet.includes('伽話と宮内悠介の作品を読む。'));
 
   console.log('  [OK] Zero-CSS EPUB fallback stylesheet generation & XHTML linkage verified');
   console.log('  [OK] KaTeX inline formula vs currency ($10 and $20) separation verified');

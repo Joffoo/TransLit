@@ -45,13 +45,15 @@ import {
   detectGlossaryChanges,
   filterSafeCascadeChanges,
   mergeChunkGlossaries,
+  normalizeGlossaryKey,
   TermChange
 } from './utils/glossaryUtils';
 import {
   isFootnoteSourceChapter,
   isChapterEffectivelySkippable,
   isChapterEffectivelyReference,
-  isChapterNonTranslatable
+  isChapterNonTranslatable,
+  buildPosteriorTextForChapter
 } from './utils/chapterUtils';
 
 const EMPTY_TOKEN_STATS: TokenUsageStats = {
@@ -163,7 +165,6 @@ const App: React.FC = () => {
   const cssContentsRef = useRef<string[]>([]);
   const activeChapterIndexRef = useRef<number>(-1);
   const activeChunkIndexRef = useRef<number>(0);
-  const unreviewedTermsRef = useRef<Record<string, string>>({});
   const savedGlossaryMapRef = useRef<Record<string, string>>({});
   const driftFixesRef = useRef<Array<{ chapterTitle: string; key: string; oldVal: string; newVal: string; count: number }>>([]);
 
@@ -471,9 +472,9 @@ const App: React.FC = () => {
           updateLiveGlossary(glossaryToOutputStr(masterGlossary));
 
           const newlyAddedFromQueue: Record<string, string> = {};
-          const prevLower = new Set(Object.keys(prevMap).map(k => k.toLowerCase()));
+          const prevLower = new Set(Object.keys(prevMap).map(normalizeGlossaryKey));
           for (const [k, v] of Object.entries(masterGlossary)) {
-            if (!prevLower.has(k.toLowerCase())) {
+            if (!prevLower.has(normalizeGlossaryKey(k))) {
               newlyAddedFromQueue[k] = v;
             }
           }
@@ -494,83 +495,6 @@ const App: React.FC = () => {
         console.error("Failed to flush pending glossary queue:", err);
       }
     }
-  };
-
-  const triggerIncrementalCleanup = async () => {
-      if (isCleaningGlossaryRef.current) return;
-      
-      const candidateMap = { ...unreviewedTermsRef.current };
-      unreviewedTermsRef.current = {}; // 立即重置计数，防止并发重复触发
-      
-      setIsCleaningGlossary(true);
-      isCleaningGlossaryRef.current = true;
-      
-      try {
-          const aiService = new AiService(config, recordTokenUsage);
-          const currentMap = await persistenceService.current.loadGlossary();
-          const masterMap = { ...currentMap };
-          
-          // 把待审查的候选词从 master 中分离出来，并在本地做大小写不敏感去重
-          Object.keys(candidateMap).forEach(k => delete masterMap[k]);
-          const masterLowerKeys = new Set(Object.keys(masterMap).map(k => k.toLowerCase()));
-          const dedupedCandidateMap: Record<string, string> = {};
-          const localDuplicateKeys: string[] = [];
-          Object.entries(candidateMap).forEach(([k, v]) => {
-              if (masterLowerKeys.has(k.toLowerCase())) {
-                  localDuplicateKeys.push(k);
-              } else {
-                  dedupedCandidateMap[k] = v;
-              }
-          });
-
-          const candidateCount = Object.keys(dedupedCandidateMap).length;
-          if (candidateCount === 0 && localDuplicateKeys.length === 0) {
-              return;
-          }
-
-          if (candidateCount > 0) {
-              addLog(`[Agent] Incremental Cleanup: AI is reviewing ${candidateCount} newly added terms...`, 'process');
-          }
-
-          const candidatesText = glossaryToOutputStr(dedupedCandidateMap);
-          const cleanedText = candidatesText
-              ? await aiService.optimizeIncrementalGlossary(candidatesText)
-              : "";
-          const cleanedMap = parseGlossaryStr(cleanedText);
-          const cleanedLower = new Set(Object.keys(cleanedMap).map(k => k.toLowerCase()));
-          
-          // 重新读取数据库最新状态，防止并发写入导致数据丢失 (Race Condition Safety)
-          const latestMap = await persistenceService.current.loadGlossary();
-          let rejectedCount = 0;
-          localDuplicateKeys.forEach(k => {
-              if (latestMap[k]) {
-                  delete latestMap[k];
-                  rejectedCount++;
-              }
-          });
-          Object.keys(dedupedCandidateMap).forEach(k => {
-              // 如果新候选词被 AI 剔除了，从数据库中抹去
-              if (!cleanedLower.has(k.toLowerCase())) {
-                  delete latestMap[k];
-                  rejectedCount++;
-              }
-          });
-          
-          await persistenceService.current.replaceGlossary(latestMap);
-          savedGlossaryMapRef.current = { ...latestMap };
-          setGlossaryMap(latestMap);
-          const prevOrder = Object.keys(parseGlossaryStr(liveGlossaryRef.current));
-          updateLiveGlossary(glossaryToOutputStr(latestMap, prevOrder));
-          
-          addLog(`[Agent] Incremental Cleanup finished. Rejected ${rejectedCount} garbage terms.`, 'success');
-      } catch (error) {
-          console.error("Incremental cleanup failed:", error);
-          addLog(`[Agent] Incremental Cleanup failed. Kept all new terms.`, 'error');
-      } finally {
-          await flushPendingGlossaryQueue();
-          setIsCleaningGlossary(false);
-          isCleaningGlossaryRef.current = false;
-      }
   };
 
   // Auto scroll logs
@@ -730,7 +654,6 @@ const App: React.FC = () => {
     updateLiveGlossary('');
     setGlossaryMap({});
     savedGlossaryMapRef.current = {};
-    unreviewedTermsRef.current = {};
     pendingGlossaryQueueRef.current = [];
     activeChapterIndexRef.current = -1;
     activeChunkIndexRef.current = 0;
@@ -886,7 +809,6 @@ const App: React.FC = () => {
     setGlossaryMap({});
     savedGlossaryMapRef.current = {};
     setEditingTermKey(null);
-    unreviewedTermsRef.current = {};
     pendingGlossaryQueueRef.current = [];
     activeChapterIndexRef.current = -1;
     activeChunkIndexRef.current = 0;
@@ -1059,12 +981,12 @@ const App: React.FC = () => {
                       const deltaTerms = parseGlossaryStr(updatedGlossary);
                       if (Object.keys(deltaTerms).length > 0) {
                           const existingLower = new Set([
-                              ...Object.keys(savedGlossaryMapRef.current).map(k => k.toLowerCase()),
-                              ...Object.keys(parseGlossaryStr(currentGlossary)).map(k => k.toLowerCase())
+                              ...Object.keys(savedGlossaryMapRef.current).map(normalizeGlossaryKey),
+                              ...Object.keys(parseGlossaryStr(currentGlossary)).map(normalizeGlossaryKey)
                           ]);
                           const trulyNewTerms: Record<string, string> = {};
                           for (const [k, v] of Object.entries(deltaTerms)) {
-                              const lower = k.toLowerCase();
+                              const lower = normalizeGlossaryKey(k);
                               if (!existingLower.has(lower)) {
                                   existingLower.add(lower);
                                   trulyNewTerms[k] = v;
@@ -1081,9 +1003,6 @@ const App: React.FC = () => {
                               } else {
                                   const addedCount = await persistenceService.current.saveGlossaryTerms(trulyNewTerms);
                                   if (addedCount > 0) {
-                                      // 收集待审查新词（仅包含真正新增的词条）
-                                      Object.assign(unreviewedTermsRef.current, trulyNewTerms);
-
                                       const masterGlossary = await persistenceService.current.loadGlossary();
                                       savedGlossaryMapRef.current = { ...masterGlossary };
                                       setGlossaryMap(masterGlossary);
@@ -1104,11 +1023,6 @@ const App: React.FC = () => {
                                           if (cascadedCount > 0) {
                                               addLog(`  > [术语回溯] 新增术语已回溯统一前文 ${cascadedCount} 处未译残留`, 'info');
                                           }
-                                      }
-
-                                      // 检查是否达到 50 条阈值，异步触发增量清理
-                                      if (Object.keys(unreviewedTermsRef.current).length >= 50) {
-                                          triggerIncrementalCleanup();
                                       }
                                   }
                               }
@@ -1165,7 +1079,7 @@ const App: React.FC = () => {
           chapter.translatedChunks,
           forceTranslateIndices,
           initialGlossaryForChapter,
-          chapters.slice(index + 1).map(c => c.markdown).join('\n'),
+          buildPosteriorTextForChapter(chapters, index, config.smartSkip),
           chapter.internalizedFootnotes || {},
           footnotePoolRef.current
         );
@@ -3319,10 +3233,10 @@ const App: React.FC = () => {
                                                 {Object.entries(glossaryMap)
                                                     .filter(([key, value]) => {
                                                         if (!glossarySearch.trim()) return true;
-                                                        const q = glossarySearch.toLowerCase();
+                                                        const q = normalizeGlossaryKey(glossarySearch);
                                                         const parsed = parseGlossaryValue(value);
-                                                        return key.toLowerCase().includes(q) || 
-                                                               parsed.toLowerCase().includes(q);
+                                                        return normalizeGlossaryKey(key).includes(q) || 
+                                                               normalizeGlossaryKey(parsed).includes(q);
                                                     })
                                                     .sort(([a], [b]) => a.localeCompare(b))
                                                     .map(([key, value]) => {

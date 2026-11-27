@@ -73,22 +73,60 @@ export const parseGlossaryValue = (rawValue: string): string => {
 };
 
 const GENERIC_COMPONENT_WORDS = new Set([
-  'about', 'after', 'against', 'army', 'before', 'between', 'black', 'blade',
-  'blood', 'book', 'case', 'church', 'city', 'clan', 'code', 'council', 'court',
-  'crown', 'dark', 'dawn', 'during', 'fire', 'first', 'force', 'forest', 'form',
-  'from', 'gate', 'great', 'guild', 'hall', 'hand', 'head', 'heart', 'high',
-  'house', 'into', 'island', 'king', 'lady', 'lake', 'land', 'last', 'life',
-  'light', 'line', 'little', 'lord', 'mark', 'mind', 'moon', 'mountain', 'name',
-  'night', 'order', 'over', 'part', 'power', 'queen', 'ring', 'river', 'road',
-  'rule', 'side', 'soul', 'star', 'state', 'stone', 'sword', 'system', 'temple',
-  'that', 'this', 'through', 'time', 'tower', 'town', 'type', 'under', 'valley',
-  'ward', 'water', 'white', 'wind', 'with', 'without', 'word', 'work', 'world',
+  'about', 'administration', 'after', 'against', 'agency', 'alliance', 'american',
+  'army', 'association', 'authority', 'back', 'bank', 'before', 'between', 'black',
+  'blade', 'blood', 'board', 'book', 'british', 'bureau', 'case', 'center', 'centre',
+  'chapter', 'church', 'city', 'clan', 'code', 'college', 'commission', 'committee',
+  'company', 'corporation', 'council', 'court', 'crown', 'dark', 'dawn', 'department',
+  'division', 'during', 'east', 'economic', 'economics', 'edition', 'european',
+  'exchange', 'federal', 'federation', 'figure', 'fire', 'first', 'force', 'forest',
+  'form', 'foundation', 'free', 'from', 'fund', 'gate', 'global', 'good', 'great',
+  'group', 'guild', 'hall', 'hand', 'head', 'health', 'heart', 'high', 'history',
+  'home', 'house', 'human', 'index', 'institute', 'international', 'into', 'island',
+  'journal', 'king', 'lady', 'lake', 'land', 'last', 'laws', 'left', 'life', 'light',
+  'line', 'little', 'long', 'lord', 'mark', 'market', 'markets', 'medical', 'mind',
+  'ministry', 'model', 'modern', 'moon', 'moral', 'mountain', 'name', 'national',
+  'network', 'night', 'north', 'note', 'notes', 'office', 'order', 'organisation',
+  'organization', 'over', 'page', 'pages', 'paper', 'part', 'party', 'place', 'plan',
+  'point', 'policy', 'post', 'power', 'press', 'program', 'programme', 'project',
+  'public', 'queen', 'real', 'report', 'research', 'revenue', 'review', 'right',
+  'ring', 'river', 'road', 'room', 'rule', 'school', 'science', 'sciences', 'section',
+  'series', 'service', 'services', 'side', 'social', 'society', 'soul', 'south',
+  'standard', 'star', 'state', 'states', 'stone', 'studies', 'study', 'sword',
+  'system', 'table', 'temple', 'that', 'theory', 'this', 'through', 'time', 'times',
+  'tower', 'town', 'true', 'type', 'under', 'union', 'united', 'university', 'valley',
+  'view', 'volume', 'ward', 'water', 'west', 'white', 'wind', 'with', 'without',
+  'word', 'work', 'world', 'year',
 ]);
 
 const ASCII_TERM_RE = /^[a-z0-9\s\-'.\u2018\u2019]+$/i;
 
 function escapeRegExp(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Normalizes full-width ASCII characters (U+FF01..U+FF5E, e.g. "ＡＩ", "ＳＦ", "ｗｅｂ"),
+ * full-width spaces (U+3000), and curly apostrophes into standard half-width ASCII while
+ * preserving letter case.
+ */
+export function normalizeTextForGlossarySearch(text: string): string {
+  if (!text) return '';
+  if (!/[\uFF01-\uFF5E\u3000\u2018\u2019]/.test(text)) {
+    return text;
+  }
+  return text
+    .replace(/[\uFF01-\uFF5E]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0))
+    .replace(/\u3000/g, ' ')
+    .replace(/[\u2018\u2019]/g, "'");
+}
+
+/**
+ * Canonical comparison key for glossary deduplication & lookup across width and case variants
+ * (e.g. "ＡＩ" and "ai" map to the same canonical key "ai").
+ */
+export function normalizeGlossaryKey(key: string): string {
+  return normalizeTextForGlossarySearch(key).trim().toLowerCase();
 }
 
 /**
@@ -155,7 +193,7 @@ export function generateEnglishSearchForms(lowerWord: string): string[] {
 function hasTermInLowerText(lowerTerm: string, normalizedLowerText: string): boolean {
   if (!lowerTerm || !normalizedLowerText) return false;
 
-  const normTerm = lowerTerm.replace(/[\u2018\u2019]/g, "'");
+  const normTerm = normalizeTextForGlossarySearch(lowerTerm).toLowerCase();
 
   if (ASCII_TERM_RE.test(normTerm) && normTerm.length <= 5) {
     const boundaryRe = new RegExp(`(?<![a-z0-9])${escapeRegExp(normTerm)}(?:s|es)?(?![a-z0-9])`);
@@ -165,12 +203,381 @@ function hasTermInLowerText(lowerTerm: string, normalizedLowerText: string): boo
   return normalizedLowerText.includes(normTerm);
 }
 
-function extractDistinctiveWords(key: string): string[] {
-  return key
-    .replace(/[\u2018\u2019]/g, "'")
+const ACRONYM_STOP_WORDS = new Set([
+  'of', 'the', 'and', 'in', 'on', 'for', 'to', 'a', 'an', 'at', 'by', 'with',
+  'from', 'as', 'de', 'la', 'du', 'des', 'von', 'van'
+]);
+
+const TITLE_CASE_MINOR_WORDS = new Set([
+  'a', 'an', 'the', 'and', 'but', 'or', 'nor', 'for', 'so', 'yet',
+  'at', 'by', 'for', 'from', 'in', 'into', 'of', 'off', 'on', 'onto',
+  'out', 'over', 'per', 'to', 'up', 'via', 'with', 'as', 'vs', 'v'
+]);
+
+const NAME_SUFFIX_RE = /^(?:jr|sr|ii|iii|iv|v|phd|md|dds|jd|esq)$/i;
+
+const HONORIFIC_PREFIX_RE = /\b(?:Mr|Mrs|Ms|Dr|Prof|St|Rev|Sen|Rep|Gov|Gen|Col|Capt|Lt|Sgt|Fr|Sr)\.$/;
+
+function isAllLowercaseAsciiTerm(normKey: string): boolean {
+  const trimmed = normKey.trim();
+  return (
+    Boolean(trimmed) &&
+    !/[A-Z]/.test(trimmed) &&
+    /^[a-z][a-z0-9\s\-'.]*$/.test(trimmed)
+  );
+}
+
+/**
+ * Generates morphological variants for a lowercased single word, hyphenated compound,
+ * or multi-word ASCII phrase by varying the final alphabetic segment
+ * (e.g. "black markets" -> ["black markets", "black market"],
+ * "trade-offs" -> ["trade-offs", "trade-off"]).
+ */
+function generatePhraseSearchForms(lowerPhrase: string): string[] {
+  const trimmed = lowerPhrase.trim();
+  if (!trimmed) return [];
+  if (/^[a-z]+$/.test(trimmed)) {
+    return generateEnglishSearchForms(trimmed);
+  }
+  const tailMatch = trimmed.match(/^(.*[\s-])([a-z]{3,})$/);
+  if (!tailMatch) {
+    return [trimmed];
+  }
+  const [, prefix, lastWord] = tailMatch;
+  const tailForms = generateEnglishSearchForms(lastWord);
+  return Array.from(new Set(tailForms.map((f) => `${prefix}${f}`)));
+}
+
+/**
+ * Returns true if `normKey` is a pure ASCII term containing uppercase letters only
+ * in simple Title-Case word-initial positions (including hyphenated compounds like
+ * "Self-Interest" or "Peer-to-Peer"), excluding acronyms ("IVF", "AI", "PNAS")
+ * and mixed-case brands/surnames ("iPhone", "McDonald", "X-Ray", "AI-Powered").
+ */
+function isSimpleTitleCaseAsciiTerm(normKey: string): boolean {
+  const trimmed = normKey.trim();
+  if (!trimmed || !ASCII_TERM_RE.test(trimmed) || !/[A-Z]/.test(trimmed)) {
+    return false;
+  }
+
+  const words = trimmed.split(/\s+/).filter(Boolean);
+  for (const rawWord of words) {
+    const cleaned = rawWord.replace(/^[^A-Za-z0-9]+|(?:'s|[^A-Za-z0-9]+)$/g, '');
+    if (!cleaned || !/[A-Z]/.test(cleaned)) continue;
+    const subParts = cleaned.split('-').filter(Boolean);
+    if (subParts.length === 0) return false;
+    for (const part of subParts) {
+      if (!/[A-Z]/.test(part)) continue;
+      // Any segment with 2+ uppercase letters, single-letter uppercase ("X-Ray"), or internal uppercase ("iPhone", "McDonald") is proper/technical
+      if (!/^[A-Z][a-z]+$/.test(part)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function isTitleCaseHeadingLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.length > 100) return false;
+  if (/[.!?,;。！？，；]$/.test(trimmed)) return false;
+
+  const tokens = trimmed.split(/\s+/).filter(Boolean);
+  if (tokens.length < 2) return false;
+
+  let capCount = 0;
+  for (const rawToken of tokens) {
+    const cleaned = rawToken.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '');
+    if (!cleaned || /^\d+$/.test(cleaned)) continue;
+    const lower = cleaned.toLowerCase();
+    if (/^[A-Z]/.test(cleaned)) {
+      capCount++;
+      continue;
+    }
+    if (TITLE_CASE_MINOR_WORDS.has(lower)) {
+      continue;
+    }
+    // Found a lowercase non-stopword content word -> ordinary prose, not a Title-Case heading
+    return false;
+  }
+  return capCount >= 2;
+}
+
+function countTermOccurrencesInLowerTexts(
+  forms: string[],
+  lowerTargets: string[],
+  cap: number
+): number {
+  const uniqueNorm = Array.from(
+    new Set(
+      forms
+        .map((f) => normalizeTextForGlossarySearch(f).trim().toLowerCase())
+        .filter(Boolean)
+    )
+  ).sort((a, b) => b.length - a.length);
+
+  if (uniqueNorm.length === 0 || lowerTargets.length === 0) return 0;
+
+  const endsWithAsciiLetters = uniqueNorm.every((f) => /[a-z]$/.test(f));
+  const pattern = uniqueNorm.map(escapeRegExp).join('|');
+  const suffix = endsWithAsciiLetters ? '(?:s|es)?' : '';
+  const countRe = new RegExp(`(?<![a-z0-9])(?:${pattern})${suffix}(?![a-z0-9])`, 'g');
+
+  let total = 0;
+  for (const target of lowerTargets) {
+    if (!target) continue;
+    countRe.lastIndex = 0;
+    while (countRe.exec(target) !== null) {
+      total++;
+      if (total >= cap) return total;
+    }
+  }
+  return total;
+}
+
+function hasLowercaseOccurrenceInRawTexts(
+  lowerForms: string[],
+  rawTexts: string[]
+): boolean {
+  const unique = Array.from(new Set(lowerForms.filter(Boolean))).sort((a, b) => b.length - a.length);
+  if (unique.length === 0 || rawTexts.length === 0) return false;
+  const endsWithAsciiLetters = unique.every((f) => /[a-z]$/.test(f));
+  const pattern = unique.map(escapeRegExp).join('|');
+  const suffix = endsWithAsciiLetters ? '(?:s|es)?' : '';
+  const re = new RegExp(`(?<![A-Za-z0-9])(?:${pattern})${suffix}(?![A-Za-z0-9])`);
+  return rawTexts.some((t) => t && re.test(t));
+}
+
+function hasMidSentenceCapitalizedOccurrence(
+  titleForms: string[],
+  rawTexts: string[]
+): boolean {
+  const unique = Array.from(new Set(titleForms.filter(Boolean))).sort((a, b) => b.length - a.length);
+  if (unique.length === 0 || rawTexts.length === 0) return false;
+  const endsWithAsciiLetters = unique.every((f) => /[A-Za-z]$/.test(f));
+  const pattern = unique.map(escapeRegExp).join('|');
+  const suffix = endsWithAsciiLetters ? "(?:'s|s|es)?" : '';
+  const re = new RegExp(`(?<![A-Za-z0-9])(?:${pattern})${suffix}(?![A-Za-z0-9])`, 'g');
+
+  for (const raw of rawTexts) {
+    if (!raw) continue;
+    // Ignore Markdown headings and standalone Title-Case heading lines
+    // (often Title-Cased regardless of whether words are common nouns)
+    const bodyText = raw
+      .split('\n')
+      .map((line) => (/^#{1,6}\s+/.test(line) || isTitleCaseHeadingLine(line) ? '' : line))
+      .join('\n');
+    re.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(bodyText)) !== null) {
+      const idx = match.index;
+      const prefix = bodyText.slice(Math.max(0, idx - 28), idx);
+
+      // Line / paragraph start
+      const lastNewline = prefix.lastIndexOf('\n');
+      if (lastNewline >= 0) {
+        const afterNl = prefix.slice(lastNewline + 1);
+        if (/^[\s"'“‘(\[•·*-]*$/.test(afterNl)) continue;
+      }
+
+      // Direct-speech opening quote (e.g. `He said, "Heroin...`)
+      if (/[,:]\s*["'“‘]+$/.test(prefix)) continue;
+
+      const before = prefix.replace(/[\s"'“‘”’(\[—–-]+$/, '');
+      if (!before) continue;
+
+      // Reject ALL-CAPS preceding words (e.g. `PROTECTION FROM HARM`)
+      if (/[A-Z]{2,}$/.test(before)) continue;
+
+      // Reject sentence-initial positions (except after known honorifics like "Dr. Kahneman")
+      if (/[.!?。！？:：]$/.test(before)) {
+        if (HONORIFIC_PREFIX_RE.test(before)) {
+          return true;
+        }
+        continue;
+      }
+
+      // Accept genuine mid-sentence context: after lowercase word, single-letter "A"/"I", digit, or CJK
+      if (
+        /[a-z][,;\)\]]*$/.test(before) ||
+        /(?:^|[\s"'“‘(\[])[AI]$/.test(before) ||
+        /\d$/.test(before) ||
+        /[\u4e00-\u9fff\u3040-\u30ff]$/.test(before)
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Detects when an LLM artificially capitalized an ordinary lowercase word/phrase
+ * (e.g. "Heroin", "Tradeoffs", "Cake", "Black Market", "Self-Interest") by checking
+ * whether it appears in lowercase in the book corpus while never appearing capitalized mid-sentence.
+ */
+function isDemotedToLowercaseByCorpusCasing(normKey: string, corpusRawTexts: string[]): boolean {
+  if (corpusRawTexts.length === 0 || !isSimpleTitleCaseAsciiTerm(normKey)) {
+    return false;
+  }
+
+  const lowerKey = normKey.toLowerCase();
+  const lowerForms = generatePhraseSearchForms(lowerKey);
+
+  if (!hasLowercaseOccurrenceInRawTexts(lowerForms, corpusRawTexts)) {
+    return false;
+  }
+
+  const isSingleAsciiWord = /^[a-z]+$/.test(lowerKey);
+  const titleForms = isSingleAsciiWord
+    ? lowerForms.map((f) => f[0].toUpperCase() + f.slice(1))
+    : Array.from(
+        new Set([
+          normKey,
+          ...lowerForms.map((f) =>
+            f.replace(/(^|[\s-])([a-z])/g, (_, sep, ch) => `${sep}${ch.toUpperCase()}`)
+          )
+        ])
+      );
+
+  return !hasMidSentenceCapitalizedOccurrence(titleForms, corpusRawTexts);
+}
+
+function extractDistinctiveCapitalizedComponents(normKey: string): {
+  baseWithoutSuffix: string | null;
+  firstLastPhrase: string | null;
+  components: string[];
+} {
+  const rawWords = normKey
     .split(/\s+/)
-    .map(w => w.replace(/^[^a-zA-Z0-9]+|(?:'s|[^a-zA-Z0-9]+)$/g, '').toLowerCase())
-    .filter(w => w.length >= 4 && !GENERIC_COMPONENT_WORDS.has(w));
+    .map((w) => w.replace(/^[^A-Za-z0-9]+|(?:'s|[^A-Za-z0-9]+)$/g, ''))
+    .filter(Boolean);
+
+  if (rawWords.length < 2 || rawWords.length > 4) {
+    return { baseWithoutSuffix: null, firstLastPhrase: null, components: [] };
+  }
+
+  // Strip trailing generational/degree suffixes (e.g. "Martin Luther King Jr.", "Alvin E. Roth, PhD")
+  let trimmedWords = rawWords;
+  let baseWithoutSuffix: string | null = null;
+  while (trimmedWords.length >= 3 && NAME_SUFFIX_RE.test(trimmedWords[trimmedWords.length - 1])) {
+    trimmedWords = trimmedWords.slice(0, -1);
+    baseWithoutSuffix = trimmedWords.join(' ').toLowerCase();
+  }
+
+  if (trimmedWords.length < 2 || trimmedWords.length > 3) {
+    return { baseWithoutSuffix, firstLastPhrase: null, components: [] };
+  }
+
+  // Strip leading English article ("The Dark Forest" -> ["Dark", "Forest"])
+  const leadingLower = trimmedWords[0].toLowerCase();
+  const contentWords =
+    trimmedWords.length === 3 && (leadingLower === 'the' || leadingLower === 'a' || leadingLower === 'an')
+      ? trimmedWords.slice(1)
+      : trimmedWords;
+
+  const isThreeWordAllCapName =
+    contentWords.length === 3 && contentWords.every((w) => /^[A-Z]/.test(w));
+
+  const firstLastPhrase = isThreeWordAllCapName
+    ? `${contentWords[0]} ${contentWords[2]}`.toLowerCase()
+    : null;
+
+  // For 3-word all-capitalized names (e.g. "Alan Page Fiske", "Alvin E. Roth"),
+  // never fall back to the middle name ("Page") or standalone first name ("Alan");
+  // allow only the surname (last word) plus the contiguous "First Last" form.
+  const candidateWords = isThreeWordAllCapName
+    ? [contentWords[2]]
+    : contentWords.filter((w) => /^[A-Z]/.test(w));
+
+  const components = candidateWords.filter((w) => {
+    const lower = w.toLowerCase();
+    return lower.length >= 4 && !GENERIC_COMPONENT_WORDS.has(lower);
+  });
+
+  return { baseWithoutSuffix, firstLastPhrase, components };
+}
+
+function hasCapitalizedComponentInRawTexts(component: string, rawTargets: string[]): boolean {
+  if (!component || rawTargets.length === 0) return false;
+  const lower = component.toLowerCase();
+  const baseForms = /^[a-z]+$/.test(lower) ? generateEnglishSearchForms(lower) : [lower];
+  const casedForms = new Set<string>([component, component.toUpperCase()]);
+  for (const f of baseForms) {
+    if (!f) continue;
+    casedForms.add(f[0].toUpperCase() + f.slice(1));
+    casedForms.add(f.toUpperCase());
+  }
+  const pattern = Array.from(casedForms)
+    .sort((a, b) => b.length - a.length)
+    .map(escapeRegExp)
+    .join('|');
+  const re = new RegExp(`(?<![A-Za-z0-9])(?:${pattern})(?:'s|s|es)?(?![A-Za-z0-9])`);
+  return rawTargets.some((target) => target && re.test(target));
+}
+
+function extractPhraseAcronym(normKey: string): string | null {
+  let words = normKey
+    .split(/\s+/)
+    .map((w) => w.replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$/g, ''))
+    .filter(Boolean);
+
+  // Strip trailing generational/degree suffixes so "John F. Kennedy Jr." -> "JFK"
+  while (words.length >= 3 && NAME_SUFFIX_RE.test(words[words.length - 1])) {
+    words = words.slice(0, -1);
+  }
+
+  const letters: string[] = [];
+  for (const w of words) {
+    const lower = w.toLowerCase();
+    if (ACRONYM_STOP_WORDS.has(lower)) continue;
+    if (/^[A-Z]/.test(w)) {
+      letters.push(w[0].toUpperCase());
+    }
+  }
+
+  return letters.length >= 3 ? letters.join('') : null;
+}
+
+function hasAcronymInTargets(
+  upperAcronym: string,
+  rawTargets: string[] | undefined,
+  lowerTargets: string[]
+): boolean {
+  if (!upperAcronym) return false;
+  if (rawTargets && rawTargets.length > 0) {
+    const upperRe = new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(upperAcronym)}(?![A-Za-z0-9])`, 'g');
+    for (const target of rawTargets) {
+      if (!target) continue;
+      upperRe.lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = upperRe.exec(target)) !== null) {
+        const before = target.slice(Math.max(0, match.index - 16), match.index);
+        const after = target.slice(match.index + match[0].length, match.index + match[0].length + 16);
+        // Reject matches sitting inside an ALL-CAPS heading run (e.g. "PART II: WHO WE ARE")
+        const precededByAllCapsWord = /[A-Z]{2,}\s+$/.test(before);
+        const followedByAllCapsWord = /^\s+[A-Z]{2,}/.test(after);
+        if (precededByAllCapsWord || followedByAllCapsWord) {
+          continue;
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+  const lowerRe = new RegExp(`(?<![a-z0-9])${escapeRegExp(upperAcronym.toLowerCase())}(?![a-z0-9])`);
+  return lowerTargets.some((target) => target && lowerRe.test(target));
+}
+
+export interface PosteriorSearchInput {
+  lowerTexts: string[];
+  rawTexts?: string[];
+  sourceText?: string;
+}
+
+export interface FilterDeltaOptions {
+  sourceText?: string;
+  verifyCasing?: boolean;
 }
 
 export interface FilterDeltaResult {
@@ -181,16 +588,24 @@ export interface FilterDeltaResult {
 
 /**
  * Filters candidate terms in deltaGlossary by searching posterior text.
- * 1. Case-insensitively strips out terms already present in currentGlossary.
+ * 1. Normalizes full-width ASCII <-> half-width ASCII (e.g. "ＡＩ" <-> "AI") and
+ *    case-insensitively strips out terms already present in currentGlossary.
  * 2. If posterior text is empty (e.g. final chapter), keeps all new candidates.
- * 3. Checks direct match (with word-boundary guard for short ASCII terms),
- *    lightweight English morphological variants, and distinctive multi-word components.
- *    Accepts pre-lowercased posterior strings to avoid repeated full-book lowercasing.
+ * 3. Applies tiered thresholds & case-aware multi-word matching:
+ *    - All-lowercase ASCII common terms (and LLM-capitalized ordinary words when casing
+ *      verification is active via `sourceText` or `verifyCasing`) must appear >= 3 times
+ *      in posterior text.
+ *    - Capitalized proper nouns / acronyms / non-ASCII terms require >= 1 match.
+ *    - 2–3 word capitalized entities may match via distinctive capitalized component words
+ *      matched case-sensitively (with 3-word person names skipping middle/first names and
+ *      allowing "First Last" or surname); 4+ word titles/journals require full phrase match
+ *      or uppercase derived acronym (e.g. PNAS).
  */
 export function filterGlossaryDeltaByPosterior(
   deltaGlossaryText: string,
   currentGlossaryText: string,
-  posteriorTextOrPrecomputed: string | { lowerTexts: string[] }
+  posteriorTextOrPrecomputed: string | PosteriorSearchInput,
+  options?: FilterDeltaOptions
 ): FilterDeltaResult {
   if (!deltaGlossaryText) return { filteredText: "", originalCount: 0, filteredCount: 0 };
 
@@ -201,23 +616,39 @@ export function filterGlossaryDeltaByPosterior(
   const originalCount = deltaEntries.length;
   if (originalCount === 0) return { filteredText: "", originalCount: 0, filteredCount: 0 };
 
-  // 1. Case-insensitive deduplication against currentGlossary and within deltaEntries
-  const seenLowerKeys = new Set(Object.keys(currentMap).map(k => k.toLowerCase()));
+  // 1. Case-insensitive & width-normalized deduplication against currentGlossary and within deltaEntries
+  const seenLowerKeys = new Set(Object.keys(currentMap).map(normalizeGlossaryKey));
   const newCandidates: [string, string][] = [];
   for (const [key, val] of deltaEntries) {
-    const lowerKey = key.toLowerCase();
+    const lowerKey = normalizeGlossaryKey(key);
     if (!seenLowerKeys.has(lowerKey)) {
       seenLowerKeys.add(lowerKey);
       newCandidates.push([key, val]);
     }
   }
 
-  // 2. Normalize posterior search targets without redundant .toLowerCase()
-  const lowerTargets = typeof posteriorTextOrPrecomputed === 'string'
-    ? [posteriorTextOrPrecomputed.trim().toLowerCase().replace(/[\u2018\u2019]/g, "'")].filter(Boolean)
-    : posteriorTextOrPrecomputed.lowerTexts
-        .map(t => t.trim().replace(/[\u2018\u2019]/g, "'"))
+  // 2. Normalize posterior search targets (preserving case when rawTexts/string is available)
+  let lowerTargets: string[];
+  let rawTargets: string[] | undefined;
+  let sourceText: string | undefined = options?.sourceText;
+
+  if (typeof posteriorTextOrPrecomputed === 'string') {
+    const normRaw = normalizeTextForGlossarySearch(posteriorTextOrPrecomputed).trim();
+    rawTargets = normRaw ? [normRaw] : [];
+    lowerTargets = normRaw ? [normRaw.toLowerCase()] : [];
+  } else {
+    lowerTargets = posteriorTextOrPrecomputed.lowerTexts
+      .map((t) => normalizeTextForGlossarySearch(t).trim().toLowerCase())
+      .filter(Boolean);
+    if (posteriorTextOrPrecomputed.rawTexts) {
+      rawTargets = posteriorTextOrPrecomputed.rawTexts
+        .map((t) => normalizeTextForGlossarySearch(t).trim())
         .filter(Boolean);
+    }
+    if (sourceText === undefined) {
+      sourceText = posteriorTextOrPrecomputed.sourceText;
+    }
+  }
 
   if (lowerTargets.length === 0) {
     const filteredMap: Record<string, string> = {};
@@ -229,36 +660,79 @@ export function filterGlossaryDeltaByPosterior(
     };
   }
 
-  // 3. Match each candidate against posterior text slices
+  const shouldVerifyCasing = sourceText !== undefined || options?.verifyCasing === true;
+  const corpusRawTexts: string[] = shouldVerifyCasing
+    ? [
+        ...(sourceText ? [normalizeTextForGlossarySearch(sourceText).trim()] : []),
+        ...(rawTargets || [])
+      ].filter(Boolean)
+    : [];
+
+  // 3. Match each candidate against posterior text slices with tiered thresholds
   const keptMap: Record<string, string> = {};
   const matchesAnyTarget = (term: string) =>
-    lowerTargets.some(target => hasTermInLowerText(term, target));
+    lowerTargets.some((target) => hasTermInLowerText(term, target));
 
   for (const [key, val] of newCandidates) {
-    const lowerKey = key.toLowerCase();
+    const normKey = normalizeTextForGlossarySearch(key).trim();
+    const lowerKey = normKey.toLowerCase();
+
+    const treatAsLowercaseCommon =
+      isAllLowercaseAsciiTerm(normKey) ||
+      (shouldVerifyCasing && isDemotedToLowercaseByCorpusCasing(normKey, corpusRawTexts));
+
+    if (treatAsLowercaseCommon) {
+      const forms = generatePhraseSearchForms(lowerKey);
+      if (countTermOccurrencesInLowerTexts(forms, lowerTargets, 3) >= 3) {
+        keptMap[key] = val;
+      }
+      continue;
+    }
+
+    const words = normKey.split(/\s+/).filter(Boolean);
 
     if (matchesAnyTarget(lowerKey)) {
       keptMap[key] = val;
       continue;
     }
 
-    // Morphological variants for single ASCII words
-    if (/^[a-z]+$/.test(lowerKey)) {
-      const variants = generateEnglishSearchForms(lowerKey).filter(v => v !== lowerKey);
-      const matchedVariant = variants.find(v => matchesAnyTarget(v));
-      if (matchedVariant) {
+    // Morphological variants for single ASCII words and multi-word ASCII phrases (e.g. "Black Markets" -> "black market")
+    if (ASCII_TERM_RE.test(lowerKey)) {
+      const variants = generatePhraseSearchForms(lowerKey).filter((v) => v !== lowerKey);
+      if (variants.some((v) => matchesAnyTarget(v))) {
         keptMap[key] = val;
         continue;
       }
     }
 
-    // Distinctive component words for multi-word phrases (skipping generic words)
-    if (/\s/.test(key)) {
-      const distinctiveWords = extractDistinctiveWords(key);
-      const matchedWord = distinctiveWords.find(word =>
-        generateEnglishSearchForms(word).some(variant => matchesAnyTarget(variant))
+    // 2–3 word capitalized entities (plus 4-word names with suffixes like "Jr." / "PhD"):
+    // allow suffixless full name, "First Last" (for 3-word names), or case-sensitive distinctive component
+    if (words.length >= 2 && words.length <= 4) {
+      const { baseWithoutSuffix, firstLastPhrase, components } =
+        extractDistinctiveCapitalizedComponents(normKey);
+      if (baseWithoutSuffix && matchesAnyTarget(baseWithoutSuffix)) {
+        keptMap[key] = val;
+        continue;
+      }
+      if (firstLastPhrase && matchesAnyTarget(firstLastPhrase)) {
+        keptMap[key] = val;
+        continue;
+      }
+      const matchedComponent = components.find((comp) =>
+        rawTargets && rawTargets.length > 0
+          ? hasCapitalizedComponentInRawTexts(comp, rawTargets)
+          : generateEnglishSearchForms(comp.toLowerCase()).some((variant) => matchesAnyTarget(variant))
       );
-      if (matchedWord) {
+      if (matchedComponent) {
+        keptMap[key] = val;
+        continue;
+      }
+    }
+
+    // 3+ word capitalized organizations / titles / journals: allow case-sensitive derived acronym (e.g. WHO, IMF, FDA, PNAS, JFK)
+    if (words.length >= 3) {
+      const acronym = extractPhraseAcronym(normKey);
+      if (acronym && hasAcronymInTargets(acronym, rawTargets, lowerTargets)) {
         keptMap[key] = val;
         continue;
       }
@@ -312,7 +786,7 @@ export function reconcileGlossaryDrift(
   const baseMap = parseGlossaryStr(currentGlossaryText);
   const baseLowerMap = new Map<string, string>();
   for (const [k, v] of Object.entries(baseMap)) {
-    baseLowerMap.set(k.toLowerCase(), v);
+    baseLowerMap.set(normalizeGlossaryKey(k), v);
   }
 
   let fixedText = translatedText;
@@ -322,7 +796,7 @@ export function reconcileGlossaryDrift(
   if (deltaGlossaryText) {
     const deltaMap = parseGlossaryStr(deltaGlossaryText);
     for (const [key, rawNewVal] of Object.entries(deltaMap)) {
-      const rawOldVal = baseLowerMap.get(key.toLowerCase());
+      const rawOldVal = baseLowerMap.get(normalizeGlossaryKey(key));
       if (!rawOldVal) continue;
 
       const oldVal = stripTrailingParenNote(rawOldVal);
@@ -531,7 +1005,7 @@ export function mergeChunkGlossaries(chunkGlossaries?: (string | undefined | nul
     if (!chunkStr || !chunkStr.trim()) continue;
     const parsed = parseGlossaryStr(chunkStr);
     for (const [key, val] of Object.entries(parsed)) {
-      const lowerKey = key.toLowerCase();
+      const lowerKey = normalizeGlossaryKey(key);
       if (!seenLower.has(lowerKey)) {
         seenLower.add(lowerKey);
         merged[key] = val;

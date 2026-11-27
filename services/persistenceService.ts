@@ -1,5 +1,6 @@
 
 import { Chapter, ProcessingLog, SessionState } from '../types';
+import { normalizeGlossaryKey } from '../utils/glossaryUtils';
 
 const DB_NAME = 'epub_translator_db';
 const DB_VERSION = 3;
@@ -254,10 +255,10 @@ export class PersistenceService {
         const keysReq = store.getAllKeys();
         keysReq.onsuccess = () => {
             const existingLower = new Set(
-                (keysReq.result || []).map(k => String(k).toLowerCase())
+                (keysReq.result || []).map(k => normalizeGlossaryKey(String(k)))
             );
             for (const [term, translation] of entries) {
-                const lower = term.toLowerCase();
+                const lower = normalizeGlossaryKey(term);
                 if (!existingLower.has(lower)) {
                     existingLower.add(lower);
                     store.put(translation, term);

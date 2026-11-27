@@ -10,7 +10,16 @@ import {
     FMT_TWO_STEP_NO_GLOSSARY,
     FMT_ONE_STEP_NO_GLOSSARY
 } from "../prompts";
-import { parseGlossaryStr, glossaryToOutputStr, filterGlossaryDeltaByPosterior, reconcileGlossaryDrift, GlossaryDriftFix } from "../utils/glossaryUtils";
+import {
+  parseGlossaryStr,
+  glossaryToOutputStr,
+  filterGlossaryDeltaByPosterior,
+  reconcileGlossaryDrift,
+  normalizeTextForGlossarySearch,
+  normalizeGlossaryKey,
+  GlossaryDriftFix,
+  PosteriorSearchInput
+} from "../utils/glossaryUtils";
 import {
   FootnotePool,
   TranslatedFootnote,
@@ -715,9 +724,9 @@ export class AiService {
     const deltaMap = parseGlossaryStr(delta);
     // Preserve established base entries & insertion order (append-only for Prefix Caching)
     const merged: Record<string, string> = { ...baseMap };
-    const seenLower = new Set(Object.keys(baseMap).map(k => k.toLowerCase()));
+    const seenLower = new Set(Object.keys(baseMap).map(normalizeGlossaryKey));
     for (const [k, v] of Object.entries(deltaMap)) {
-      const lower = k.toLowerCase();
+      const lower = normalizeGlossaryKey(k);
       if (!seenLower.has(lower)) {
         seenLower.add(lower);
         merged[k] = v;
@@ -729,12 +738,12 @@ export class AiService {
   /**
    * Filters candidate terms in deltaGlossary by searching posterior text.
    * Delegates to filterGlossaryDeltaByPosterior for case-insensitive deduplication,
-   * word-boundary matching, morphological variants, and pre-lowercased text reuse.
+   * word-boundary matching, morphological variants, casing verification, and precomputed text reuse.
    */
   private filterDeltaByPosterior(
     deltaGlossaryText: string,
     currentGlossaryText: string,
-    posteriorTextOrPrecomputed: string | { lowerTexts: string[] }
+    posteriorTextOrPrecomputed: string | PosteriorSearchInput
   ): { filteredText: string; originalCount: number; filteredCount: number } {
     return filterGlossaryDeltaByPosterior(
       deltaGlossaryText,
@@ -768,8 +777,11 @@ export class AiService {
     const activePool = footnotePool || this.defaultFootnotePool;
     const customChunkSize = this.config.enableProofreading ? 1800 : this.CHUNK_SIZE;
     const chunks = this.splitTextIntoChunks(content, customChunkSize);
-    const lowerChunks = chunks.map(c => c.toLowerCase());
-    const lowerFullPosterior = fullPosteriorText ? fullPosteriorText.trim().toLowerCase() : "";
+    const normalizedChunks = chunks.map(c => normalizeTextForGlossarySearch(c));
+    const lowerChunks = normalizedChunks.map(c => c.toLowerCase());
+    const chunkSlotIds = chunks.map(c => extractFootnoteSlots(c));
+    const rawFullPosterior = fullPosteriorText ? normalizeTextForGlossarySearch(fullPosteriorText).trim() : "";
+    const lowerFullPosterior = rawFullPosterior.toLowerCase();
     const translatedChunks: string[] = [...existingChunks];
     const chapterTranslatedFootnotes: Record<string, string> = {};
     const chapterDriftFixes: GlossaryDriftFix[] = [];
@@ -962,9 +974,47 @@ export class AiService {
             }
 
             if (this.config.enableGlossary && deltaGlossary) {
-                const lowerChapterPosterior = lowerChunks.slice(i + 1).join('\n');
+                const seenFnKeys = new Set<string>();
+                for (let prev = 0; prev <= i; prev++) {
+                    for (const fnId of chunkSlotIds[prev]) {
+                        const cleanId = fnId.replace(/^fn-/, '');
+                        const node = internalizedFootnotes[cleanId] || internalizedFootnotes[fnId] || internalizedFootnotes[`fn-${cleanId}`];
+                        seenFnKeys.add(node?.key || cleanId);
+                    }
+                }
+                const posteriorChapterFnTexts: string[] = [];
+                for (let next = i + 1; next < chunks.length; next++) {
+                    for (const fnId of chunkSlotIds[next]) {
+                        const cleanId = fnId.replace(/^fn-/, '');
+                        const node = internalizedFootnotes[cleanId] || internalizedFootnotes[fnId] || internalizedFootnotes[`fn-${cleanId}`];
+                        if (!node?.plainText) continue;
+                        const dedupeKey = node.key || cleanId;
+                        if (seenFnKeys.has(dedupeKey)) continue;
+                        seenFnKeys.add(dedupeKey);
+                        posteriorChapterFnTexts.push(normalizeTextForGlossarySearch(node.plainText));
+                    }
+                }
+
+                const rawChapterPosteriorParts = [
+                    ...normalizedChunks.slice(i + 1),
+                    ...posteriorChapterFnTexts
+                ].filter(Boolean);
+                const rawChapterPosterior = rawChapterPosteriorParts.join('\n');
+                const lowerChapterPosterior = posteriorChapterFnTexts.length > 0
+                    ? rawChapterPosterior.toLowerCase()
+                    : lowerChunks.slice(i + 1).join('\n');
+
+                const chunkSourceText = pendingFootnotes.length > 0
+                    ? [
+                        normalizedChunks[i],
+                        ...pendingFootnotes.map(fn => normalizeTextForGlossarySearch(fn.plainText || ''))
+                      ].filter(Boolean).join('\n')
+                    : normalizedChunks[i];
+
                 const filterRes = this.filterDeltaByPosterior(deltaGlossary, currentGlossary, {
-                    lowerTexts: [lowerChapterPosterior, lowerFullPosterior]
+                    rawTexts: [rawChapterPosterior, rawFullPosterior],
+                    lowerTexts: [lowerChapterPosterior, lowerFullPosterior],
+                    sourceText: chunkSourceText
                 });
                 deltaGlossary = filterRes.filteredText;
                 stats = { originalCount: filterRes.originalCount, filteredCount: filterRes.filteredCount };

@@ -662,6 +662,15 @@ export class FootnoteResolver {
     const clone = el.cloneNode(true) as Element;
     let removedLeadingBacklink = false;
 
+    // Strip Japanese/CJK <ruby> furigana (<rt>, <rp>, <rtc>) and unwrap <ruby>/<rb>
+    for (const rubyMeta of Array.from(clone.querySelectorAll('rt, rp, rtc'))) {
+      rubyMeta.remove();
+    }
+    for (const rubyWrap of Array.from(clone.querySelectorAll('ruby, rb')).reverse()) {
+      if (!rubyWrap.parentNode) continue;
+      rubyWrap.replaceWith(...Array.from(rubyWrap.childNodes));
+    }
+
     // Remove backlink anchors (leading number backlinks or trailing ↩ arrows)
     const links = Array.from(clone.querySelectorAll('a[href]'));
     for (const a of links) {
