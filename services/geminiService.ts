@@ -11,12 +11,13 @@ import {
     FMT_ONE_STEP_NO_GLOSSARY
 } from "../prompts";
 import {
-  parseGlossaryStr,
-  glossaryToOutputStr,
+  parseGlossaryEntries,
+  glossaryEntriesToOutputStr,
+  mergeGlossaryStrings,
+  reconcileOptimizedGlossary,
   filterGlossaryDeltaByPosterior,
   reconcileGlossaryDrift,
   normalizeTextForGlossarySearch,
-  normalizeGlossaryKey,
   GlossaryDriftFix,
   PosteriorSearchInput
 } from "../utils/glossaryUtils";
@@ -368,12 +369,19 @@ export class AiService {
   }
 
   /**
-   * Cleans the glossary using Gemini to remove noise and redundancies.
+   * Cleans the glossary using Gemini to remove noise and redundancies,
+   * while deterministically preserving the original chronological order.
    */
   async optimizeGlossary(glossaryText: string): Promise<string> {
       try {
+          const originalEntries = parseGlossaryEntries(glossaryText);
+          if (originalEntries.length === 0) {
+              return '';
+          }
           const result = await this.generate(`Current Glossary:\n${glossaryText}`, GLOSSARY_OPTIMIZER_ALL_PROMPT, 0.2);
-          return result.translation; // translation property holds the text
+          const rawOptimized = result.glossary || result.translation;
+          const reconciled = reconcileOptimizedGlossary(originalEntries, rawOptimized);
+          return glossaryEntriesToOutputStr(reconciled);
       } catch (error) {
           console.error("Glossary optimization API call failed:", error);
           throw error;
@@ -381,14 +389,21 @@ export class AiService {
   }
 
   /**
-   * Cleans newly added terms by filtering out generic words and noise.
+   * Cleans newly added terms by filtering out generic words and noise,
+   * while deterministically preserving their original input order.
    * Exact/case-insensitive deduplication against master glossary is handled locally.
    */
   async optimizeIncrementalGlossary(newTermsText: string, _masterGlossaryText?: string): Promise<string> {
       try {
+          const originalEntries = parseGlossaryEntries(newTermsText);
+          if (originalEntries.length === 0) {
+              return '';
+          }
           const prompt = `NEW CANDIDATES:\n${newTermsText}`;
           const result = await this.generate(prompt, GLOSSARY_OPTIMIZER_INCREMENTAL_PROMPT, 0.2);
-          return result.translation;
+          const rawOptimized = result.glossary || result.translation;
+          const reconciled = reconcileOptimizedGlossary(originalEntries, rawOptimized);
+          return glossaryEntriesToOutputStr(reconciled);
       } catch (error) {
           console.error("Incremental glossary optimization failed:", error);
           throw error;
@@ -720,19 +735,8 @@ export class AiService {
   }
 
   private mergeGlossary(base: string, delta: string): string {
-    const baseMap = parseGlossaryStr(base);
-    const deltaMap = parseGlossaryStr(delta);
     // Preserve established base entries & insertion order (append-only for Prefix Caching)
-    const merged: Record<string, string> = { ...baseMap };
-    const seenLower = new Set(Object.keys(baseMap).map(normalizeGlossaryKey));
-    for (const [k, v] of Object.entries(deltaMap)) {
-      const lower = normalizeGlossaryKey(k);
-      if (!seenLower.has(lower)) {
-        seenLower.add(lower);
-        merged[k] = v;
-      }
-    }
-    return glossaryToOutputStr(merged);
+    return mergeGlossaryStrings(base, delta);
   }
 
   /**

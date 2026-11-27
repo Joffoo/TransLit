@@ -1,6 +1,12 @@
 
 import { Chapter, ProcessingLog, SessionState } from '../types';
-import { normalizeGlossaryKey } from '../utils/glossaryUtils';
+import {
+  GlossaryEntry,
+  glossaryEntriesToRecord,
+  normalizeGlossaryKey
+} from '../utils/glossaryUtils';
+
+type StoredGlossaryRecord = string | { value: string; order?: number };
 
 const DB_NAME = 'epub_translator_db';
 const DB_VERSION = 3;
@@ -243,64 +249,160 @@ export class PersistenceService {
 
   // --- Glossary ---
 
-  async saveGlossaryTerms(terms: Record<string, string>): Promise<number> {
+  private normalizeGlossaryInput(
+    terms: GlossaryEntry[] | Record<string, string>
+  ): GlossaryEntry[] {
+    const raw: GlossaryEntry[] = Array.isArray(terms)
+      ? terms
+      : Object.entries(terms).map(([key, value]) => ({ key, value }));
+    const deduped: GlossaryEntry[] = [];
+    const indexByExactKey = new Map<string, number>();
+    for (const item of raw) {
+      if (!item || typeof item.key !== 'string') continue;
+      const trimmedKey = item.key.trim();
+      if (!trimmedKey) continue;
+      const existingIdx = indexByExactKey.get(trimmedKey);
+      if (existingIdx !== undefined) {
+        deduped[existingIdx] = { key: trimmedKey, value: item.value };
+      } else {
+        indexByExactKey.set(trimmedKey, deduped.length);
+        deduped.push({ key: trimmedKey, value: item.value });
+      }
+    }
+    return deduped;
+  }
+
+  async saveGlossaryTerms(terms: GlossaryEntry[] | Record<string, string>): Promise<number> {
     return new Promise((resolve, reject) => {
-        const entries = Object.entries(terms);
+        const entries = this.normalizeGlossaryInput(terms);
         if (entries.length === 0) return resolve(0);
 
         const transaction = this.getTransaction(STORES.GLOSSARY, 'readwrite');
         const store = transaction.objectStore(STORES.GLOSSARY);
-        
+
         let addedCount = 0;
-        const keysReq = store.getAllKeys();
-        keysReq.onsuccess = () => {
-            const existingLower = new Set(
-                (keysReq.result || []).map(k => normalizeGlossaryKey(String(k)))
-            );
-            for (const [term, translation] of entries) {
-                const lower = normalizeGlossaryKey(term);
-                if (!existingLower.has(lower)) {
-                    existingLower.add(lower);
-                    store.put(translation, term);
-                    addedCount++;
+        const existingLower = new Set<string>();
+        let maxOrder = -1;
+        let existingCount = 0;
+
+        const cursorReq = store.openCursor();
+        cursorReq.onsuccess = (event) => {
+            const cursor = (event.target as IDBRequest<IDBCursorWithValue | null>).result;
+            if (cursor) {
+                existingCount++;
+                existingLower.add(normalizeGlossaryKey(String(cursor.key)));
+                const rawVal = cursor.value as StoredGlossaryRecord | null | undefined;
+                if (
+                    rawVal &&
+                    typeof rawVal === 'object' &&
+                    typeof rawVal.order === 'number' &&
+                    Number.isFinite(rawVal.order) &&
+                    rawVal.order > maxOrder
+                ) {
+                    maxOrder = rawVal.order;
                 }
+                cursor.continue();
+                return;
+            }
+
+            let nextOrder = Math.max(maxOrder + 1, existingCount);
+            for (const { key: term, value: translation } of entries) {
+                const lower = normalizeGlossaryKey(term);
+                if (!lower || existingLower.has(lower)) continue;
+                existingLower.add(lower);
+                store.put({ value: translation, order: nextOrder++ }, term);
+                addedCount++;
             }
         };
 
+        cursorReq.onerror = () => reject(cursorReq.error);
         transaction.oncomplete = () => resolve(addedCount);
         transaction.onerror = () => reject(transaction.error);
     });
   }
 
-  async loadGlossary(): Promise<Record<string, string>> {
+  async loadGlossaryEntriesWithMeta(): Promise<{
+    entries: GlossaryEntry[];
+    isLegacyUnordered: boolean;
+  }> {
      return new Promise((resolve, reject) => {
         const transaction = this.getTransaction(STORES.GLOSSARY, 'readonly');
         const store = transaction.objectStore(STORES.GLOSSARY);
-        const glossary: Record<string, string> = {};
+        const rows: Array<{
+          key: string;
+          value: string;
+          order: number | undefined;
+          cursorIdx: number;
+        }> = [];
+        let isLegacyUnordered = false;
+        let cursorIdx = 0;
+
         const request = store.openCursor();
 
         request.onsuccess = (event) => {
           const cursor = (event.target as IDBRequest<IDBCursorWithValue | null>).result;
           if (cursor) {
-            glossary[String(cursor.key)] = cursor.value as string;
+            const key = String(cursor.key);
+            const rawVal = cursor.value as StoredGlossaryRecord | null | undefined;
+            if (typeof rawVal === 'string') {
+              isLegacyUnordered = true;
+              rows.push({ key, value: rawVal, order: undefined, cursorIdx: cursorIdx++ });
+            } else if (rawVal && typeof rawVal === 'object' && typeof rawVal.value === 'string') {
+              const hasOrder = typeof rawVal.order === 'number' && Number.isFinite(rawVal.order);
+              if (!hasOrder) {
+                isLegacyUnordered = true;
+              }
+              rows.push({
+                key,
+                value: rawVal.value,
+                order: hasOrder ? rawVal.order : undefined,
+                cursorIdx: cursorIdx++
+              });
+            }
             cursor.continue();
           }
         };
 
         request.onerror = () => reject(request.error);
-        transaction.oncomplete = () => resolve(glossary);
+        transaction.oncomplete = () => {
+          rows.sort((a, b) => {
+            if (a.order !== undefined && b.order !== undefined) {
+              return a.order - b.order || a.cursorIdx - b.cursorIdx;
+            }
+            if (a.order === undefined && b.order === undefined) {
+              return a.cursorIdx - b.cursorIdx;
+            }
+            // Legacy unordered entries pre-date newly appended ordered entries
+            return a.order === undefined ? -1 : 1;
+          });
+          resolve({
+            entries: rows.map(({ key, value }) => ({ key, value })),
+            isLegacyUnordered
+          });
+        };
         transaction.onerror = () => reject(transaction.error);
      });
   }
 
-  async replaceGlossary(terms: Record<string, string>): Promise<void> {
+  async loadGlossaryEntries(): Promise<GlossaryEntry[]> {
+    const { entries } = await this.loadGlossaryEntriesWithMeta();
+    return entries;
+  }
+
+  async loadGlossary(): Promise<Record<string, string>> {
+    const entries = await this.loadGlossaryEntries();
+    return glossaryEntriesToRecord(entries);
+  }
+
+  async replaceGlossary(terms: GlossaryEntry[] | Record<string, string>): Promise<void> {
     return new Promise((resolve, reject) => {
+        const entries = this.normalizeGlossaryInput(terms);
         const transaction = this.getTransaction(STORES.GLOSSARY, 'readwrite');
         const store = transaction.objectStore(STORES.GLOSSARY);
-        
+
         store.clear();
-        Object.entries(terms).forEach(([term, translation]) => {
-            store.put(translation, term);
+        entries.forEach((entry, idx) => {
+            store.put({ value: entry.value, order: idx }, entry.key);
         });
 
         transaction.oncomplete = () => resolve();

@@ -61,7 +61,7 @@ export const TRANSLATION_PROMPT_GLOSSARY_PRINCIPLES = `
  */
 
 const GLOSSARY_XML_SPEC = `<glossary>
-按【对齐系统】仅列本段新增的“易漂移且需统一”词条，无则留空；每行一条 \`原文=译文\`（如 \`Finnegans=芬尼根\`，仅人物可标性别如 \`Alex=亚历克斯(女)\`）。
+按【对齐系统】按本段首次出现的先后顺序，仅列新增的“易漂移且需统一”词条，无则留空；每行一条 \`原文=译文\`（如 \`Finnegans=芬尼根\`，仅人物可标性别如 \`Alex=亚历克斯(女)\`）。
 </glossary>`;
 
 // 格式约束：一步法翻译 + 无术语表
@@ -113,11 +113,12 @@ ${GLOSSARY_XML_SPEC}`;
 const OPTIMIZER_CORE_RULES = `- **准入标准**（仅留“易漂移且需全书统一”词条）：
   - **保留**：易译串或需锁性别/说话人标签的人物、虚构专名/设定词、全书核心概念/特定书刊及“译或不译”分歧词。
   - **剔除**：译名唯一固定的常识专名与物质（\`New York\`、\`Wall Street Journal\`、\`heroin\`、\`DNA\`）、可随语境灵活换译的普通词（\`tradeoffs\`、\`supply chain\`、\`black market\`）及通用动/形/副/逻辑词。
-- **严禁篡改译文**：仅作筛选或去重，保留项的译文与人物 \`(男)\`/\`(女)\` 标注必须原样不变。
+- **严格保持原序**：保留项必须严格按输入中的原有先后顺序输出，严禁按字母、词性或类别重新排序（以维持前缀缓存稳定）。
+- **严禁篡改译文**：仅作筛选或去重，保留项的原文键、译文与人物 \`(男)\`/\`(女)\` 标注必须原样不变。
 - **输出格式**：每行一条 \`原文=译文\`，无解释、无 Markdown 围栏；无保留项则输出空。`;
 
 export const GLOSSARY_OPTIMIZER_ALL_PROMPT = `你是术语表审查专家。请全量清洗输入的 \`Current Glossary\`：
-- **彻底去重**：相同或仅大小写/全半角不同的原文仅保留首条。
+- **彻底去重**：相同或仅大小写/全半角不同的原文仅保留首次出现的条目及其原位置。
 ${OPTIMIZER_CORE_RULES}`;
 
 export const GLOSSARY_OPTIMIZER_INCREMENTAL_PROMPT = `你是术语表审查专家。请逐条筛选输入的 \`NEW CANDIDATES\`，仅输出合格词条：

@@ -1,8 +1,37 @@
-export const parseGlossaryStr = (str: string): Record<string, string> => {
+export interface GlossaryEntry {
+  key: string;
+  value: string;
+}
+
+/**
+ * Parses a glossary string into an ordered list of `{ key, value }` entries,
+ * strictly preserving first-appearance line order (including numeric string keys
+ * such as "1984" or "2001" that plain JS objects would hoist to the front).
+ * If the exact same key appears more than once, its value is updated in-place
+ * at its original position.
+ */
+export const parseGlossaryEntries = (str: string): GlossaryEntry[] => {
+  if (!str) return [];
   const lines = str.split('\n');
-  const result: Record<string, string> = {};
+  const entries: GlossaryEntry[] = [];
+  const indexByExactKey = new Map<string, number>();
+
+  const upsert = (key: string, value: string) => {
+    const existingIdx = indexByExactKey.get(key);
+    if (existingIdx !== undefined) {
+      entries[existingIdx] = { key, value };
+    } else {
+      indexByExactKey.set(key, entries.length);
+      entries.push({ key, value });
+    }
+  };
+
   lines.forEach(rawLine => {
-    const line = rawLine.trim();
+    const line = rawLine
+      .trim()
+      .replace(/^<\/?glossary>\s*/i, '')
+      .replace(/\s*<\/?glossary>$/i, '')
+      .trim();
     if (!line) return;
 
     // 1. Legacy structural format compatibility: SOURCE: xxx | TARGET: yyy
@@ -11,20 +40,30 @@ export const parseGlossaryStr = (str: string): Record<string, string> => {
         const key = structuralMatch[1].trim();
         const value = parseGlossaryValue(structuralMatch[2]);
         if (key && value) {
-            result[key] = value;
-            return;
+            upsert(key, value);
         }
+        return;
     }
 
-    // 2. Primary compact format: Key=Value
+    // 2. Primary compact format: Key=Value (also tolerate full-width ＝)
     const eqIndex = line.indexOf('=');
     if (eqIndex > 0) {
         const key = line.slice(0, eqIndex).trim();
         const value = parseGlossaryValue(line.slice(eqIndex + 1));
         if (key && value) {
-            result[key] = value;
-            return;
+            upsert(key, value);
         }
+        return;
+    }
+
+    const fullEqIndex = line.indexOf('＝');
+    if (fullEqIndex > 0) {
+        const key = line.slice(0, fullEqIndex).trim();
+        const value = parseGlossaryValue(line.slice(fullEqIndex + 1));
+        if (key && value) {
+            upsert(key, value);
+        }
+        return;
     }
 
     // 3. Fallback to simple format: Key: Value
@@ -33,12 +72,32 @@ export const parseGlossaryStr = (str: string): Record<string, string> => {
       const key = parts[0].trim();
       const value = parts.slice(1).join(':').trim();
       if (key && value && !key.toLowerCase().includes('source') && !key.toLowerCase().includes('target')) {
-          result[key] = value;
+          upsert(key, value);
       }
     }
   });
-  return result;
-}
+
+  return entries;
+};
+
+export const glossaryEntriesToOutputStr = (entries: GlossaryEntry[]): string => {
+  if (!entries || entries.length === 0) return '';
+  return entries
+    .map(e => `${e.key}=${e.value}`)
+    .join('\n');
+};
+
+export const glossaryEntriesToRecord = (entries: GlossaryEntry[]): Record<string, string> => {
+  const record: Record<string, string> = {};
+  for (const { key, value } of entries) {
+    record[key] = value;
+  }
+  return record;
+};
+
+export const parseGlossaryStr = (str: string): Record<string, string> => {
+  return glossaryEntriesToRecord(parseGlossaryEntries(str));
+};
 
 export const glossaryToOutputStr = (glossary: Record<string, string>, preferredOrder?: string[]): string => {
   const keys = Object.keys(glossary);
@@ -66,11 +125,240 @@ export const glossaryToOutputStr = (glossary: Record<string, string>, preferredO
   return orderedKeys
     .map(k => `${k}=${glossary[k]}`)
     .join('\n');
-}
+};
 
 export const parseGlossaryValue = (rawValue: string): string => {
   return rawValue ? rawValue.trim() : "";
 };
+
+/**
+ * Append-only chronological merge of glossary entries (case- and width-insensitive
+ * deduplication). Established entries in `base` never move, preserving Prefix Cache stability.
+ */
+export function mergeGlossaryEntries(
+  base: GlossaryEntry[],
+  delta: GlossaryEntry[]
+): GlossaryEntry[] {
+  const merged: GlossaryEntry[] = [];
+  const seenLower = new Set<string>();
+
+  for (const entry of base) {
+    const lower = normalizeGlossaryKey(entry.key);
+    if (!lower || seenLower.has(lower)) continue;
+    seenLower.add(lower);
+    merged.push({ key: entry.key, value: entry.value });
+  }
+
+  for (const entry of delta) {
+    const lower = normalizeGlossaryKey(entry.key);
+    if (!lower || seenLower.has(lower)) continue;
+    seenLower.add(lower);
+    merged.push({ key: entry.key, value: entry.value });
+  }
+
+  return merged;
+}
+
+/**
+ * Append-only chronological merge of two serialized glossary strings.
+ */
+export function mergeGlossaryStrings(base: string, delta: string): string {
+  return glossaryEntriesToOutputStr(
+    mergeGlossaryEntries(parseGlossaryEntries(base), parseGlossaryEntries(delta))
+  );
+}
+
+function stripOptimizerKeyDecorations(rawKey: string): string {
+  let cleaned = rawKey.trim();
+  // Strip leading Markdown bullets / numbered list markers (e.g. "- ", "* ", "• ", "1. ", "2) ", "3、")
+  cleaned = cleaned.replace(/^(?:[-*•·+]\s+|\d+[.)、]\s+)/, '').trim();
+  // Iteratively unwrap surrounding Markdown emphasis, inline code, or quote wrappers
+  for (let pass = 0; pass < 4; pass++) {
+    const prev = cleaned;
+    cleaned = cleaned
+      .replace(/^\*\*([\s\S]+?)\*\*$/, '$1')
+      .replace(/^__([\s\S]+?)__$/, '$1')
+      .replace(/^`([\s\S]+?)`$/, '$1')
+      .replace(/^"([\s\S]+?)"$/, '$1')
+      .replace(/^'([\s\S]+?)'$/, '$1')
+      .replace(/^“([\s\S]+?)”$/, '$1')
+      .replace(/^‘([\s\S]+?)’$/, '$1')
+      .replace(/^「([\s\S]+?)」$/, '$1')
+      .trim();
+    if (cleaned === prev) break;
+  }
+  return cleaned;
+}
+
+function extractOptimizerCandidateKeys(optimizedText: string): string[] {
+  const sanitized = optimizedText
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/<\/?glossary>/gi, '\n');
+
+  const keys: string[] = [];
+  for (const rawLine of sanitized.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || /^```/.test(line)) continue;
+
+    // 1. Legacy structural format: SOURCE: xxx | TARGET: yyy
+    const structuralMatch = line.match(/SOURCE:\s*(.*?)\s*\|\s*TARGET:\s*(.*)/i);
+    if (structuralMatch) {
+      const k = structuralMatch[1].trim();
+      const v = parseGlossaryValue(structuralMatch[2]);
+      if (k && v) keys.push(k);
+      continue;
+    }
+
+    // 2. Primary compact format: Key=Value or Key＝Value
+    const eqIndex = line.indexOf('=');
+    if (eqIndex > 0) {
+      const k = line.slice(0, eqIndex).trim();
+      const v = parseGlossaryValue(line.slice(eqIndex + 1));
+      if (k && v) keys.push(k);
+      continue;
+    }
+    const fullEqIndex = line.indexOf('＝');
+    if (fullEqIndex > 0) {
+      const k = line.slice(0, fullEqIndex).trim();
+      const v = parseGlossaryValue(line.slice(fullEqIndex + 1));
+      if (k && v) keys.push(k);
+      continue;
+    }
+
+    // 3. Arrow separator tolerance: Key -> Value / Key → Value
+    const arrowMatch = line.match(/^(.+?)\s*(?:->|→)\s*(.+)$/);
+    if (arrowMatch) {
+      const k = arrowMatch[1].trim();
+      const v = parseGlossaryValue(arrowMatch[2]);
+      if (k && v) keys.push(k);
+      continue;
+    }
+
+    // 4. Colon separator tolerance: Key: Value / Key：Value
+    const colonMatch = line.match(/^([^:：]+)[:：](.+)$/);
+    if (colonMatch) {
+      const k = colonMatch[1].trim();
+      const v = parseGlossaryValue(colonMatch[2]);
+      if (k && v && !k.toLowerCase().includes('source') && !k.toLowerCase().includes('target')) {
+        keys.push(k);
+      }
+    }
+  }
+  return keys;
+}
+
+/**
+ * Reconciles AI smart-cleanup/deduplication output against the pre-optimization
+ * chronological glossary:
+ * 1. Deduplicates case/width variants to the earliest occurrence in `originalEntries`.
+ * 2. Restores original key casing, translation, and gender tags (filter/dedupe only).
+ * 3. Deterministically enforces the original chronological first-appearance order
+ *    regardless of whether the LLM reordered, bulleted, or grouped its output.
+ * 4. Drops non-glossary commentary or hallucinated entries not present in `originalEntries`.
+ */
+export function reconcileOptimizedGlossary(
+  originalEntries: GlossaryEntry[],
+  optimizedText: string
+): GlossaryEntry[] {
+  if (originalEntries.length === 0 || !optimizedText || !optimizedText.trim()) {
+    return [];
+  }
+
+  const origByNormKey = new Map<string, { index: number; entry: GlossaryEntry }>();
+  for (let i = 0; i < originalEntries.length; i++) {
+    const entry = originalEntries[i];
+    const normKey = normalizeGlossaryKey(entry.key);
+    if (!normKey || origByNormKey.has(normKey)) continue;
+    origByNormKey.set(normKey, { index: i, entry });
+  }
+
+  const candidateKeys = extractOptimizerCandidateKeys(optimizedText);
+  const selectedNormKeys = new Set<string>();
+  const kept: Array<{ index: number; entry: GlossaryEntry }> = [];
+
+  for (const rawKey of candidateKeys) {
+    let matchedNormKey = normalizeGlossaryKey(rawKey);
+    let orig = matchedNormKey ? origByNormKey.get(matchedNormKey) : undefined;
+    if (!orig) {
+      const strippedKey = stripOptimizerKeyDecorations(rawKey);
+      const strippedNorm = normalizeGlossaryKey(strippedKey);
+      if (strippedNorm) {
+        matchedNormKey = strippedNorm;
+        orig = origByNormKey.get(strippedNorm);
+      }
+    }
+    if (!orig || !matchedNormKey || selectedNormKeys.has(matchedNormKey)) continue;
+    selectedNormKeys.add(matchedNormKey);
+    kept.push({
+      index: orig.index,
+      entry: { key: orig.entry.key, value: orig.entry.value }
+    });
+  }
+
+  kept.sort((a, b) => a.index - b.index);
+  return kept.map(item => item.entry);
+}
+
+/**
+ * Recovers chronological first-appearance order for a legacy unordered glossary
+ * (e.g. loaded from an older IndexedDB session without explicit sequence numbers)
+ * using persisted chapter `chunkGlossaries` and `glossary` snapshots in chapter order.
+ * Terms not found in chapter snapshots (e.g. manually added terms) are appended at
+ * the end preserving their existing relative order.
+ */
+export function recoverGlossaryOrderFromChapters(
+  entries: GlossaryEntry[],
+  chapters: Array<{ index?: number; chunkGlossaries?: string[]; glossary?: string }>
+): GlossaryEntry[] {
+  if (entries.length <= 1 || !chapters || chapters.length === 0) {
+    return entries.map(e => ({ ...e }));
+  }
+
+  const sortedChapters = [...chapters].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+  const rankByNormKey = new Map<string, number>();
+  let nextRank = 0;
+
+  const recordFromText = (text?: string | null) => {
+    if (!text || !text.trim()) return;
+    for (const item of parseGlossaryEntries(text)) {
+      const normKey = normalizeGlossaryKey(item.key);
+      if (normKey && !rankByNormKey.has(normKey)) {
+        rankByNormKey.set(normKey, nextRank++);
+      }
+    }
+  };
+
+  for (const ch of sortedChapters) {
+    if (ch.chunkGlossaries && ch.chunkGlossaries.length > 0) {
+      for (const chunkStr of ch.chunkGlossaries) {
+        recordFromText(chunkStr);
+      }
+    }
+    if (ch.glossary) {
+      recordFromText(ch.glossary);
+    }
+  }
+
+  if (rankByNormKey.size === 0) {
+    return entries.map(e => ({ ...e }));
+  }
+
+  return entries
+    .map((entry, idx) => ({
+      entry: { key: entry.key, value: entry.value },
+      rank: rankByNormKey.get(normalizeGlossaryKey(entry.key)),
+      idx
+    }))
+    .sort((a, b) => {
+      if (a.rank !== undefined && b.rank !== undefined) {
+        return a.rank - b.rank || a.idx - b.idx;
+      }
+      if (a.rank !== undefined) return -1;
+      if (b.rank !== undefined) return 1;
+      return a.idx - b.idx;
+    })
+    .map(item => item.entry);
+}
 
 const GENERIC_COMPONENT_WORDS = new Set([
   'about', 'administration', 'after', 'against', 'agency', 'alliance', 'american',
@@ -609,21 +897,20 @@ export function filterGlossaryDeltaByPosterior(
 ): FilterDeltaResult {
   if (!deltaGlossaryText) return { filteredText: "", originalCount: 0, filteredCount: 0 };
 
-  const deltaMap = parseGlossaryStr(deltaGlossaryText);
-  const currentMap = parseGlossaryStr(currentGlossaryText);
+  const deltaEntries = parseGlossaryEntries(deltaGlossaryText);
+  const currentEntries = parseGlossaryEntries(currentGlossaryText);
 
-  const deltaEntries = Object.entries(deltaMap);
   const originalCount = deltaEntries.length;
   if (originalCount === 0) return { filteredText: "", originalCount: 0, filteredCount: 0 };
 
   // 1. Case-insensitive & width-normalized deduplication against currentGlossary and within deltaEntries
-  const seenLowerKeys = new Set(Object.keys(currentMap).map(normalizeGlossaryKey));
-  const newCandidates: [string, string][] = [];
-  for (const [key, val] of deltaEntries) {
-    const lowerKey = normalizeGlossaryKey(key);
+  const seenLowerKeys = new Set(currentEntries.map((e) => normalizeGlossaryKey(e.key)));
+  const newCandidates: GlossaryEntry[] = [];
+  for (const entry of deltaEntries) {
+    const lowerKey = normalizeGlossaryKey(entry.key);
     if (!seenLowerKeys.has(lowerKey)) {
       seenLowerKeys.add(lowerKey);
-      newCandidates.push([key, val]);
+      newCandidates.push(entry);
     }
   }
 
@@ -651,10 +938,8 @@ export function filterGlossaryDeltaByPosterior(
   }
 
   if (lowerTargets.length === 0) {
-    const filteredMap: Record<string, string> = {};
-    for (const [k, v] of newCandidates) filteredMap[k] = v;
     return {
-      filteredText: glossaryToOutputStr(filteredMap),
+      filteredText: glossaryEntriesToOutputStr(newCandidates),
       originalCount,
       filteredCount: newCandidates.length
     };
@@ -669,11 +954,12 @@ export function filterGlossaryDeltaByPosterior(
     : [];
 
   // 3. Match each candidate against posterior text slices with tiered thresholds
-  const keptMap: Record<string, string> = {};
+  const keptEntries: GlossaryEntry[] = [];
   const matchesAnyTarget = (term: string) =>
     lowerTargets.some((target) => hasTermInLowerText(term, target));
 
-  for (const [key, val] of newCandidates) {
+  for (const entry of newCandidates) {
+    const { key, value: val } = entry;
     const normKey = normalizeTextForGlossarySearch(key).trim();
     const lowerKey = normKey.toLowerCase();
 
@@ -684,7 +970,7 @@ export function filterGlossaryDeltaByPosterior(
     if (treatAsLowercaseCommon) {
       const forms = generatePhraseSearchForms(lowerKey);
       if (countTermOccurrencesInLowerTexts(forms, lowerTargets, 3) >= 3) {
-        keptMap[key] = val;
+        keptEntries.push({ key, value: val });
       }
       continue;
     }
@@ -692,7 +978,7 @@ export function filterGlossaryDeltaByPosterior(
     const words = normKey.split(/\s+/).filter(Boolean);
 
     if (matchesAnyTarget(lowerKey)) {
-      keptMap[key] = val;
+      keptEntries.push({ key, value: val });
       continue;
     }
 
@@ -700,7 +986,7 @@ export function filterGlossaryDeltaByPosterior(
     if (ASCII_TERM_RE.test(lowerKey)) {
       const variants = generatePhraseSearchForms(lowerKey).filter((v) => v !== lowerKey);
       if (variants.some((v) => matchesAnyTarget(v))) {
-        keptMap[key] = val;
+        keptEntries.push({ key, value: val });
         continue;
       }
     }
@@ -711,11 +997,11 @@ export function filterGlossaryDeltaByPosterior(
       const { baseWithoutSuffix, firstLastPhrase, components } =
         extractDistinctiveCapitalizedComponents(normKey);
       if (baseWithoutSuffix && matchesAnyTarget(baseWithoutSuffix)) {
-        keptMap[key] = val;
+        keptEntries.push({ key, value: val });
         continue;
       }
       if (firstLastPhrase && matchesAnyTarget(firstLastPhrase)) {
-        keptMap[key] = val;
+        keptEntries.push({ key, value: val });
         continue;
       }
       const matchedComponent = components.find((comp) =>
@@ -724,7 +1010,7 @@ export function filterGlossaryDeltaByPosterior(
           : generateEnglishSearchForms(comp.toLowerCase()).some((variant) => matchesAnyTarget(variant))
       );
       if (matchedComponent) {
-        keptMap[key] = val;
+        keptEntries.push({ key, value: val });
         continue;
       }
     }
@@ -733,16 +1019,16 @@ export function filterGlossaryDeltaByPosterior(
     if (words.length >= 3) {
       const acronym = extractPhraseAcronym(normKey);
       if (acronym && hasAcronymInTargets(acronym, rawTargets, lowerTargets)) {
-        keptMap[key] = val;
+        keptEntries.push({ key, value: val });
         continue;
       }
     }
   }
 
   return {
-    filteredText: glossaryToOutputStr(keptMap),
+    filteredText: glossaryEntriesToOutputStr(keptEntries),
     originalCount,
-    filteredCount: Object.keys(keptMap).length
+    filteredCount: keptEntries.length
   };
 }
 
@@ -783,10 +1069,13 @@ export function reconcileGlossaryDrift(
     return { fixedText: translatedText, fixes: [] };
   }
 
-  const baseMap = parseGlossaryStr(currentGlossaryText);
+  const baseEntries = parseGlossaryEntries(currentGlossaryText);
   const baseLowerMap = new Map<string, string>();
-  for (const [k, v] of Object.entries(baseMap)) {
-    baseLowerMap.set(normalizeGlossaryKey(k), v);
+  for (const { key: k, value: v } of baseEntries) {
+    const norm = normalizeGlossaryKey(k);
+    if (!baseLowerMap.has(norm)) {
+      baseLowerMap.set(norm, v);
+    }
   }
 
   let fixedText = translatedText;
@@ -794,8 +1083,8 @@ export function reconcileGlossaryDrift(
 
   // Pass 1: Reconcile conflicting translations proposed in deltaGlossary
   if (deltaGlossaryText) {
-    const deltaMap = parseGlossaryStr(deltaGlossaryText);
-    for (const [key, rawNewVal] of Object.entries(deltaMap)) {
+    const deltaEntries = parseGlossaryEntries(deltaGlossaryText);
+    for (const { key, value: rawNewVal } of deltaEntries) {
       const rawOldVal = baseLowerMap.get(normalizeGlossaryKey(key));
       if (!rawOldVal) continue;
 
@@ -833,7 +1122,7 @@ export function reconcileGlossaryDrift(
   }
 
   // Pass 2: Guard against untranslated ASCII source-key leaks for established glossary entries
-  for (const [rawKey, rawEstablishedVal] of Object.entries(baseMap)) {
+  for (const { key: rawKey, value: rawEstablishedVal } of baseEntries) {
     const key = rawKey.trim();
     const establishedVal = stripTrailingParenNote(rawEstablishedVal);
     if (!key || !establishedVal) continue;
@@ -997,22 +1286,20 @@ export function filterSafeCascadeChanges(changes: TermChange[]): TermChange[] {
 export function mergeChunkGlossaries(chunkGlossaries?: (string | undefined | null)[]): string {
   if (!chunkGlossaries || chunkGlossaries.length === 0) return '';
 
-  const merged: Record<string, string> = {};
+  const merged: GlossaryEntry[] = [];
   const seenLower = new Set<string>();
-  const orderedKeys: string[] = [];
 
   for (const chunkStr of chunkGlossaries) {
     if (!chunkStr || !chunkStr.trim()) continue;
-    const parsed = parseGlossaryStr(chunkStr);
-    for (const [key, val] of Object.entries(parsed)) {
+    const parsed = parseGlossaryEntries(chunkStr);
+    for (const { key, value: val } of parsed) {
       const lowerKey = normalizeGlossaryKey(key);
       if (!seenLower.has(lowerKey)) {
         seenLower.add(lowerKey);
-        merged[key] = val;
-        orderedKeys.push(key);
+        merged.push({ key, value: val });
       }
     }
   }
 
-  return glossaryToOutputStr(merged, orderedKeys);
+  return glossaryEntriesToOutputStr(merged);
 }

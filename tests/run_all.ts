@@ -10,6 +10,7 @@ const TESTS = [
   'tests/verify_general_epub_parsing.ts',
   'tests/verify_glossary_filter.ts',
   'tests/verify_glossary_consistency.ts',
+  'tests/verify_glossary_order.ts',
   'tests/verify_glossary_sync.ts',
   'tests/verify_heti_and_pseudo_headings.ts',
   'tests/verify_language_detection.ts',

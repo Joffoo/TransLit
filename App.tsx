@@ -38,8 +38,13 @@ import { StyleClassifier } from './services/styleClassifier';
 import { AppStatus, AppConfig, Chapter, ProcessingLog, BilingualMode, BookStyleRoleMap, SessionState, TokenUsage, TokenUsageStats } from './types';
 import { RECOMMENDED_TRANSLATION_PROMPT, TWO_STEP_BASE_PROMPT } from './prompts';
 import {
-  parseGlossaryStr,
-  glossaryToOutputStr,
+  GlossaryEntry,
+  parseGlossaryEntries,
+  glossaryEntriesToOutputStr,
+  glossaryEntriesToRecord,
+  mergeGlossaryEntries,
+  reconcileOptimizedGlossary,
+  recoverGlossaryOrderFromChapters,
   parseGlossaryValue,
   safeReplaceKeyword,
   detectGlossaryChanges,
@@ -115,7 +120,7 @@ const App: React.FC = () => {
   const tokenStatsRef = useRef<TokenUsageStats>(EMPTY_TOKEN_STATS);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [liveGlossary, setLiveGlossary] = useState<string>('');
-  const [glossaryMap, setGlossaryMap] = useState<Record<string, string>>({});
+  const [glossaryEntries, setGlossaryEntries] = useState<GlossaryEntry[]>([]);
   const [glossarySearch, setGlossarySearch] = useState('');
   const [editingTermKey, setEditingTermKey] = useState<{ origKey: string; draft: string } | null>(null);
   const [isBulkEdit, setIsBulkEdit] = useState(false);
@@ -133,7 +138,7 @@ const App: React.FC = () => {
   } | null>(null);
   const missingZipInputRef = useRef<HTMLInputElement>(null);
   const isCleaningGlossaryRef = useRef(false);
-  const pendingGlossaryQueueRef = useRef<Record<string, string>[]>([]);
+  const pendingGlossaryQueueRef = useRef<GlossaryEntry[][]>([]);
   const lastDownloadUrlRef = useRef<string | null>(null);
   const progressRef = useRef<number>(0);
   const liveGlossaryRef = useRef<string>('');
@@ -165,7 +170,7 @@ const App: React.FC = () => {
   const cssContentsRef = useRef<string[]>([]);
   const activeChapterIndexRef = useRef<number>(-1);
   const activeChunkIndexRef = useRef<number>(0);
-  const savedGlossaryMapRef = useRef<Record<string, string>>({});
+  const savedGlossaryEntriesRef = useRef<GlossaryEntry[]>([]);
   const driftFixesRef = useRef<Array<{ chapterTitle: string; key: string; oldVal: string; newVal: string; count: number }>>([]);
 
   const updateProgress = (val: number) => {
@@ -176,6 +181,45 @@ const App: React.FC = () => {
   const updateLiveGlossary = (val: string) => {
     liveGlossaryRef.current = val;
     setLiveGlossary(val);
+  };
+
+  const resolvePendingTermKeyRename = (
+    entries: GlossaryEntry[],
+    pending: { origKey: string; draft: string } | null
+  ): { entries: GlossaryEntry[]; conflictKey?: string } => {
+    if (!pending) return { entries };
+    const trimmedNew = pending.draft.trim();
+    if (!trimmedNew || trimmedNew === pending.origKey) return { entries };
+    const normNew = normalizeGlossaryKey(trimmedNew);
+    const conflict = entries.some(
+      e => e.key !== pending.origKey && (e.key === trimmedNew || normalizeGlossaryKey(e.key) === normNew)
+    );
+    if (conflict) {
+      return { entries, conflictKey: trimmedNew };
+    }
+    return {
+      entries: entries.map(e =>
+        e.key === pending.origKey ? { key: trimmedNew, value: e.value } : e
+      )
+    };
+  };
+
+  const buildCleanedGlossaryEntries = (entries: GlossaryEntry[]): GlossaryEntry[] => {
+    const cleaned: GlossaryEntry[] = [];
+    const indexByExactKey = new Map<string, number>();
+    for (const entry of entries) {
+      const trimmedK = entry.key.trim();
+      const trimmedV = entry.value.trim();
+      if (!trimmedK || (!trimmedV && trimmedK.startsWith('新词条_'))) continue;
+      const existingIdx = indexByExactKey.get(trimmedK);
+      if (existingIdx !== undefined) {
+        cleaned[existingIdx] = { key: trimmedK, value: trimmedV };
+      } else {
+        indexByExactKey.set(trimmedK, cleaned.length);
+        cleaned.push({ key: trimmedK, value: trimmedV });
+      }
+    }
+    return cleaned;
   };
 
   const revokeDownloadUrl = () => {
@@ -292,11 +336,17 @@ const App: React.FC = () => {
                  footnotePoolRef.current = new FootnotePool();
                  footnotePoolRef.current.restoreFromChapters(chaptersRef.current);
                  
-                 // Restore glossary
-                const savedGlossary = await persistenceService.current.loadGlossary();
-                savedGlossaryMapRef.current = { ...savedGlossary };
-                setGlossaryMap(savedGlossary);
-                updateLiveGlossary(glossaryToOutputStr(savedGlossary));
+                 // Restore glossary (preserving chronological order; migrate legacy unordered DB if needed)
+                const { entries: loadedEntries, isLegacyUnordered } =
+                  await persistenceService.current.loadGlossaryEntriesWithMeta();
+                let restoredEntries = loadedEntries;
+                if (isLegacyUnordered && loadedEntries.length > 0) {
+                  restoredEntries = recoverGlossaryOrderFromChapters(loadedEntries, chaptersRef.current);
+                  await persistenceService.current.replaceGlossary(restoredEntries);
+                }
+                savedGlossaryEntriesRef.current = restoredEntries.map(e => ({ ...e }));
+                setGlossaryEntries(restoredEntries);
+                updateLiveGlossary(glossaryEntriesToOutputStr(restoredEntries));
                 
                  // Restore UI state, merging with LocalStorage configurations
                 const mergedRestoredConfig = { ...session.config, ...localApiConfig };
@@ -411,14 +461,38 @@ const App: React.FC = () => {
   }, [exportNotification]);
 
   const optimizeGlossary = async () => {
-    // Read fresh from database to avoid stale closures in the long-running process
-    const currentGlossaryMap = await persistenceService.current.loadGlossary();
-    const currentGlossaryText = glossaryToOutputStr(currentGlossaryMap);
-    const termCount = Object.keys(currentGlossaryMap).length;
+    if (isCleaningGlossaryRef.current) return;
+
+    // Respect unsaved UI edits (Bulk text or Table edits / pending key rename) if present;
+    // otherwise read fresh ordered entries from IndexedDB (including legacy v3 migration).
+    let currentEntries: GlossaryEntry[];
+    const pendingResolved = resolvePendingTermKeyRename(glossaryEntries, editingTermKey);
+    if (pendingResolved.conflictKey) {
+      addLog(`术语「${pendingResolved.conflictKey}」已存在，已取消覆盖。`, "error");
+    }
+    const uiEntries = isBulkEdit
+      ? parseGlossaryEntries(liveGlossaryRef.current)
+      : buildCleanedGlossaryEntries(pendingResolved.entries);
+    const hasUnsavedUiEdits =
+      glossaryEntriesToOutputStr(uiEntries) !==
+      glossaryEntriesToOutputStr(savedGlossaryEntriesRef.current);
+
+    if (hasUnsavedUiEdits) {
+      setEditingTermKey(null);
+      currentEntries = uiEntries;
+    } else {
+      const { entries: rawEntries, isLegacyUnordered } =
+        await persistenceService.current.loadGlossaryEntriesWithMeta();
+      currentEntries =
+        isLegacyUnordered && rawEntries.length > 0
+          ? recoverGlossaryOrderFromChapters(rawEntries, chaptersRef.current)
+          : rawEntries;
+    }
+
+    const currentGlossaryText = glossaryEntriesToOutputStr(currentEntries);
+    const termCount = currentEntries.length;
     if (termCount === 0) return;
 
-    if (isCleaningGlossaryRef.current) return;
-    
     setIsCleaningGlossary(true);
     isCleaningGlossaryRef.current = true;
     
@@ -427,17 +501,17 @@ const App: React.FC = () => {
         addLog(`[Agent] Smart Cleanup: Performing deep analysis on ${termCount} terms...`, 'process');
 
         const optimizedText = await aiService.optimizeGlossary(currentGlossaryText);
-        const finalMap = parseGlossaryStr(optimizedText);
-        if (termCount > 0 && Object.keys(finalMap).length === 0) {
+        const finalEntries = reconcileOptimizedGlossary(currentEntries, optimizedText);
+        if (termCount > 0 && finalEntries.length === 0) {
           addLog(`[Agent] Smart Cleanup skipped: optimizer returned empty result, preserved existing ${termCount} terms.`, 'error');
           return;
         }
-        await persistenceService.current.replaceGlossary(finalMap);
-        savedGlossaryMapRef.current = { ...finalMap };
-        setGlossaryMap(finalMap);
-        updateLiveGlossary(glossaryToOutputStr(finalMap));
+        await persistenceService.current.replaceGlossary(finalEntries);
+        savedGlossaryEntriesRef.current = finalEntries.map(e => ({ ...e }));
+        setGlossaryEntries(finalEntries);
+        updateLiveGlossary(glossaryEntriesToOutputStr(finalEntries));
         
-        const finalCount = Object.keys(finalMap).length;
+        const finalCount = finalEntries.length;
         addLog(`[Agent] Smart Cleanup finished. Result: ${finalCount} / ${termCount} terms kept.`, 'success');
     } catch (e) {
         if (e instanceof Error && e.message === "PAUSE_SIGNAL") {
@@ -446,40 +520,45 @@ const App: React.FC = () => {
         console.error("Glossary optimization failed:", e);
         addLog(`[Agent] Glossary optimization failed: ${e instanceof Error ? e.message : 'Unknown error'}`, 'error');
     } finally {
-        await flushPendingGlossaryQueue();
-        setIsCleaningGlossary(false);
+        while (pendingGlossaryQueueRef.current.length > 0) {
+          await flushPendingGlossaryQueue();
+        }
         isCleaningGlossaryRef.current = false;
+        setIsCleaningGlossary(false);
     }
   };
 
   const flushPendingGlossaryQueue = async () => {
     if (pendingGlossaryQueueRef.current.length === 0) return;
-    const queuedDeltaTerms: Record<string, string> = {};
+    const queuedDeltaEntries: GlossaryEntry[] = [];
+    const seenLower = new Set<string>();
     while (pendingGlossaryQueueRef.current.length > 0) {
-      const item = pendingGlossaryQueueRef.current.shift();
-      if (item) {
-        Object.assign(queuedDeltaTerms, item);
+      const batch = pendingGlossaryQueueRef.current.shift();
+      if (batch) {
+        for (const entry of batch) {
+          const lower = normalizeGlossaryKey(entry.key);
+          if (!lower || seenLower.has(lower)) continue;
+          seenLower.add(lower);
+          queuedDeltaEntries.push(entry);
+        }
       }
     }
-    if (Object.keys(queuedDeltaTerms).length > 0) {
+    if (queuedDeltaEntries.length > 0) {
       try {
-        const prevMap = { ...savedGlossaryMapRef.current };
-        const addedCount = await persistenceService.current.saveGlossaryTerms(queuedDeltaTerms);
+        const prevEntries = [...savedGlossaryEntriesRef.current];
+        const addedCount = await persistenceService.current.saveGlossaryTerms(queuedDeltaEntries);
         if (addedCount > 0) {
-          const masterGlossary = await persistenceService.current.loadGlossary();
-          savedGlossaryMapRef.current = { ...masterGlossary };
-          setGlossaryMap(masterGlossary);
-          updateLiveGlossary(glossaryToOutputStr(masterGlossary));
+          const masterEntries = await persistenceService.current.loadGlossaryEntries();
+          savedGlossaryEntriesRef.current = masterEntries.map(e => ({ ...e }));
+          setGlossaryEntries(masterEntries);
+          updateLiveGlossary(glossaryEntriesToOutputStr(masterEntries));
 
-          const newlyAddedFromQueue: Record<string, string> = {};
-          const prevLower = new Set(Object.keys(prevMap).map(normalizeGlossaryKey));
-          for (const [k, v] of Object.entries(masterGlossary)) {
-            if (!prevLower.has(normalizeGlossaryKey(k))) {
-              newlyAddedFromQueue[k] = v;
-            }
-          }
+          const prevLower = new Set(prevEntries.map(e => normalizeGlossaryKey(e.key)));
+          const newlyAddedFromQueue = masterEntries.filter(
+            e => !prevLower.has(normalizeGlossaryKey(e.key))
+          );
           const cascadeChanges = filterSafeCascadeChanges(
-            detectGlossaryChanges({}, newlyAddedFromQueue)
+            detectGlossaryChanges({}, glossaryEntriesToRecord(newlyAddedFromQueue))
           );
           if (cascadeChanges.length > 0) {
             const cascadedCount = await syncGlossaryChangesToChapters(
@@ -652,8 +731,8 @@ const App: React.FC = () => {
     setLogs([]);
     lastLogTimestampRef.current = 0;
     updateLiveGlossary('');
-    setGlossaryMap({});
-    savedGlossaryMapRef.current = {};
+    setGlossaryEntries([]);
+    savedGlossaryEntriesRef.current = [];
     pendingGlossaryQueueRef.current = [];
     activeChapterIndexRef.current = -1;
     activeChunkIndexRef.current = 0;
@@ -806,8 +885,8 @@ const App: React.FC = () => {
     setLogs([]);
     lastLogTimestampRef.current = 0;
     updateLiveGlossary('');
-    setGlossaryMap({});
-    savedGlossaryMapRef.current = {};
+    setGlossaryEntries([]);
+    savedGlossaryEntriesRef.current = [];
     setEditingTermKey(null);
     pendingGlossaryQueueRef.current = [];
     activeChapterIndexRef.current = -1;
@@ -888,14 +967,15 @@ const App: React.FC = () => {
         setChapters([...chaptersRef.current]);
     }
     let updated = false;
-    let currentGlossary = startGlossary;
-    const freshMap = await persistenceService.current.loadGlossary();
-    savedGlossaryMapRef.current = { ...freshMap };
-    if (!currentGlossary) {
-        currentGlossary = glossaryToOutputStr(freshMap);
-    } else {
-        const prevOrder = Object.keys(parseGlossaryStr(currentGlossary));
-        currentGlossary = glossaryToOutputStr(freshMap, prevOrder);
+    const freshEntries = await persistenceService.current.loadGlossaryEntries();
+    savedGlossaryEntriesRef.current = freshEntries.map(e => ({ ...e }));
+    const effectiveEntries =
+      pendingGlossaryQueueRef.current.length > 0
+        ? mergeGlossaryEntries(freshEntries, pendingGlossaryQueueRef.current.flat())
+        : freshEntries;
+    let currentGlossary = glossaryEntriesToOutputStr(effectiveEntries);
+    if (!currentGlossary && startGlossary) {
+      currentGlossary = startGlossary;
     }
     
     // Skip empty chapters usually
@@ -944,9 +1024,9 @@ const App: React.FC = () => {
     // --- Translation ---
     const needsProofread = config.enableProofreading && !chapter.proofreadMarkdown;
     if (chapter.translatedMarkdown && !needsProofread && forceTranslateIndices.length === 0) {
-        // Already translated (and proofread if required), just return the starting master glossary
+        // Already translated (and proofread if required), return the current ordered master glossary
         // Do NOT overwrite it with chapter.glossary, which would wipe manual edits!
-        return startGlossary;
+        return currentGlossary;
     } else {
         setStatus(AppStatus.TRANSLATING);
         setSelectedChapterIndex(index);
@@ -976,44 +1056,44 @@ const App: React.FC = () => {
                       chapter.fallbackChunks!.push(current - 1);
                   }
               } else {
-                  // Merge new glossary entries into master database
+                  // Merge new glossary entries into master database (strictly append-only chronological order)
                   if (updatedGlossary) {
-                      const deltaTerms = parseGlossaryStr(updatedGlossary);
-                      if (Object.keys(deltaTerms).length > 0) {
+                      const deltaEntries = parseGlossaryEntries(updatedGlossary);
+                      if (deltaEntries.length > 0) {
                           const existingLower = new Set([
-                              ...Object.keys(savedGlossaryMapRef.current).map(normalizeGlossaryKey),
-                              ...Object.keys(parseGlossaryStr(currentGlossary)).map(normalizeGlossaryKey)
+                              ...savedGlossaryEntriesRef.current.map(e => normalizeGlossaryKey(e.key)),
+                              ...parseGlossaryEntries(currentGlossary).map(e => normalizeGlossaryKey(e.key))
                           ]);
-                          const trulyNewTerms: Record<string, string> = {};
-                          for (const [k, v] of Object.entries(deltaTerms)) {
-                              const lower = normalizeGlossaryKey(k);
-                              if (!existingLower.has(lower)) {
-                                  existingLower.add(lower);
-                                  trulyNewTerms[k] = v;
-                              }
+                          const trulyNewEntries: GlossaryEntry[] = [];
+                          for (const entry of deltaEntries) {
+                              const lower = normalizeGlossaryKey(entry.key);
+                              if (!lower || existingLower.has(lower)) continue;
+                              existingLower.add(lower);
+                              trulyNewEntries.push(entry);
                           }
 
-                          if (Object.keys(trulyNewTerms).length > 0) {
+                          if (trulyNewEntries.length > 0) {
                               if (isCleaningGlossaryRef.current) {
-                                  pendingGlossaryQueueRef.current.push(trulyNewTerms);
+                                  pendingGlossaryQueueRef.current.push(trulyNewEntries);
                                   // Keep in-memory currentGlossary up-to-date so subsequent chunks don't lose newly discovered terms
-                                  const mergedMap = { ...parseGlossaryStr(currentGlossary), ...trulyNewTerms };
-                                  const prevOrder = Object.keys(parseGlossaryStr(currentGlossary));
-                                  currentGlossary = glossaryToOutputStr(mergedMap, prevOrder);
+                                  const mergedEntries = mergeGlossaryEntries(
+                                      parseGlossaryEntries(currentGlossary),
+                                      trulyNewEntries
+                                  );
+                                  currentGlossary = glossaryEntriesToOutputStr(mergedEntries);
                               } else {
-                                  const addedCount = await persistenceService.current.saveGlossaryTerms(trulyNewTerms);
+                                  const addedCount = await persistenceService.current.saveGlossaryTerms(trulyNewEntries);
                                   if (addedCount > 0) {
-                                      const masterGlossary = await persistenceService.current.loadGlossary();
-                                      savedGlossaryMapRef.current = { ...masterGlossary };
-                                      setGlossaryMap(masterGlossary);
-                                      const prevOrder = Object.keys(parseGlossaryStr(currentGlossary));
-                                      const fullStr = glossaryToOutputStr(masterGlossary, prevOrder);
+                                      const masterEntries = await persistenceService.current.loadGlossaryEntries();
+                                      savedGlossaryEntriesRef.current = masterEntries.map(e => ({ ...e }));
+                                      setGlossaryEntries(masterEntries);
+                                      const fullStr = glossaryEntriesToOutputStr(masterEntries);
                                       updateLiveGlossary(fullStr);
                                       currentGlossary = fullStr;
 
                                       // 自动将新发现的术语回溯替换到前文已译章节/分片中的未译英文残留
                                       const cascadeChanges = filterSafeCascadeChanges(
-                                          detectGlossaryChanges({}, trulyNewTerms)
+                                          detectGlossaryChanges({}, glossaryEntriesToRecord(trulyNewEntries))
                                       );
                                       if (cascadeChanges.length > 0) {
                                           const cascadedCount = await syncGlossaryChangesToChapters(
@@ -1204,9 +1284,9 @@ const App: React.FC = () => {
             activeChapter.chunkGlossaries = new Array(sourceChunks.length).fill('');
         }
         
-        // Fetch the latest master glossary from DB for accurate retry
-        const freshMap = await persistenceService.current.loadGlossary();
-        const runningGlossary = glossaryToOutputStr(freshMap);
+        // Fetch the latest ordered master glossary from DB for accurate retry
+        const freshEntries = await persistenceService.current.loadGlossaryEntries();
+        const runningGlossary = glossaryEntriesToOutputStr(freshEntries);
         
         await processChapter(index, aiService, activeChapters, effectiveSystemInstruction, failedIndices, runningGlossary);
         
@@ -1348,13 +1428,16 @@ const App: React.FC = () => {
   };
 
   const handleUpdateGlossary = async (newText: string) => {
-    const newMap = parseGlossaryStr(newText);
-    const changes = detectGlossaryChanges(savedGlossaryMapRef.current, newMap);
-    await persistenceService.current.replaceGlossary(newMap);
-    const updated = await persistenceService.current.loadGlossary();
-    setGlossaryMap(updated);
-    updateLiveGlossary(glossaryToOutputStr(updated));
-    savedGlossaryMapRef.current = { ...updated };
+    const newEntries = parseGlossaryEntries(newText);
+    const changes = detectGlossaryChanges(
+      glossaryEntriesToRecord(savedGlossaryEntriesRef.current),
+      glossaryEntriesToRecord(newEntries)
+    );
+    await persistenceService.current.replaceGlossary(newEntries);
+    const updated = await persistenceService.current.loadGlossaryEntries();
+    setGlossaryEntries(updated);
+    updateLiveGlossary(glossaryEntriesToOutputStr(updated));
+    savedGlossaryEntriesRef.current = updated.map(e => ({ ...e }));
 
     if (changes.length > 0) {
       const replacedCount = await syncGlossaryChangesToChapters(changes);
@@ -1367,62 +1450,82 @@ const App: React.FC = () => {
 
   const commitTermKeyRename = (oldKey: string, rawNewKey: string) => {
     setEditingTermKey(null);
-    const trimmedNew = rawNewKey.trim();
-    if (!trimmedNew || trimmedNew === oldKey) return;
-    if (glossaryMap[trimmedNew] !== undefined) {
-      addLog(`术语「${trimmedNew}」已存在，已取消覆盖。`, "error");
+    const { entries: nextEntries, conflictKey } = resolvePendingTermKeyRename(
+      glossaryEntries,
+      { origKey: oldKey, draft: rawNewKey }
+    );
+    if (conflictKey) {
+      addLog(`术语「${conflictKey}」已存在，已取消覆盖。`, "error");
       return;
     }
-    const newMap: Record<string, string> = {};
-    for (const [k, v] of Object.entries(glossaryMap)) {
-      newMap[k === oldKey ? trimmedNew : k] = v;
+    if (nextEntries === glossaryEntries) return;
+    setGlossaryEntries(nextEntries);
+    updateLiveGlossary(glossaryEntriesToOutputStr(nextEntries));
+  };
+
+  const handleToggleBulkEdit = () => {
+    if (isBulkEdit) {
+      const parsed = parseGlossaryEntries(liveGlossaryRef.current);
+      setEditingTermKey(null);
+      setGlossaryEntries(parsed);
+      setIsBulkEdit(false);
+    } else {
+      const { entries: resolved, conflictKey } = resolvePendingTermKeyRename(glossaryEntries, editingTermKey);
+      if (conflictKey) {
+        addLog(`术语「${conflictKey}」已存在，已取消覆盖。`, "error");
+      }
+      setEditingTermKey(null);
+      setGlossaryEntries(resolved);
+      updateLiveGlossary(glossaryEntriesToOutputStr(resolved));
+      setIsBulkEdit(true);
     }
-    setGlossaryMap(newMap);
-    updateLiveGlossary(glossaryToOutputStr(newMap));
   };
 
   const handleDeleteTerm = (key: string) => {
     if (editingTermKey?.origKey === key) {
       setEditingTermKey(null);
     }
-    const newMap = { ...glossaryMap };
-    delete newMap[key];
-    setGlossaryMap(newMap);
-    updateLiveGlossary(glossaryToOutputStr(newMap));
+    const nextEntries = glossaryEntries.filter(e => e.key !== key);
+    setGlossaryEntries(nextEntries);
+    updateLiveGlossary(glossaryEntriesToOutputStr(nextEntries));
   };
 
   const handleAddTerm = () => {
-     let index = Object.keys(glossaryMap).length + 1;
+     const existingKeys = new Set(glossaryEntries.map(e => e.key));
+     let index = glossaryEntries.length + 1;
      let newKey = `新词条_${index}`;
-     while (glossaryMap[newKey] !== undefined) {
+     while (existingKeys.has(newKey)) {
        index++;
        newKey = `新词条_${index}`;
      }
-     const newMap = { ...glossaryMap, [newKey]: "" };
-     setGlossaryMap(newMap);
-     updateLiveGlossary(glossaryToOutputStr(newMap));
+     const nextEntries = [...glossaryEntries, { key: newKey, value: "" }];
+     setGlossaryEntries(nextEntries);
+     updateLiveGlossary(glossaryEntriesToOutputStr(nextEntries));
   };
 
   const handleUpdateTermTarget = (key: string, newTarget: string) => {
-    const newMap = { ...glossaryMap, [key]: newTarget };
-    setGlossaryMap(newMap);
-    updateLiveGlossary(glossaryToOutputStr(newMap));
+    const nextEntries = glossaryEntries.map(e =>
+      e.key === key ? { key: e.key, value: newTarget } : e
+    );
+    setGlossaryEntries(nextEntries);
+    updateLiveGlossary(glossaryEntriesToOutputStr(nextEntries));
   };
 
   const handleSaveGlossaryMap = async () => {
-    const cleanMap: Record<string, string> = {};
-    for (const [k, v] of Object.entries(glossaryMap)) {
-      const trimmedK = k.trim();
-      const trimmedV = v.trim();
-      if (trimmedK && (trimmedV || !trimmedK.startsWith('新词条_'))) {
-        cleanMap[trimmedK] = trimmedV;
-      }
+    const { entries: resolved, conflictKey } = resolvePendingTermKeyRename(glossaryEntries, editingTermKey);
+    if (conflictKey) {
+      addLog(`术语「${conflictKey}」已存在，已取消覆盖。`, "error");
     }
-    const changes = detectGlossaryChanges(savedGlossaryMapRef.current, cleanMap);
-    await persistenceService.current.replaceGlossary(cleanMap);
-    setGlossaryMap(cleanMap);
-    updateLiveGlossary(glossaryToOutputStr(cleanMap));
-    savedGlossaryMapRef.current = { ...cleanMap };
+    setEditingTermKey(null);
+    const cleanEntries = buildCleanedGlossaryEntries(resolved);
+    const changes = detectGlossaryChanges(
+      glossaryEntriesToRecord(savedGlossaryEntriesRef.current),
+      glossaryEntriesToRecord(cleanEntries)
+    );
+    await persistenceService.current.replaceGlossary(cleanEntries);
+    setGlossaryEntries(cleanEntries);
+    updateLiveGlossary(glossaryEntriesToOutputStr(cleanEntries));
+    savedGlossaryEntriesRef.current = cleanEntries.map(e => ({ ...e }));
 
     if (changes.length > 0) {
       const replacedCount = await syncGlossaryChangesToChapters(changes);
@@ -1434,23 +1537,29 @@ const App: React.FC = () => {
   };
 
   const handleManualSyncGlossary = async () => {
-    const cleanMap: Record<string, string> = {};
-    for (const [k, v] of Object.entries(glossaryMap)) {
-      const trimmedK = k.trim();
-      const trimmedV = v.trim();
-      if (trimmedK && (trimmedV || !trimmedK.startsWith('新词条_'))) {
-        cleanMap[trimmedK] = trimmedV;
+    let cleanEntries: GlossaryEntry[];
+    if (isBulkEdit) {
+      cleanEntries = parseGlossaryEntries(liveGlossaryRef.current);
+    } else {
+      const { entries: resolved, conflictKey } = resolvePendingTermKeyRename(glossaryEntries, editingTermKey);
+      if (conflictKey) {
+        addLog(`术语「${conflictKey}」已存在，已取消覆盖。`, "error");
       }
+      setEditingTermKey(null);
+      cleanEntries = buildCleanedGlossaryEntries(resolved);
     }
-    const changes = detectGlossaryChanges(savedGlossaryMapRef.current, cleanMap);
+    const changes = detectGlossaryChanges(
+      glossaryEntriesToRecord(savedGlossaryEntriesRef.current),
+      glossaryEntriesToRecord(cleanEntries)
+    );
     if (changes.length === 0) {
       addLog("[术语联动] 当前术语表未检测到新旧译法变更。如需按最新术语重写上下文，可在章节列表中点击「重新翻译」。", "info");
       return;
     }
-    await persistenceService.current.replaceGlossary(cleanMap);
-    setGlossaryMap(cleanMap);
-    updateLiveGlossary(glossaryToOutputStr(cleanMap));
-    savedGlossaryMapRef.current = { ...cleanMap };
+    await persistenceService.current.replaceGlossary(cleanEntries);
+    setGlossaryEntries(cleanEntries);
+    updateLiveGlossary(glossaryEntriesToOutputStr(cleanEntries));
+    savedGlossaryEntriesRef.current = cleanEntries.map(e => ({ ...e }));
     const count = await syncGlossaryChangesToChapters(changes);
     addLog(`[术语联动] 手动触发联动完成，共更新已译章节 ${count} 处。`, "success");
   };
@@ -1973,11 +2082,11 @@ const App: React.FC = () => {
       }
 
       let runningGlossary = "";
-      // Load current master glossary from persistence
-      const initialGlossaryFromDb = await persistenceService.current.loadGlossary();
-      savedGlossaryMapRef.current = { ...initialGlossaryFromDb };
-      setGlossaryMap(initialGlossaryFromDb);
-      runningGlossary = glossaryToOutputStr(initialGlossaryFromDb);
+      // Load current ordered master glossary from persistence
+      const initialGlossaryEntries = await persistenceService.current.loadGlossaryEntries();
+      savedGlossaryEntriesRef.current = initialGlossaryEntries.map(e => ({ ...e }));
+      setGlossaryEntries(initialGlossaryEntries);
+      runningGlossary = glossaryEntriesToOutputStr(initialGlossaryEntries);
       updateLiveGlossary(runningGlossary);
 
       isPauseRequested.current = false; // Reset pause flag
@@ -2538,7 +2647,7 @@ const App: React.FC = () => {
                         }`}
                     >
                         <Tag className="w-3.5 h-3.5" />
-                        全书术语库 ({Object.keys(glossaryMap).length})
+                        全书术语库 ({glossaryEntries.length})
                     </button>
                 )}
              </div>
@@ -3175,7 +3284,7 @@ const App: React.FC = () => {
                                 {isCleaningGlossary ? '正在净化...' : '智能去重净化'}
                             </button>
                              <button 
-                                onClick={() => setIsBulkEdit(!isBulkEdit)}
+                                onClick={handleToggleBulkEdit}
                                 className="text-[10px] px-3 py-1.5 rounded-none font-mono tracking-widest uppercase text-neutral-700 hover:text-black bg-white hover:bg-neutral-100 border border-neutral-300 transition-all"
                             >
                                 {isBulkEdit ? '切换表格' : '切换纯文本'}
@@ -3205,7 +3314,7 @@ const App: React.FC = () => {
                                     <div className="p-3 border-b border-neutral-200 bg-neutral-50 flex flex-wrap items-center justify-between gap-3">
                                         <div className="flex items-center gap-2 text-[10px] font-mono text-neutral-600 uppercase tracking-widest">
                                             <Tag className="w-3 h-3 text-neutral-500" />
-                                            <span>{Object.keys(glossaryMap).length} 条术语</span>
+                                            <span>{glossaryEntries.length} 条术语 · 按出现顺序</span>
                                         </div>
                                         <div className="relative flex-1 max-w-xs">
                                             <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-neutral-400" />
@@ -3230,16 +3339,15 @@ const App: React.FC = () => {
                                                 </tr>
                                             </thead>
                                             <tbody className="divide-y divide-neutral-200">
-                                                {Object.entries(glossaryMap)
-                                                    .filter(([key, value]) => {
+                                                {glossaryEntries
+                                                    .filter(({ key, value }) => {
                                                         if (!glossarySearch.trim()) return true;
                                                         const q = normalizeGlossaryKey(glossarySearch);
                                                         const parsed = parseGlossaryValue(value);
                                                         return normalizeGlossaryKey(key).includes(q) || 
                                                                normalizeGlossaryKey(parsed).includes(q);
                                                     })
-                                                    .sort(([a], [b]) => a.localeCompare(b))
-                                                    .map(([key, value]) => {
+                                                    .map(({ key, value }) => {
                                                         const parsed = parseGlossaryValue(value);
                                                         const isEditingKey = editingTermKey?.origKey === key;
                                                         return (
@@ -3288,7 +3396,7 @@ const App: React.FC = () => {
                                                             </tr>
                                                         );
                                                     })}
-                                                {Object.keys(glossaryMap).length === 0 && (
+                                                {glossaryEntries.length === 0 && (
                                                     <tr>
                                                         <td colSpan={3} className="p-8 text-center text-neutral-400 font-mono text-sm">
                                                             暂无术语
@@ -3403,7 +3511,7 @@ const App: React.FC = () => {
 
                 {/* Chapters & Glossary Stats */}
                 <span className="text-[11px] text-neutral-400 shrink-0 hidden sm:inline">
-                  {chapters.filter(c => c.translatedMarkdown || isChapterNonTranslatable(c, config.smartSkip)).length}/{chapters.length} 章 · 术语 {Object.keys(glossaryMap).length} 条
+                  {chapters.filter(c => c.translatedMarkdown || isChapterNonTranslatable(c, config.smartSkip)).length}/{chapters.length} 章 · 术语 {glossaryEntries.length} 条
                 </span>
 
                 {tokenStats.requestCount > 0 && (
