@@ -1,6 +1,11 @@
 import { FootnoteNode } from '../types';
 import { parseHtmlDocument } from '../utils/domAdapter';
 import { decodeBlocksFromWire } from '../utils/blockProtocol';
+import {
+  BLOCK_LEVEL_TAGS,
+  NON_TRANSLATABLE_SUBTREE_TAGS,
+  buildBlockDescendantIndex
+} from '../utils/htmlStructure';
 import { DomMutationEngine } from './domMutationEngine';
 
 export const FOOTNOTE_SLOT_PROMPT_CONSTRAINT =
@@ -653,45 +658,24 @@ export class FootnotePool {
   }
 
   private collectTopLevelBlockElements(container: Element): Element[] {
-    const BLOCK_TAGS = new Set([
-      'P',
-      'BLOCKQUOTE',
-      'TABLE',
-      'H1',
-      'H2',
-      'H3',
-      'H4',
-      'H5',
-      'H6',
-      'UL',
-      'OL',
-      'PRE',
-      'HR',
-      'FIGURE'
-    ]);
+    const blockDescIndex = buildBlockDescendantIndex(container);
     const result: Element[] = [];
 
-    for (const child of Array.from(container.children)) {
-      if (BLOCK_TAGS.has(child.tagName)) {
-        result.push(child);
-      } else if (
-        child.tagName === 'DIV' ||
-        child.tagName === 'SECTION' ||
-        child.tagName === 'ARTICLE' ||
-        child.tagName === 'MAIN' ||
-        child.tagName === 'HEADER'
-      ) {
-        const nested = this.collectTopLevelBlockElements(child);
-        if (nested.length > 0) {
-          result.push(...nested);
-        } else if ((child.textContent || '').trim().length > 0) {
+    const walk = (el: Element) => {
+      for (const child of Array.from(el.children)) {
+        const tag = (child.tagName || '').toUpperCase();
+        if (NON_TRANSLATABLE_SUBTREE_TAGS.has(tag)) continue;
+        if (tag === 'PRE' || tag === 'HR' || tag === 'FIGURE') {
+          result.push(child);
+        } else if (blockDescIndex.has(child)) {
+          walk(child);
+        } else if (BLOCK_LEVEL_TAGS.has(tag) || (child.textContent || '').trim().length > 0) {
           result.push(child);
         }
-      } else if ((child.textContent || '').trim().length > 0) {
-        result.push(child);
       }
-    }
+    };
 
+    walk(container);
     return result;
   }
 

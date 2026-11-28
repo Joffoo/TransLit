@@ -35,6 +35,7 @@ import {
   serializeXmlNode
 } from '../utils/domAdapter';
 import { isChapterNonTranslatable, buildPosteriorTextForChapter } from '../utils/chapterUtils';
+import { ALL_KNOWN_HTML_TAG_NAMES } from '../utils/htmlStructure';
 
 const FORBIDDEN_HARDCODED_HEX = [
   '#2e5b60',
@@ -884,15 +885,17 @@ async function cmdInspect(positionals: string[], flags: Record<string, string | 
       applyChineseTypography: true
     });
     const mutDoc = parseHtmlDocument(mutated);
-    const leafEls = mutDoc.body ? engine.collectTranslatableLeafElements(mutDoc.body) : [];
-    const analysis = resolveLeafHeadingAnalysis(
-      parseHtmlDocument(inspectChapter.content).body
-        ? engine.collectTranslatableLeafElements(parseHtmlDocument(inspectChapter.content).body!)
-        : [],
-      cssProfiles,
-      localRoles
-    );
-    const headingLvls = Array.from(analysis.headingLevels.values());
+    const leafEls = mutDoc.body ? engine.collectTranslatableLeafElements(mutDoc.body, cssProfiles) : [];
+    const origDoc = parseHtmlDocument(inspectChapter.content);
+    if (origDoc.body) {
+      engine.decomposeBlockquotes(origDoc.body);
+      engine.normalizeMixedContentContainers(origDoc.body);
+    }
+    const origLeafEls = origDoc.body
+      ? engine.collectTranslatableLeafElements(origDoc.body, cssProfiles)
+      : [];
+    const analysis = resolveLeafHeadingAnalysis(origLeafEls, cssProfiles, localRoles);
+    const headingLvls = origLeafEls.map((el) => analysis.headingLevels.get(el) || 0);
 
     blockDetails = extracted.blocks.map((b, idx) => {
       const mutEl = leafEls[idx];
@@ -1145,6 +1148,10 @@ async function runEpubQualityAudit(
     }
 
     // Check non-aside visible blocks for leaked footnotes, replacement chars, & untranslated English
+    const escapedHtmlTagRe = new RegExp(
+      `<\\/?(?:${Array.from(ALL_KNOWN_HTML_TAG_NAMES).join('|')})\\b[^>]*>`,
+      'i'
+    );
     const knownFnIds = Object.keys(ch.internalizedFootnotes || {});
     for (const block of Array.from(
       outDoc.body.querySelectorAll('p, h1, h2, h3, h4, h5, h6, li, blockquote, div')
@@ -1160,7 +1167,7 @@ async function runEpubQualityAudit(
 
       corruptedChars += countReplacementChars(text);
 
-      if (/<\/?(?:a|img|span|div|p|font|strong|em)\b[^>]*>/i.test(text)) {
+      if (escapedHtmlTagRe.test(text)) {
         escapedHtmlLeaks.push({ fileName: ch.fileName, snippet: text.slice(0, 100) });
       }
 

@@ -279,8 +279,18 @@ const App: React.FC = () => {
             if (savedChapters.length > 0) {
                 // Invalidate / refresh legacy Turndown-polluted payloads
                 let anyRefreshed = false;
+                const restoredCssProfiles =
+                  session.cssContents && session.cssContents.length > 0
+                    ? parseEpubCssProfiles(session.cssContents)
+                    : undefined;
                 for (const ch of savedChapters) {
-                    if (epubService.current.refreshChapterPayloadIfNeeded(ch)) {
+                    if (
+                      epubService.current.refreshChapterPayloadIfNeeded(
+                        ch,
+                        restoredCssProfiles,
+                        session.bookStyleRoles
+                      )
+                    ) {
                         anyRefreshed = true;
                         persistenceService.current.updateChapter(ch).catch(() => {});
                     }
@@ -962,7 +972,15 @@ const App: React.FC = () => {
     startGlossary: string = ""
   ): Promise<string> => {
     const chapter = chapters[index];
-    if (epubService.current.refreshChapterPayloadIfNeeded(chapter)) {
+    const activeCssProfiles =
+      cssContentsRef.current.length > 0 ? parseEpubCssProfiles(cssContentsRef.current) : undefined;
+    if (
+      epubService.current.refreshChapterPayloadIfNeeded(
+        chapter,
+        activeCssProfiles,
+        bookStyleRolesRef.current
+      )
+    ) {
         await persistenceService.current.updateChapter(chapter);
         setChapters([...chaptersRef.current]);
     }
@@ -1214,7 +1232,15 @@ const App: React.FC = () => {
         const aiService = new AiService(config, recordTokenUsage);
         const chapters = chaptersRef.current;
         const chapter = chapters[index];
-        if (epubService.current.refreshChapterPayloadIfNeeded(chapter)) {
+        const activeCssProfiles =
+          cssContentsRef.current.length > 0 ? parseEpubCssProfiles(cssContentsRef.current) : undefined;
+        if (
+          epubService.current.refreshChapterPayloadIfNeeded(
+            chapter,
+            activeCssProfiles,
+            bookStyleRolesRef.current
+          )
+        ) {
             await persistenceService.current.updateChapter(chapter);
             setChapters([...chaptersRef.current]);
         }

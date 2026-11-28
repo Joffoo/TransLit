@@ -12,6 +12,11 @@ import {
   parseEpubCssProfiles,
   resolveElementVisualStyle
 } from './domMutationEngine';
+import {
+  LEAF_CANDIDATE_TAGS,
+  NON_TRANSLATABLE_SUBTREE_TAGS,
+  buildBlockDescendantIndex
+} from '../utils/htmlStructure';
 
 export interface BookStyleCandidate {
   cls: string;
@@ -56,26 +61,6 @@ const INLINE_STYLE_ROLES: ReadonlySet<InlineStyleRole> = new Set<InlineStyleRole
   'ignore'
 ]);
 
-const BLOCK_CENSUS_TAGS = new Set([
-  'P',
-  'DIV',
-  'BLOCKQUOTE',
-  'LI',
-  'TD',
-  'TH',
-  'DT',
-  'DD',
-  'FIGCAPTION',
-  'CAPTION',
-  'PRE',
-  'H1',
-  'H2',
-  'H3',
-  'H4',
-  'H5',
-  'H6'
-]);
-
 const INLINE_CENSUS_TAGS = new Set([
   'SPAN',
   'B',
@@ -87,28 +72,6 @@ const INLINE_CENSUS_TAGS = new Set([
   'CITE',
   'CODE',
   'U'
-]);
-
-const STRUCTURAL_CONTAINER_TAGS = new Set([
-  'BODY',
-  'SECTION',
-  'ARTICLE',
-  'MAIN',
-  'HEADER',
-  'FOOTER',
-  'NAV',
-  'ASIDE',
-  'FIGURE',
-  'IMG',
-  'SVG',
-  'HR',
-  'TABLE',
-  'THEAD',
-  'TBODY',
-  'TR',
-  'OL',
-  'UL',
-  'DL'
 ]);
 
 const SKIP_CLASS_NAME_RE =
@@ -245,19 +208,16 @@ export function buildBookStyleCensus(
 
     // Collect block leaf elements in order (exclude wrappers that contain nested block tags)
     const leafBlocks: Element[] = [];
+    const blockDescIndex = buildBlockDescendantIndex(doc.body);
     const walkBlocks = (el: Element) => {
       const tag = (el.tagName || '').toUpperCase();
-      if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'SVG' || tag === 'MATH') return;
+      if (NON_TRANSLATABLE_SUBTREE_TAGS.has(tag)) return;
       const children = Array.from(el.children);
-      const hasBlockChild = children.some((c) => {
-        const ct = (c.tagName || '').toUpperCase();
-        return BLOCK_CENSUS_TAGS.has(ct) || STRUCTURAL_CONTAINER_TAGS.has(ct);
-      });
-      if (hasBlockChild) {
+      if (blockDescIndex.has(el)) {
         for (const child of children) walkBlocks(child);
         return;
       }
-      if (BLOCK_CENSUS_TAGS.has(tag)) {
+      if (LEAF_CANDIDATE_TAGS.has(tag)) {
         const txt = (el.textContent || '').replace(/[\s\u00a0]+/g, ' ').trim();
         if (txt.length > 0) leafBlocks.push(el);
       } else {

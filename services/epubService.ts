@@ -1537,14 +1537,23 @@ export class EpubService {
    * Refreshes a chapter's translatable payload if it contains legacy Turndown markdown artifacts
    * (such as `![img]` or `>` blockquote tokens), re-extracting clean payload via DomMutationEngine.
    */
-  public refreshChapterPayloadIfNeeded(chapter: Chapter): boolean {
+  public refreshChapterPayloadIfNeeded(
+    chapter: Chapter,
+    cssProfiles?: Map<string, CssClassProfile>,
+    bookStyleRoles?: BookStyleRoleMap
+  ): boolean {
     if (!chapter.content) return false;
     const combinedMarkdown = `${chapter.markdown || ''}\n${chapter.slottedMarkdown || ''}`;
-    const hasLegacyArtifacts = /!\[.*?\]\(.*?\)|<img\b|<ruby\b|<rt\b|^[ \t]*>+|>>+/m.test(combinedMarkdown);
+    const hasLegacyArtifacts =
+      /!\[.*?\]\(.*?\)|<img\b|<ruby\b|<rt\b|<\/?(?:hgroup|h[1-6]|p|div|section|article|aside|header|footer|nav|figure|figcaption|blockquote|ul|ol|li|dl|dt|dd|table|tr|td|th|pre|details|summary|address|main|center|wbr|pagebreak)\b|^[ \t]*>+|>>+/im.test(
+        combinedMarkdown
+      );
     if (hasLegacyArtifacts) {
       const res = this.domMutationEngine.extractTranslatablePayload(
         chapter.content,
-        chapter.internalizedFootnotes
+        chapter.internalizedFootnotes,
+        cssProfiles,
+        bookStyleRoles
       );
       if (res.payloadText) {
         chapter.markdown = res.payloadText;
@@ -1652,7 +1661,7 @@ export class EpubService {
         if (navFile) {
           const navHtml = await navFile.async('string');
           const navDoc = parseHtmlDocument(navHtml);
-          const links = navDoc.querySelectorAll('nav[epub\\:type="toc"] a, nav#toc a');
+          const links = navDoc.querySelectorAll('nav[epub\\:type~="toc"] a, nav[role="doc-toc"] a, nav#toc a');
           links.forEach((a) => {
             const label = getCleanElementText(a).trim();
             const src = a.getAttribute('href');
@@ -1767,7 +1776,7 @@ export class EpubService {
         };
 
         if (headings.length > 0) {
-          const headTitle = getCleanElementText(headings[0]).trim();
+          const headTitle = getCleanElementText(headings[0]).replace(/[\s\u00a0]+/g, ' ').trim();
           if (!isGarbageTitle(headTitle)) {
             title = headTitle;
           }
@@ -2078,6 +2087,7 @@ export class EpubService {
       if (hasSource) {
         sourceHtml = await marked(pair.sourceContent!, { breaks: true, gfm: true });
         sourceHtml = sourceHtml.trim()
+          .replace(/&nbsp;/gi, '&#160;')
           .replace(/<br>/g, '<br/>')
           .replace(/<hr>/g, '<hr/>')
           .replace(/<img([^>]*)>/g, (m, attrs) => attrs.trim().endsWith('/') ? m : `<img${attrs}/>`);
@@ -2090,6 +2100,7 @@ export class EpubService {
           pair.type !== 'code' ? applyHetiTextTypography(pair.targetContent!) : pair.targetContent!;
         targetHtml = await marked(targetMdForRender, { breaks: true, gfm: true });
         targetHtml = targetHtml.trim()
+          .replace(/&nbsp;/gi, '&#160;')
           .replace(/<br>/g, '<br/>')
           .replace(/<hr>/g, '<hr/>')
           .replace(/<img([^>]*)>/g, (m, attrs) => attrs.trim().endsWith('/') ? m : `<img${attrs}/>`);
@@ -2280,6 +2291,7 @@ export class EpubService {
     });
 
     htmlBody = htmlBody
+      .replace(/&nbsp;/gi, '&#160;')
       .replace(/<br>/g, '<br/>')
       .replace(/<hr>/g, '<hr/>')
       .replace(/<img([^>]*)>/g, (match, attrs) =>

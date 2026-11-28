@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
-import { DomMutationEngine, parseEpubCssProfiles } from '../services/domMutationEngine';
+import {
+  DomMutationEngine,
+  computeStructuralTreeDiff,
+  parseEpubCssProfiles,
+  sanitizeInlineXhtmlForLeaf
+} from '../services/domMutationEngine';
 import { EpubService, buildAdaptiveChineseTypographyCss } from '../services/epubService';
-import { expandXhtmlSelfClosingTags } from '../utils/domAdapter';
+import { expandXhtmlSelfClosingTags, parseHtmlDocument, parseXmlDocument } from '../utils/domAdapter';
 
 async function runTests() {
   const engine = new DomMutationEngine();
@@ -152,6 +157,207 @@ async function runTests() {
     assert.ok(mutated.includes('看将棋电视转播时'), 'Body text must be mutated in-place');
 
     console.log('[OK] Slice 4: Self-closing <script .../> & <style .../> expanded without swallowing <body>');
+  }
+
+  // Slice 5: EPUB3 <hgroup> + <span role="doc-pagebreak"/> + display:block heading spans (Why We Click pattern)
+  {
+    const whyCss = `
+      span.CN { font-size: 1.083em; display: block; text-align: center; }
+      span.CT { font-size: 1.667em; display: block; text-align: center; }
+      span.CST { font-size: 0.979em; display: block; text-align: center; }
+      .eSANS_Gotham_Black_B_11 { font-weight: bold; }
+      p.CO { font-size: 0.979em; text-indent: 0em; }
+    `;
+    const profiles = parseEpubCssProfiles([whyCss]);
+    assert.equal(profiles.get('CN')?.inlineDisplayBlock, true, 'span.CN must have inlineDisplayBlock=true');
+    assert.equal(profiles.get('CT')?.inlineDisplayBlock, true, 'span.CT must have inlineDisplayBlock=true');
+    assert.equal(profiles.get('CST')?.inlineDisplayBlock, true, 'span.CST must have inlineDisplayBlock=true');
+    assert.notEqual(profiles.get('CO')?.inlineDisplayBlock, true, 'p.CO must not set inlineDisplayBlock');
+
+    const whyCh2Xhtml = `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<body epub:type="bodymatter">
+  <section aria-labelledby="ch2" epub:type="chapter" role="doc-chapter">
+    <span aria-label="16" epub:type="pagebreak" id="pg_16" role="doc-pagebreak"/>
+    <hgroup>
+      <h1 class="CHAPTER" id="ch2">
+        <span class="CN"><a href="contents.xhtml#c_ch2"><span class="eSANS_Gotham_Black_B_11">2</span></a></span>
+        <span class="CT"><a href="contents.xhtml#c_ch2"><span class="eSANS_Gotham_Book_11">Love at First Sync</span></a></span>
+        <span class="CST" role="doc-subtitle"><a href="contents.xhtml#c_ch2">THE HIDDEN DYNAMICS OF ATTRACTION</a></span>
+      </h1>
+    </hgroup>
+    <p class="CO">If there were a Hollywood Walk of Fame for matchmaking, Yaacov Deyo would certainly have a star.</p>
+  </section>
+</body>
+</html>`;
+
+    const extracted = engine.extractTranslatablePayload(whyCh2Xhtml, {}, profiles);
+    assert.equal(extracted.blocks.length, 2, `Expected 2 blocks (h1 + p.CO), got ${extracted.blocks.length}`);
+    assert.equal(extracted.blocks[0].tagName, 'h1');
+    assert.equal(extracted.blocks[0].isHeadingLike, true);
+    assert.equal(
+      extracted.blocks[0].slottedText,
+      '# <b>2</b><br/>Love at First Sync<br/>THE HIDDEN DYNAMICS OF ATTRACTION'
+    );
+    assert.ok(
+      !extracted.payloadText.includes('<hgroup') && !extracted.payloadText.includes('<h1'),
+      `Payload must not leak <hgroup> or <h1>, got:\n${extracted.payloadText}`
+    );
+
+    const zhTranslation = [
+      '<b>2</b><br/>一拍即合的爱<br/>吸引力的隐秘动力学',
+      '如果好莱坞星光大道专为媒人设一颗星，雅各夫·德约必定名列其中。'
+    ].join('\n\n');
+
+    const mutatedMono = engine.mutateDomInPlace(whyCh2Xhtml, zhTranslation, {
+      cssProfiles: profiles,
+      bilingualMode: 'none'
+    });
+    assert.ok(!mutatedMono.includes('&lt;hgroup') && !mutatedMono.includes('&lt;h1'), 'Monolingual output must not escape <hgroup>/<h1>');
+    assert.equal(
+      parseXmlDocument(`<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body>${mutatedMono}</body></html>`).getElementsByTagName('parsererror').length,
+      0,
+      'Monolingual output must be valid XML'
+    );
+    assert.equal(computeStructuralTreeDiff(whyCh2Xhtml, mutatedMono).diffCount, 0, 'Monolingual Tree-Diff must be 0');
+    const monoDoc = parseHtmlDocument(mutatedMono);
+    assert.equal(monoDoc.querySelector('hgroup > h1.CHAPTER#ch2')?.getAttribute('data-translit-role'), 'h1');
+    assert.ok(monoDoc.querySelector('h1.CHAPTER')?.innerHTML.includes('一拍即合的爱'));
+
+    const mutatedBi = engine.mutateDomInPlace(whyCh2Xhtml, zhTranslation, {
+      cssProfiles: profiles,
+      bilingualMode: 'source_first'
+    });
+    assert.ok(!mutatedBi.includes('&lt;hgroup') && !mutatedBi.includes('&lt;h1'), 'Bilingual output must not escape <hgroup>/<h1>');
+    const biDoc = parseHtmlDocument(mutatedBi);
+    assert.equal(biDoc.querySelectorAll('h1.CHAPTER').length, 2, 'Bilingual mode must clone h1.CHAPTER cleanly inside hgroup');
+
+    console.log('[OK] Slice 5: <hgroup> + display:block heading spans (Why We Click pattern)');
+  }
+
+  // Slice 6: Life in Perspective <aside><hgroup> & inline display:block span.heading_breakf
+  {
+    const lipCss = `
+      span.heading_breakf { display: block; }
+    `;
+    const profiles = parseEpubCssProfiles([lipCss]);
+    const lipXhtml = `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<body>
+  <section>
+    <h1 class="h1fm" id="prologue_hd">PROLOGUE <span class="heading_breakf">THE DAY I REWROTE MY FUTURE</span></h1>
+    <aside class="box">
+      <hgroup>
+        <h2 class="boxh"><span class="bline">Your Preparation Checklist:</span></h2>
+        <p class="boxsubh" role="doc-subtitle"><span aria-label="76" id="page_76" role="doc-pagebreak"/>What Needs to Be in Place</p>
+      </hgroup>
+      <p class="boxno">The following checklist summarizes what we covered.</p>
+    </aside>
+  </section>
+</body>
+</html>`;
+
+    const extracted = engine.extractTranslatablePayload(lipXhtml, {}, profiles);
+    assert.equal(extracted.blocks.length, 4, `Expected 4 blocks (h1, h2, p.boxsubh, p.boxno), got ${extracted.blocks.length}`);
+    assert.equal(extracted.blocks[0].slottedText, '# PROLOGUE<br/>THE DAY I REWROTE MY FUTURE');
+    assert.equal(extracted.blocks[1].slottedText, '## Your Preparation Checklist:');
+    assert.equal(extracted.blocks[2].slottedText, 'What Needs to Be in Place');
+    assert.equal(extracted.blocks[3].slottedText, 'The following checklist summarizes what we covered.');
+
+    const mutated = engine.mutateDomInPlace(
+      lipXhtml,
+      '序幕<br/>我改写未来的那一天\n\n你的准备清单：\n\n开始前需要就绪的事项\n\n以下清单总结了我们讨论的内容。',
+      { cssProfiles: profiles }
+    );
+    assert.equal(computeStructuralTreeDiff(lipXhtml, mutated).diffCount, 0, 'Aside + hgroup Tree-Diff must be 0');
+    console.log('[OK] Slice 6: <aside><hgroup> & display:block heading_breakf');
+  }
+
+  // Slice 7: Unknown wrapper element containing blocks & symmetric inline tag purification
+  {
+    const wrapperAndInlineXhtml = `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+  <section>
+    <custom-epub-wrapper>
+      <h2>Section Title</h2>
+      <p>Visit us<wbr/><pagebreak id="pb_1"/> for <cite>Hamlet</cite>, <del>old</del><ins>new</ins>, <kbd>Ctrl+C</kbd>, and <time datetime="2026-01-01">today</time>.</p>
+    </custom-epub-wrapper>
+  </section>
+</body>
+</html>`;
+    const extracted = engine.extractTranslatablePayload(wrapperAndInlineXhtml);
+    assert.equal(extracted.blocks.length, 2, 'Unknown wrapper containing blocks must descend cleanly to <h2> and <p>');
+    assert.equal(extracted.blocks[0].slottedText, '## Section Title');
+    assert.equal(
+      extracted.blocks[1].slottedText,
+      'Visit us for <i>Hamlet</i>, oldnew, <code>Ctrl+C</code>, and today.'
+    );
+    const mutated = engine.mutateDomInPlace(
+      wrapperAndInlineXhtml,
+      '章节标题\n\n请访问我们以查看<i>《哈姆雷特》</i>、新旧版本、<code>Ctrl+C</code> 以及今日内容。'
+    );
+    assert.equal(computeStructuralTreeDiff(wrapperAndInlineXhtml, mutated).diffCount, 0);
+    assert.ok(!mutated.includes('&lt;wbr') && !mutated.includes('&lt;pagebreak') && !mutated.includes('&lt;cite'));
+
+    // Output defense-in-depth in sanitizeInlineXhtmlForLeaf: strips leaked HTML shells while preserving literal math/internal brackets
+    assert.equal(
+      sanitizeInlineXhtmlForLeaf('<hgroup><h1 class="CHAPTER" id="ch2">2 Love at First Sync</h1></hgroup><wbr/>'),
+      '2 Love at First Sync'
+    );
+    assert.equal(
+      sanitizeInlineXhtmlForLeaf('First line<br class="calibre19"/>Second line'),
+      'First line<br/>Second line'
+    );
+    assert.equal(
+      sanitizeInlineXhtmlForLeaf('x < y & <internal>'),
+      'x &lt; y &amp; &lt;internal&gt;'
+    );
+
+    // refreshChapterPayloadIfNeeded auto-heals legacy cached chapters containing <hgroup> / <h1>
+    const epubService = new EpubService();
+    const staleChapter = {
+      id: 'ch2',
+      index: 2,
+      fileName: 'xhtml/chapter2.xhtml',
+      title: '2. Love at First Sync',
+      content: `<html xmlns="http://www.w3.org/1999/xhtml"><body><section><hgroup><h1 class="CHAPTER" id="ch2">2 Love at First Sync</h1></hgroup><p>Body text.</p></section></body></html>`,
+      markdown: '<hgroup> <h1 class="CHAPTER" id="ch2"> 2 Love at First Sync </h1> </hgroup>\n\nBody text.',
+      slottedMarkdown: '<hgroup> <h1 class="CHAPTER" id="ch2"> 2 Love at First Sync </h1> </hgroup>\n\nBody text.'
+    };
+    assert.equal(epubService.refreshChapterPayloadIfNeeded(staleChapter), true);
+    assert.equal(staleChapter.markdown, '# 2 Love at First Sync\n\nBody text.');
+    console.log('[OK] Slice 7: Unknown block wrapper, inline purification, sanitizer defense, and cache refresh');
+  }
+
+  // Slice 8: Strict XML serialization safety for &nbsp; / \u00a0 and HTML5 void tags (<col/>, <wbr/>)
+  {
+    const nbspAndVoidXhtml = `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<body>
+  <p>Alpha\u00a0Beta and Gamma.</p>
+  <table class="data"><colgroup><col class="c1"/></colgroup><tbody><tr><td class="bor1">\u00a0</td></tr></tbody></table>
+</body>
+</html>`;
+
+    const extracted = engine.extractTranslatablePayload(nbspAndVoidXhtml);
+    assert.ok(extracted.blocks.length >= 1, 'Expected paragraph block extracted');
+    const mutated = engine.mutateDomInPlace(nbspAndVoidXhtml, '阿尔法\u00a0贝塔与伽马。', {
+      bilingualMode: 'none'
+    });
+    assert.ok(!/&nbsp;/i.test(mutated), `Output must not contain &nbsp; undefined XML entity:\n${mutated}`);
+    assert.ok(mutated.includes('&#160;'), `Output should use numeric &#160; for non-breaking spaces:\n${mutated}`);
+    assert.ok(/<col class="c1"\/>/.test(mutated), `Output must keep <col/> self-closed for XHTML:\n${mutated}`);
+
+    const xmlDoc = parseXmlDocument(
+      `<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body>${mutated}</body></html>`
+    );
+    assert.equal(
+      xmlDoc.getElementsByTagName('parsererror').length,
+      0,
+      `Strict XML parse failed on &nbsp;/<col/> output:\n${mutated}`
+    );
+    console.log('[OK] Slice 8: Strict XML safety for &nbsp; (&#160;) and void tags (<col/>)');
   }
 }
 

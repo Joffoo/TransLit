@@ -12,6 +12,17 @@ import {
   validateAndRepairSlots
 } from './footnotePool';
 import { stripBlockProtocolMarkers } from '../utils/blockProtocol';
+import {
+  BLOCK_LEVEL_TAGS,
+  LEAF_CANDIDATE_TAGS,
+  NON_TRANSLATABLE_SUBTREE_TAGS,
+  EMPTY_MARKER_VOID_TAGS,
+  FOOTNOTE_INLINE_TAG_SET,
+  LEAF_INLINE_TAG_SET,
+  STRIP_SHELL_HTML_TAGS,
+  buildBlockDescendantIndex,
+  isBlockBoundaryElement
+} from '../utils/htmlStructure';
 
 export interface TranslatableDomBlock {
   index: number;
@@ -47,6 +58,7 @@ export interface CssClassProfile {
   hasBorder?: boolean;
   hasBorderBottom?: boolean;
   isInlineOnly?: boolean;
+  inlineDisplayBlock?: boolean;
   displayNone?: boolean;
 }
 
@@ -66,6 +78,7 @@ export interface ElementVisualStyle {
   letterSpacingEm?: number;
   hasBorder?: boolean;
   hasBorderBottom?: boolean;
+  displayBlock?: boolean;
   displayNone?: boolean;
 }
 
@@ -86,61 +99,6 @@ export interface StructuralTreeDiffResult {
   diffCount: number;
   diffs: string[];
 }
-
-const LEAF_CANDIDATE_TAGS = new Set([
-  'P',
-  'H1',
-  'H2',
-  'H3',
-  'H4',
-  'H5',
-  'H6',
-  'LI',
-  'TD',
-  'TH',
-  'DT',
-  'DD',
-  'FIGCAPTION',
-  'BLOCKQUOTE',
-  'PRE',
-  'DIV'
-]);
-
-const BLOCK_LEVEL_TAGS = new Set([
-  'P',
-  'H1',
-  'H2',
-  'H3',
-  'H4',
-  'H5',
-  'H6',
-  'UL',
-  'OL',
-  'LI',
-  'DL',
-  'DT',
-  'DD',
-  'TABLE',
-  'THEAD',
-  'TBODY',
-  'TFOOT',
-  'TR',
-  'TD',
-  'TH',
-  'BLOCKQUOTE',
-  'PRE',
-  'DIV',
-  'SECTION',
-  'ARTICLE',
-  'ASIDE',
-  'MAIN',
-  'HEADER',
-  'FOOTER',
-  'NAV',
-  'FIGURE',
-  'FIGCAPTION',
-  'HR'
-]);
 
 export const EXCLUDED_PSEUDO_HEADING_CLASSES =
   /(?:^|[\s_-])(?:caption|fig|figcaption|bib|toc|copyright|epigraph|dedication|footnote|endnote|noteref|note|quote|blockquote|bq|extract|ext|callout|box|sidebar|plaque|inscription|verse|poem|poetry|letter|motto|sign|signature|attribution|credit|dropcap|stickupcap|initial|firstletter)\d*(?:$|[\s_-])/i;
@@ -344,8 +302,13 @@ function parseCssDeclarations(declText: string): Partial<ElementVisualStyle> {
       case 'display': {
         if (rawVal === 'none') {
           result.displayNone = true;
-        } else if (result.displayNone) {
-          result.displayNone = false;
+          result.displayBlock = false;
+        } else {
+          if (result.displayNone) {
+            result.displayNone = false;
+          }
+          result.displayBlock =
+            rawVal === 'block' || rawVal === 'list-item' || rawVal === 'flex' || rawVal === 'grid';
         }
         break;
       }
@@ -394,7 +357,8 @@ export function parseEpubCssProfiles(cssTexts: string[]): Map<string, CssClassPr
   const mergeProfile = (
     className: string,
     parsed: Partial<ElementVisualStyle>,
-    isInlineSelectorTag: boolean
+    isInlineSelectorTag: boolean,
+    targetTag: string
   ) => {
     const existing = profiles.get(className) || { className };
     if (parsed.fontSizeEm !== undefined) existing.fontSizeEm = parsed.fontSizeEm;
@@ -413,6 +377,9 @@ export function parseEpubCssProfiles(cssTexts: string[]): Map<string, CssClassPr
     if (parsed.hasBorder !== undefined) existing.hasBorder = parsed.hasBorder;
     if (parsed.hasBorderBottom !== undefined) existing.hasBorderBottom = parsed.hasBorderBottom;
     if (parsed.displayNone !== undefined) existing.displayNone = parsed.displayNone;
+    if (parsed.displayBlock !== undefined && (!targetTag || isInlineSelectorTag)) {
+      existing.inlineDisplayBlock = parsed.displayBlock;
+    }
     if (isInlineSelectorTag) {
       if (existing.isInlineOnly === undefined) existing.isInlineOnly = true;
     } else {
@@ -460,7 +427,7 @@ export function parseEpubCssProfiles(cssTexts: string[]): Map<string, CssClassPr
 
         for (const clsToken of classMatches) {
           const className = clsToken.slice(1);
-          mergeProfile(className, parsed, isInlineSelectorTag);
+          mergeProfile(className, parsed, isInlineSelectorTag, targetTag);
         }
       }
     }
@@ -658,12 +625,22 @@ function isEmptyPagebreakAnchor(node: Node): node is Element {
   if (node.nodeType !== 1) return false;
   const el = node as Element;
   const tag = (el.tagName || '').toUpperCase();
+  if (EMPTY_MARKER_VOID_TAGS.has(tag)) {
+    const text = (el.textContent || '').replace(/\u00a0/g, '').trim();
+    return text.length === 0 && !el.querySelector('img, svg, image');
+  }
   if (tag !== 'A' && tag !== 'SPAN') return false;
   if (isNoterefAnchor(el)) return false;
   const text = (el.textContent || '').replace(/\u00a0/g, '').trim();
   if (text.length > 0) return false;
   if (el.querySelector('img, svg, image')) return false;
-  return Boolean(el.getAttribute('id') || el.getAttribute('name') || el.getAttribute('role'));
+  return Boolean(
+    el.getAttribute('id') ||
+      el.getAttribute('name') ||
+      el.getAttribute('role') ||
+      el.getAttribute('epub:type') ||
+      el.getAttribute('aria-label')
+  );
 }
 
 function isStructuralTitleTable(table: Element): boolean {
@@ -1354,7 +1331,13 @@ export function computeStructuralTreeDiff(
     return Array.from(parent.children).filter((child) => !isFootnotePopupElement(child));
   };
 
-  const compareElements = (a: Element, b: Element, path: string) => {
+  const compareElements = (
+    a: Element,
+    b: Element,
+    path: string,
+    blockDescA: Set<Element>,
+    blockDescB: Set<Element>
+  ) => {
     const tagA = a.tagName.toUpperCase();
     const tagB = b.tagName.toUpperCase();
     if (tagA !== tagB) {
@@ -1388,8 +1371,8 @@ export function computeStructuralTreeDiff(
 
     // For translatable leaf blocks, we have already verified tag, class, and id on the block container.
     // Text formatting internals (e.g. <i>, <b>, <span>) vary with target translation and are not structural skeleton diffs.
-    const isLeafA = LEAF_CANDIDATE_TAGS.has(tagA) && !childrenA.some((c) => BLOCK_LEVEL_TAGS.has(c.tagName.toUpperCase()));
-    const isLeafB = LEAF_CANDIDATE_TAGS.has(tagB) && !childrenB.some((c) => BLOCK_LEVEL_TAGS.has(c.tagName.toUpperCase()));
+    const isLeafA = LEAF_CANDIDATE_TAGS.has(tagA) && !blockDescA.has(a);
+    const isLeafB = LEAF_CANDIDATE_TAGS.has(tagB) && !blockDescB.has(b);
     if (isLeafA && isLeafB) {
       return;
     }
@@ -1402,7 +1385,7 @@ export function computeStructuralTreeDiff(
     }
 
     for (let i = 0; i < childrenA.length; i++) {
-      compareElements(childrenA[i], childrenB[i], `${path}/${tagA}[${i}]`);
+      compareElements(childrenA[i], childrenB[i], `${path}/${tagA}[${i}]`, blockDescA, blockDescB);
     }
   };
 
@@ -1419,7 +1402,9 @@ export function computeStructuralTreeDiff(
   }
 
   if (origDoc.body && mutDoc.body) {
-    compareElements(origDoc.body, mutDoc.body, '/BODY');
+    const blockDescA = buildBlockDescendantIndex(origDoc.body, isFootnotePopupElement);
+    const blockDescB = buildBlockDescendantIndex(mutDoc.body, isFootnotePopupElement);
+    compareElements(origDoc.body, mutDoc.body, '/BODY', blockDescA, blockDescB);
   }
 
   return {
@@ -1428,48 +1413,8 @@ export function computeStructuralTreeDiff(
   };
 }
 
-const FOOTNOTE_INLINE_TAG_SET = new Set([
-  'i',
-  'em',
-  'b',
-  'strong',
-  'sup',
-  'sub',
-  'u',
-  'small',
-  'code'
-]);
-
-const LEAF_INLINE_TAG_SET = new Set([
-  ...FOOTNOTE_INLINE_TAG_SET,
-  'span'
-]);
-
-const STRIP_SHELL_HTML_TAGS = new Set([
-  'a',
-  'font',
-  'big',
-  'center',
-  'cite',
-  'q',
-  'abbr',
-  'mark',
-  'del',
-  'ins',
-  's',
-  'strike',
-  'div',
-  'p',
-  'section',
-  'article',
-  'header',
-  'footer',
-  'nav',
-  'aside'
-]);
-
 interface InlineXhtmlSanitizeOptions {
-  allowedTags: Set<string>;
+  allowedTags: ReadonlySet<string>;
   allowClassAttr: boolean;
   stripUnmatchedAllowedTags: boolean;
   stripDisallowedHtmlShells?: boolean;
@@ -1546,7 +1491,7 @@ function sanitizeInlineXhtmlCore(text: string, options: InlineXhtmlSanitizeOptio
       tokens.push({ kind: 'text', raw: safeAmps.slice(lastIndex, match.index) });
     }
     const rawTag = match[0];
-    if (/^<\s*br\s*\/?\s*>$/i.test(rawTag)) {
+    if (/^<\s*br(?:\s+[^<>]*)?\/?\s*>$/i.test(rawTag)) {
       tokens.push({ kind: 'tag', raw: rawTag, tagName: 'br', isVoidBr: true, valid: true });
     } else if (options.allowSafeVoidImg && /^<\s*img\b[^>]*>$/i.test(rawTag)) {
       const attrsMatch = rawTag.match(/^<\s*img\b([\s\S]*?)\/?\s*>$/i);
@@ -1838,8 +1783,24 @@ export class DomMutationEngine {
       'UL',
       'OL',
       'DL',
-      'NAV'
+      'NAV',
+      'HGROUP',
+      'H1',
+      'H2',
+      'H3',
+      'H4',
+      'H5',
+      'H6',
+      'P',
+      'PRE',
+      'FIGURE',
+      'DETAILS',
+      'SUMMARY',
+      'FIELDSET',
+      'COLGROUP'
     ]);
+
+    const blockDescIndex = buildBlockDescendantIndex(root, isFootnotePopupElement);
 
     for (const container of Array.from(root.querySelectorAll('*'))) {
       if (!container.isConnected) continue;
@@ -1850,9 +1811,7 @@ export class DomMutationEngine {
       if (SKIP_MIXED_CONTAINER_TAGS.has(tag)) continue;
 
       const childElements = Array.from(container.children).filter((c) => !isFootnotePopupElement(c));
-      const hasBlockChild = childElements.some((c) =>
-        BLOCK_LEVEL_TAGS.has((c.tagName || '').toUpperCase())
-      );
+      const hasBlockChild = childElements.some((c) => isBlockBoundaryElement(c, blockDescIndex));
       if (!hasBlockChild) continue;
 
       const childNodes = Array.from(container.childNodes);
@@ -1867,6 +1826,7 @@ export class DomMutationEngine {
           if (n.nodeType === 1) {
             if (isEmptyPagebreakAnchor(n)) return false;
             const elem = n as Element;
+            if (EMPTY_MARKER_VOID_TAGS.has((elem.tagName || '').toUpperCase())) return false;
             if (isNoterefAnchor(elem)) return true;
             if ((elem.tagName || '').toUpperCase() === 'IMG') return true;
             return (elem.textContent || '').replace(/[\s\u00a0]+/g, '').length > 0;
@@ -1889,7 +1849,7 @@ export class DomMutationEngine {
       for (const node of childNodes) {
         if (
           node.nodeType === 1 &&
-          BLOCK_LEVEL_TAGS.has(((node as Element).tagName || '').toUpperCase())
+          isBlockBoundaryElement(node as Element, blockDescIndex)
         ) {
           flushInlineRun();
         } else {
@@ -2054,12 +2014,13 @@ export class DomMutationEngine {
     cssProfiles?: Map<string, CssClassProfile>
   ): Element[] {
     const results: Element[] = [];
+    const blockDescIndex = buildBlockDescendantIndex(body, isFootnotePopupElement);
 
     const walk = (el: Element) => {
       if (isFootnotePopupElement(el)) return;
 
       const tag = (el.tagName || '').toUpperCase();
-      if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'SVG' || tag === 'MATH') {
+      if (NON_TRANSLATABLE_SUBTREE_TAGS.has(tag)) {
         return;
       }
 
@@ -2069,11 +2030,7 @@ export class DomMutationEngine {
       }
 
       const childElements = Array.from(el.children).filter((c) => !isFootnotePopupElement(c));
-      const hasBlockChild = childElements.some((c) =>
-        BLOCK_LEVEL_TAGS.has((c.tagName || '').toUpperCase())
-      );
-
-      if (hasBlockChild) {
+      if (blockDescIndex.has(el)) {
         for (const child of childElements) {
           walk(child);
         }
@@ -2146,189 +2103,274 @@ export class DomMutationEngine {
     // 2. If the remaining content is a single outer wrapper element (<small>, <span>) with no sibling text,
     // we can unwrap its children during serialization and mutate inside that wrapper on write-back!
     const targetContainer = this.resolveInnerWrapperTarget(clone);
-
-    // 3. Replace footnote anchors with __FN_REF_{id}__ text nodes
-    const anchors = Array.from(targetContainer.querySelectorAll('a'));
-    for (const a of anchors) {
-      if (isNoterefAnchor(a)) {
-        const dataFnId = a.getAttribute('data-fn-id');
-        const href = a.getAttribute('href') || '';
-        let rawId = dataFnId || '';
-        if (!rawId && href.startsWith('#')) {
-          rawId = href.slice(1).replace(/^fn-/, '');
-        }
-        if (rawId) {
-          const slot = createFootnoteSlot(rawId);
-          const textNode = targetContainer.ownerDocument!.createTextNode(slot);
-          a.replaceWith(textNode);
-        }
-      }
-    }
-
-    // 3.5. Replace inline <img> elements with opaque __IMG_{idx}__ slots so LLM never sees or corrupts image URLs/attributes
     const inlineImageHtmls: string[] = [];
-    for (const img of Array.from(targetContainer.querySelectorAll('img'))) {
-      if (img.classList.contains('qqreader-footnote')) continue;
-      const imgOuter = (img.cloneNode(true) as Element).outerHTML.replace(
-        /<img\b([^>]*)>/gi,
-        (m, attrs) => (attrs.trim().endsWith('/') ? m : `<img${attrs}/>`)
-      );
-      const imgIdx = inlineImageHtmls.length;
-      inlineImageHtmls.push(imgOuter);
-      img.replaceWith(targetContainer.ownerDocument!.createTextNode(`__IMG_${imgIdx}__`));
-    }
-
-    // 3.6. Replace inline <math> elements with opaque __MATH_{idx}__ slots so LLM never corrupts or escapes MathML tags
     const inlineMathHtmls: string[] = [];
-    for (const mathEl of Array.from(targetContainer.querySelectorAll('math'))) {
-      if (mathEl.parentElement?.closest('math')) continue;
-      const mathOuter = (mathEl.cloneNode(true) as Element).outerHTML;
-      const mathIdx = inlineMathHtmls.length;
-      inlineMathHtmls.push(mathOuter);
-      mathEl.replaceWith(targetContainer.ownerDocument!.createTextNode(`__MATH_${mathIdx}__`));
-    }
 
-    // 4. Strip mid-paragraph invisible pagebreak spans and empty metadata anchors so the LLM never sees or hallucinates on them
-    const inlineMetaNodes = Array.from(targetContainer.querySelectorAll('a, span'));
-    for (const metaNode of inlineMetaNodes) {
-      if (isEmptyPagebreakAnchor(metaNode)) {
-        metaNode.remove();
+    if (targetContainer.firstElementChild) {
+      // 3. Replace footnote anchors with __FN_REF_{id}__ text nodes
+      const anchors = Array.from(targetContainer.querySelectorAll('a'));
+      for (const a of anchors) {
+        if (isNoterefAnchor(a)) {
+          const dataFnId = a.getAttribute('data-fn-id');
+          const href = a.getAttribute('href') || '';
+          let rawId = dataFnId || '';
+          if (!rawId && href.startsWith('#')) {
+            rawId = href.slice(1).replace(/^fn-/, '');
+          }
+          if (rawId) {
+            const slot = createFootnoteSlot(rawId);
+            const textNode = targetContainer.ownerDocument!.createTextNode(slot);
+            a.replaceWith(textNode);
+          }
+        }
       }
-    }
 
-    // 4.5. Unwrap remaining non-noteref inline <a> elements (e.g. doc-backlink / internal cross-refs)
-    // so raw `<a class="..." href="..." role="doc-backlink">` never leaks to the LLM;
-    // any non-noteref `<a id="...">` anchors are preserved in-place on write-back.
-    for (const anchor of Array.from(targetContainer.querySelectorAll('a')).reverse()) {
-      if (!anchor.parentNode || isNoterefAnchor(anchor)) continue;
-      anchor.replaceWith(...Array.from(anchor.childNodes));
-    }
-
-    // 4.6. Strip Japanese/CJK <ruby> furigana annotations (<rt>, <rp>, <rtc>) and unwrap <ruby>/<rb>
-    // so phonetic readings never leak into translatable LLM payloads or break glossary matching.
-    for (const rubyMeta of Array.from(targetContainer.querySelectorAll('rt, rp, rtc'))) {
-      rubyMeta.remove();
-    }
-    for (const rubyWrap of Array.from(targetContainer.querySelectorAll('ruby, rb')).reverse()) {
-      if (!rubyWrap.parentNode) continue;
-      rubyWrap.replaceWith(...Array.from(rubyWrap.childNodes));
-    }
-
-    // 5. Purify remaining <span> elements (deepest-first) using CSS profiles + AI style roles:
-    // dropcap / ignore / empty / decorative / body / smallcaps spans are unwrapped or removed;
-    // emphasis / strong / code spans are normalized to bare <i> / <b> / <code> tags.
-    const doc = targetContainer.ownerDocument!;
-    const spans = Array.from(targetContainer.querySelectorAll('span')).reverse();
-    for (const span of spans) {
-      if (!span.parentNode || span.getAttribute('data-translit-role') === 'footnote-popup') {
-        continue;
+      // 3.5. Replace inline <img> elements with opaque __IMG_{idx}__ slots so LLM never sees or corrupts image URLs/attributes
+      for (const img of Array.from(targetContainer.querySelectorAll('img'))) {
+        if (img.classList.contains('qqreader-footnote')) continue;
+        const imgOuter = (img.cloneNode(true) as Element).outerHTML.replace(
+          /<img\b([^>]*)>/gi,
+          (m, attrs) => (attrs.trim().endsWith('/') ? m : `<img${attrs}/>`)
+        );
+        const imgIdx = inlineImageHtmls.length;
+        inlineImageHtmls.push(imgOuter);
+        img.replaceWith(targetContainer.ownerDocument!.createTextNode(`__IMG_${imgIdx}__`));
       }
-      if (span.childNodes.length === 0) {
-        const emptyClsTokens = (span.getAttribute('class') || '').split(/\s+/).filter(Boolean);
-        let hasHorizontalSpacing = false;
-        if (cssProfiles) {
-          for (const c of emptyClsTokens) {
-            const prof = cssProfiles.get(c);
+
+      // 3.6. Replace inline <math> elements with opaque __MATH_{idx}__ slots so LLM never corrupts or escapes MathML tags
+      for (const mathEl of Array.from(targetContainer.querySelectorAll('math'))) {
+        if (mathEl.parentElement?.closest('math')) continue;
+        const mathOuter = (mathEl.cloneNode(true) as Element).outerHTML;
+        const mathIdx = inlineMathHtmls.length;
+        inlineMathHtmls.push(mathOuter);
+        mathEl.replaceWith(targetContainer.ownerDocument!.createTextNode(`__MATH_${mathIdx}__`));
+      }
+
+      // 4. Strip mid-paragraph invisible pagebreak spans and empty metadata anchors so the LLM never sees or hallucinates on them
+      const inlineMetaNodes = Array.from(targetContainer.querySelectorAll('a, span'));
+      for (const metaNode of inlineMetaNodes) {
+        if (isEmptyPagebreakAnchor(metaNode)) {
+          metaNode.remove();
+        }
+      }
+
+      // 4.5. Unwrap remaining non-noteref inline <a> elements (e.g. doc-backlink / internal cross-refs)
+      // so raw `<a class="..." href="..." role="doc-backlink">` never leaks to the LLM;
+      // any non-noteref `<a id="...">` anchors are preserved in-place on write-back.
+      for (const anchor of Array.from(targetContainer.querySelectorAll('a')).reverse()) {
+        if (!anchor.parentNode || isNoterefAnchor(anchor)) continue;
+        anchor.replaceWith(...Array.from(anchor.childNodes));
+      }
+
+      // 4.6. Strip Japanese/CJK <ruby> furigana annotations (<rt>, <rp>, <rtc>) and unwrap <ruby>/<rb>
+      // so phonetic readings never leak into translatable LLM payloads or break glossary matching.
+      for (const rubyMeta of Array.from(targetContainer.querySelectorAll('rt, rp, rtc'))) {
+        rubyMeta.remove();
+      }
+      for (const rubyWrap of Array.from(targetContainer.querySelectorAll('ruby, rb')).reverse()) {
+        if (!rubyWrap.parentNode) continue;
+        rubyWrap.replaceWith(...Array.from(rubyWrap.childNodes));
+      }
+
+      // 5. Purify remaining <span> elements (deepest-first) using CSS profiles + AI style roles:
+      // dropcap / ignore / empty / decorative / body / smallcaps spans are unwrapped or removed;
+      // emphasis / strong / code spans are normalized to bare <i> / <b> / <code> tags.
+      const doc = targetContainer.ownerDocument!;
+      const spans = Array.from(targetContainer.querySelectorAll('span')).reverse();
+      for (const span of spans) {
+        if (!span.parentNode || span.getAttribute('data-translit-role') === 'footnote-popup') {
+          continue;
+        }
+        if (span.childNodes.length === 0) {
+          const emptyClsTokens = (span.getAttribute('class') || '').split(/\s+/).filter(Boolean);
+          let hasHorizontalSpacing = false;
+          if (cssProfiles) {
+            for (const c of emptyClsTokens) {
+              const prof = cssProfiles.get(c);
+              if (
+                prof &&
+                ((prof.paddingLeftEm !== undefined && prof.paddingLeftEm > 0) ||
+                  (prof.marginLeftEm !== undefined && prof.marginLeftEm > 0))
+              ) {
+                hasHorizontalSpacing = true;
+                break;
+              }
+            }
+          }
+          const emptyInlineStyle = span.getAttribute('style');
+          if (!hasHorizontalSpacing && emptyInlineStyle) {
+            const parsedInline = parseCssDeclarations(emptyInlineStyle);
             if (
-              prof &&
-              ((prof.paddingLeftEm !== undefined && prof.paddingLeftEm > 0) ||
-                (prof.marginLeftEm !== undefined && prof.marginLeftEm > 0))
+              (parsedInline.paddingLeftEm !== undefined && parsedInline.paddingLeftEm > 0) ||
+              (parsedInline.marginLeftEm !== undefined && parsedInline.marginLeftEm > 0)
             ) {
               hasHorizontalSpacing = true;
-              break;
+            }
+          }
+          if (hasHorizontalSpacing) {
+            span.replaceWith(doc.createTextNode(' '));
+          } else {
+            span.remove();
+          }
+          continue;
+        }
+
+        const mapped = resolveElementBookStyleMapping(span, bookStyleRoles);
+        const cls = span.getAttribute('class') || '';
+        const clsTokens = cls.split(/\s+/).filter(Boolean);
+
+        let ownFontStyle: 'italic' | 'normal' | undefined;
+        let ownFontWeight: 'bold' | 'normal' | undefined;
+        let ownDisplayBlock = false;
+        if (cssProfiles) {
+          for (const c of clsTokens) {
+            const prof = cssProfiles.get(c);
+            if (!prof) continue;
+            if (prof.fontStyle !== undefined) ownFontStyle = prof.fontStyle;
+            if (prof.fontWeight !== undefined) ownFontWeight = prof.fontWeight;
+            if (prof.inlineDisplayBlock !== undefined) ownDisplayBlock = prof.inlineDisplayBlock;
+          }
+        }
+        const inlineStyleAttr = span.getAttribute('style');
+        if (inlineStyleAttr) {
+          const inlineParsed = parseCssDeclarations(inlineStyleAttr);
+          if (inlineParsed.fontStyle !== undefined) ownFontStyle = inlineParsed.fontStyle;
+          if (inlineParsed.fontWeight !== undefined) ownFontWeight = inlineParsed.fontWeight;
+          if (inlineParsed.displayBlock !== undefined) ownDisplayBlock = inlineParsed.displayBlock;
+        }
+
+        const spanRoleAttr = `${span.getAttribute('role') || ''} ${span.getAttribute('epub:type') || ''}`;
+        const isBlockBreakSpan =
+          ownDisplayBlock || /\b(?:doc-subtitle|subtitle)\b/i.test(spanRoleAttr);
+
+        if (isBlockBreakSpan && span.parentNode) {
+          const hasVisibleSpanContent =
+            (span.textContent || '').replace(/[\s\u00a0]+/g, '').length > 0 ||
+            Boolean(span.querySelector('img, math'));
+          if (hasVisibleSpanContent) {
+            const isSignificantSibling = (n: ChildNode): boolean => {
+              if (n.nodeType === 3) {
+                return (n.textContent || '').replace(/[\s\u00a0]+/g, '').length > 0;
+              }
+              if (n.nodeType === 1) {
+                if (isEmptyPagebreakAnchor(n)) return false;
+                const t = ((n as Element).tagName || '').toUpperCase();
+                if (EMPTY_MARKER_VOID_TAGS.has(t)) return false;
+                return true;
+              }
+              return false;
+            };
+
+            let prevSig: ChildNode | null = span.previousSibling;
+            while (prevSig && !isSignificantSibling(prevSig)) {
+              prevSig = prevSig.previousSibling;
+            }
+            if (
+              prevSig &&
+              !(prevSig.nodeType === 1 && ((prevSig as Element).tagName || '').toUpperCase() === 'BR')
+            ) {
+              span.parentNode.insertBefore(doc.createElement('br'), span);
+            }
+
+            let nextSig: ChildNode | null = span.nextSibling;
+            while (nextSig && !isSignificantSibling(nextSig)) {
+              nextSig = nextSig.nextSibling;
+            }
+            if (
+              nextSig &&
+              !(nextSig.nodeType === 1 && ((nextSig as Element).tagName || '').toUpperCase() === 'BR')
+            ) {
+              span.parentNode.insertBefore(doc.createElement('br'), span.nextSibling);
             }
           }
         }
-        const emptyInlineStyle = span.getAttribute('style');
-        if (!hasHorizontalSpacing && emptyInlineStyle) {
-          const parsedInline = parseCssDeclarations(emptyInlineStyle);
-          if (
-            (parsedInline.paddingLeftEm !== undefined && parsedInline.paddingLeftEm > 0) ||
-            (parsedInline.marginLeftEm !== undefined && parsedInline.marginLeftEm > 0)
-          ) {
-            hasHorizontalSpacing = true;
-          }
+
+        const isDropcapOrIgnore =
+          mapped?.role === 'dropcap' ||
+          mapped?.role === 'ignore' ||
+          /(?:^|[\s_-])(?:dropcap|stickupcap|initial|firstletter)\d*(?:$|[\s_-])/i.test(cls);
+
+        if (isDropcapOrIgnore) {
+          span.replaceWith(...Array.from(span.childNodes));
+          continue;
         }
-        if (hasHorizontalSpacing) {
-          span.replaceWith(doc.createTextNode(' '));
+
+        const isCode =
+          mapped?.role === 'code' ||
+          /(?:^|[\s_-])(?:code|mono|monospace|tt)\d*(?:$|[\s_-])/i.test(cls);
+        if (isCode) {
+          const codeEl = doc.createElement('code');
+          codeEl.append(...Array.from(span.childNodes));
+          span.replaceWith(codeEl);
+          continue;
+        }
+
+        const isItalic =
+          mapped?.role === 'emphasis' ||
+          (ownFontStyle === 'italic' && mapped?.role !== 'body' && mapped?.role !== 'meta') ||
+          /(?:^|[\s_-])(?:italic|italics|emph|emphasis)\d*(?:$|[\s_-])/i.test(cls);
+        const isBold =
+          mapped?.role === 'strong' ||
+          (ownFontWeight === 'bold' && mapped?.role !== 'body' && mapped?.role !== 'meta') ||
+          /(?:^|[\s_-])(?:bold|strong)\d*(?:$|[\s_-])/i.test(cls);
+
+        if (isBold && isItalic) {
+          const bEl = doc.createElement('b');
+          const iEl = doc.createElement('i');
+          iEl.append(...Array.from(span.childNodes));
+          bEl.appendChild(iEl);
+          span.replaceWith(bEl);
+        } else if (isItalic) {
+          const iEl = doc.createElement('i');
+          iEl.append(...Array.from(span.childNodes));
+          span.replaceWith(iEl);
+        } else if (isBold) {
+          const bEl = doc.createElement('b');
+          bEl.append(...Array.from(span.childNodes));
+          span.replaceWith(bEl);
         } else {
-          span.remove();
-        }
-        continue;
-      }
-
-      const mapped = resolveElementBookStyleMapping(span, bookStyleRoles);
-      const cls = span.getAttribute('class') || '';
-      const clsTokens = cls.split(/\s+/).filter(Boolean);
-
-      let ownFontStyle: 'italic' | 'normal' | undefined;
-      let ownFontWeight: 'bold' | 'normal' | undefined;
-      if (cssProfiles) {
-        for (const c of clsTokens) {
-          const prof = cssProfiles.get(c);
-          if (!prof) continue;
-          if (prof.fontStyle !== undefined) ownFontStyle = prof.fontStyle;
-          if (prof.fontWeight !== undefined) ownFontWeight = prof.fontWeight;
+          span.replaceWith(...Array.from(span.childNodes));
         }
       }
-      const inlineStyleAttr = span.getAttribute('style');
-      if (inlineStyleAttr) {
-        const inlineParsed = parseCssDeclarations(inlineStyleAttr);
-        if (inlineParsed.fontStyle !== undefined) ownFontStyle = inlineParsed.fontStyle;
-        if (inlineParsed.fontWeight !== undefined) ownFontWeight = inlineParsed.fontWeight;
-      }
 
-      const isDropcapOrIgnore =
-        mapped?.role === 'dropcap' ||
-        mapped?.role === 'ignore' ||
-        /(?:^|[\s_-])(?:dropcap|stickupcap|initial|firstletter)\d*(?:$|[\s_-])/i.test(cls);
+      // 5.5. Universal non-canonical inline tag purification (deepest-first):
+      // Keep only canonical leaf inline tags (i, em, b, strong, sup, sub, u, small, code, br),
+      // convert cite/dfn/var -> <i>, kbd/samp -> <code>, remove empty marker tags (wbr/pagebreak),
+      // and unwrap all remaining phrasing/shell elements so raw HTML never leaks to the LLM.
+      for (const node of Array.from(targetContainer.querySelectorAll('*')).reverse()) {
+        if (!node.parentNode) continue;
+        if (node.getAttribute('data-translit-role') === 'footnote-popup') continue;
+        const tagUpper = (node.tagName || '').toUpperCase();
+        const tagLower = tagUpper.toLowerCase();
+        if (tagLower === 'svg' || node.closest('svg, math')) continue;
+        if (LEAF_INLINE_TAG_SET.has(tagLower) || tagLower === 'br') continue;
 
-      if (isDropcapOrIgnore) {
-        span.replaceWith(...Array.from(span.childNodes));
-        continue;
-      }
+        if (EMPTY_MARKER_VOID_TAGS.has(tagUpper)) {
+          node.remove();
+          continue;
+        }
 
-      const isCode =
-        mapped?.role === 'code' ||
-        /(?:^|[\s_-])(?:code|mono|monospace|tt)\d*(?:$|[\s_-])/i.test(cls);
-      if (isCode) {
-        const codeEl = doc.createElement('code');
-        codeEl.append(...Array.from(span.childNodes));
-        span.replaceWith(codeEl);
-        continue;
-      }
-
-      const isItalic =
-        mapped?.role === 'emphasis' ||
-        (ownFontStyle === 'italic' && mapped?.role !== 'body' && mapped?.role !== 'meta') ||
-        /(?:^|[\s_-])(?:italic|italics|emph|emphasis)\d*(?:$|[\s_-])/i.test(cls);
-      const isBold =
-        mapped?.role === 'strong' ||
-        (ownFontWeight === 'bold' && mapped?.role !== 'body' && mapped?.role !== 'meta') ||
-        /(?:^|[\s_-])(?:bold|strong)\d*(?:$|[\s_-])/i.test(cls);
-
-      if (isBold && isItalic) {
-        const bEl = doc.createElement('b');
-        const iEl = doc.createElement('i');
-        iEl.append(...Array.from(span.childNodes));
-        bEl.appendChild(iEl);
-        span.replaceWith(bEl);
-      } else if (isItalic) {
-        const iEl = doc.createElement('i');
-        iEl.append(...Array.from(span.childNodes));
-        span.replaceWith(iEl);
-      } else if (isBold) {
-        const bEl = doc.createElement('b');
-        bEl.append(...Array.from(span.childNodes));
-        span.replaceWith(bEl);
-      } else {
-        span.replaceWith(...Array.from(span.childNodes));
+        if (tagLower === 'cite' || tagLower === 'dfn' || tagLower === 'var') {
+          const iEl = doc.createElement('i');
+          iEl.append(...Array.from(node.childNodes));
+          node.replaceWith(iEl);
+        } else if (tagLower === 'kbd' || tagLower === 'samp') {
+          const codeEl = doc.createElement('code');
+          codeEl.append(...Array.from(node.childNodes));
+          node.replaceWith(codeEl);
+        } else if (node.childNodes.length === 0) {
+          node.remove();
+        } else {
+          node.replaceWith(...Array.from(node.childNodes));
+        }
       }
     }
 
     const slottedText = targetContainer.innerHTML
       .replace(/\r?\n/g, ' ')
       .replace(/\s+/g, ' ')
+      .replace(/\s*<br\s*\/?>\s*/gi, '<br/>')
+      .replace(/^(?:<br\/>)+|(?:<br\/>)+$/gi, '')
       .trim();
     const footnoteIds = Array.from(new Set(extractFootnoteSlots(slottedText)));
 
@@ -3155,16 +3197,13 @@ export class DomMutationEngine {
     // Stamp inline semantic roles AFTER leaf HTML writes so surviving inline spans retain roles
     this.stampInlineSemanticRoles(doc.body, bookStyleRoles);
 
-    // Serialize body innerHTML and normalize XHTML self-closing void tags
+    // Serialize body innerHTML cleanly for strict XML/EPUB3:
+    // HTML5 innerHTML serializes \u00a0 as &nbsp; (invalid without a DTD in strict XML) and strips "/>" on void tags.
     let htmlBody = doc.body.innerHTML
-      .replace(/<br\b([^>]*)>/gi, (m, attrs) =>
-        attrs.trim().endsWith('/') ? m : `<br${attrs}/>`
-      )
-      .replace(/<hr\b([^>]*)>/gi, (m, attrs) =>
-        attrs.trim().endsWith('/') ? m : `<hr${attrs}/>`
-      )
-      .replace(/<img\b([^>]*)>/gi, (m, attrs) =>
-        attrs.trim().endsWith('/') ? m : `<img${attrs}/>`
+      .replace(/&nbsp;/gi, '&#160;')
+      .replace(
+        /<(br|hr|img|col|wbr|source|track|area|base|embed|input|link|meta|param)\b((?:"[^"]*"|'[^']*'|[^>"'])*)>/gi,
+        (m, tag, attrs) => (attrs.trim().endsWith('/') ? m : `<${tag}${attrs}/>`)
       );
 
     // Append standard EPUB 3 <aside epub:type="footnote" class="footnote-popup"> nodes
