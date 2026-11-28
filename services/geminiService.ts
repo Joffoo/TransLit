@@ -312,12 +312,313 @@ export async function requestJsonFromCandidates(
   throw lastError || new Error('API request failed');
 }
 
+export interface ChatCompletionResult {
+  content: string;
+  usage?: TokenUsage;
+}
+
+class NonJsonResponseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NonJsonResponseError';
+  }
+}
+
+function extractMessageText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    let out = '';
+    for (const item of value) {
+      if (typeof item === 'string') {
+        out += item;
+      } else if (item && typeof item === 'object' && typeof (item as any).text === 'string') {
+        out += (item as any).text;
+      }
+    }
+    return out;
+  }
+  return '';
+}
+
+function mergeTokenUsage(
+  prev: TokenUsage | undefined,
+  next: TokenUsage | undefined
+): TokenUsage | undefined {
+  if (!next) return prev;
+  if (!prev) return { ...next };
+  const promptTokens = next.promptTokens || prev.promptTokens;
+  const cachedTokens = next.cachedTokens || prev.cachedTokens;
+  const completionTokens = next.completionTokens || prev.completionTokens;
+  const reasoningTokens = next.reasoningTokens || prev.reasoningTokens;
+  const totalTokens = next.totalTokens || prev.totalTokens || (promptTokens + completionTokens);
+  return {
+    promptTokens,
+    cachedTokens,
+    completionTokens,
+    reasoningTokens,
+    totalTokens,
+  };
+}
+
+function looksLikeSsePrefix(text: string): boolean {
+  return /^(?:data:|event:|:)/.test(text);
+}
+
+function createSseEventProcessor() {
+  const contentParts: string[] = [];
+  let sawDeltaContent = false;
+  let fallbackMessageContent = '';
+  let mergedUsage: TokenUsage | undefined;
+  let sawDone = false;
+  let finishReason: string | null = null;
+  let lineBuffer = '';
+  let eventDataLines: string[] = [];
+
+  const processDataPayload = (payload: string) => {
+    const trimmed = payload.trim();
+    if (!trimmed) return;
+    if (trimmed === '[DONE]') {
+      sawDone = true;
+      return;
+    }
+
+    let chunkObj: any;
+    try {
+      chunkObj = JSON.parse(trimmed);
+    } catch {
+      return;
+    }
+
+    if (chunkObj?.error) {
+      const errObj = chunkObj.error;
+      const msg =
+        errObj?.message ||
+        (typeof errObj === 'string' ? errObj : JSON.stringify(errObj));
+      const err = new Error(`API Stream Error: ${msg}`);
+      const numericStatus = Number(errObj?.code ?? errObj?.status);
+      if (Number.isInteger(numericStatus) && numericStatus >= 400 && numericStatus < 600) {
+        (err as any).status = numericStatus;
+      }
+      throw err;
+    }
+
+    mergedUsage = mergeTokenUsage(mergedUsage, extractTokenUsage(chunkObj));
+
+    const choice = Array.isArray(chunkObj?.choices) ? chunkObj.choices[0] : undefined;
+    if (choice) {
+      if (typeof choice.finish_reason === 'string' && choice.finish_reason.length > 0) {
+        finishReason = choice.finish_reason;
+      }
+      const deltaText = extractMessageText(choice?.delta?.content);
+      if (deltaText.length > 0) {
+        sawDeltaContent = true;
+        contentParts.push(deltaText);
+      } else if (!sawDeltaContent) {
+        const msgText = extractMessageText(choice?.message?.content);
+        if (msgText.length > 0) {
+          fallbackMessageContent = msgText;
+        }
+      }
+    }
+  };
+
+  const feedLine = (rawLine: string) => {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    if (line === '') {
+      if (eventDataLines.length > 0) {
+        processDataPayload(eventDataLines.join('\n'));
+        eventDataLines = [];
+      }
+      return;
+    }
+    if (line.startsWith(':')) return;
+    if (line.startsWith('data:')) {
+      eventDataLines.push(line.slice(5).replace(/^ /, ''));
+    }
+  };
+
+  const feedChunk = (text: string) => {
+    lineBuffer += text;
+    let nlIdx: number;
+    while ((nlIdx = lineBuffer.indexOf('\n')) !== -1) {
+      const line = lineBuffer.slice(0, nlIdx);
+      lineBuffer = lineBuffer.slice(nlIdx + 1);
+      feedLine(line);
+    }
+  };
+
+  const finish = (): ChatCompletionResult => {
+    if (lineBuffer.length > 0) {
+      feedLine(lineBuffer);
+      lineBuffer = '';
+    }
+    if (eventDataLines.length > 0) {
+      processDataPayload(eventDataLines.join('\n'));
+      eventDataLines = [];
+    }
+    if (!sawDone && !finishReason) {
+      throw new Error('API stream ended unexpectedly before completion');
+    }
+    return {
+      content: sawDeltaContent ? contentParts.join('') : fallbackMessageContent,
+      usage: mergedUsage,
+    };
+  };
+
+  return { feedChunk, finish };
+}
+
+export async function consumeChatCompletionResponse(
+  response: Response
+): Promise<ChatCompletionResult> {
+  const contentType = (response.headers.get('content-type') || '').toLowerCase();
+
+  const parseJsonPayload = (rawText: string): ChatCompletionResult => {
+    let data: any;
+    try {
+      data = JSON.parse(rawText);
+    } catch {
+      const snippet = rawText.trim().slice(0, 160);
+      throw new NonJsonResponseError(
+        `API returned non-JSON response (${contentType || 'unknown content-type'}): ${snippet}`
+      );
+    }
+
+    if (data?.error) {
+      const errObj = data.error;
+      const msg =
+        errObj?.message ||
+        (typeof errObj === 'string' ? errObj : JSON.stringify(errObj));
+      const err = new Error(`API Error: ${msg}`);
+      const numericStatus = Number(errObj?.code ?? errObj?.status);
+      if (Number.isInteger(numericStatus) && numericStatus >= 400 && numericStatus < 600) {
+        (err as any).status = numericStatus;
+      }
+      throw err;
+    }
+
+    return {
+      content: extractMessageText(data?.choices?.[0]?.message?.content),
+      usage: extractTokenUsage(data),
+    };
+  };
+
+  if (response.body) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let mode: 'sse' | 'json' | 'detect' = contentType.includes('text/event-stream')
+      ? 'sse'
+      : 'detect';
+    let detectBuffer = '';
+    const sse = createSseEventProcessor();
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        const piece = done ? decoder.decode() : decoder.decode(value, { stream: true });
+
+        if (mode === 'sse') {
+          if (piece) sse.feedChunk(piece);
+        } else if (mode === 'detect') {
+          detectBuffer += piece;
+          const trimmedStart = detectBuffer.trimStart();
+          if (trimmedStart.length > 0) {
+            if (looksLikeSsePrefix(trimmedStart)) {
+              mode = 'sse';
+              sse.feedChunk(detectBuffer);
+              detectBuffer = '';
+            } else if (
+              trimmedStart.startsWith('{') ||
+              trimmedStart.startsWith('[') ||
+              trimmedStart.startsWith('<') ||
+              detectBuffer.length >= 64
+            ) {
+              mode = 'json';
+            }
+          }
+        } else {
+          detectBuffer += piece;
+        }
+
+        if (done) break;
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    if (mode === 'sse') {
+      return sse.finish();
+    }
+    if (looksLikeSsePrefix(detectBuffer.trimStart())) {
+      sse.feedChunk(detectBuffer);
+      return sse.finish();
+    }
+    return parseJsonPayload(detectBuffer);
+  }
+
+  const rawText = await response.text();
+  if (contentType.includes('text/event-stream') || looksLikeSsePrefix(rawText.trimStart())) {
+    const sse = createSseEventProcessor();
+    sse.feedChunk(rawText);
+    return sse.finish();
+  }
+  return parseJsonPayload(rawText);
+}
+
+export async function requestChatCompletionFromCandidates(
+  rawBaseUrl: string,
+  init: RequestInit
+): Promise<ChatCompletionResult> {
+  const candidates = buildApiEndpointCandidates(rawBaseUrl, 'chat/completions');
+  if (candidates.length === 0) {
+    throw new Error('Base URL is required.');
+  }
+
+  let lastError: Error | null = null;
+
+  for (let i = 0; i < candidates.length; i++) {
+    const candidateUrl = candidates[i];
+    const hasNextCandidate = i < candidates.length - 1;
+    const response = await fetchViaProxyOrDirect(candidateUrl, init);
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+
+    if (!response.ok) {
+      const errText = await response.text();
+      const err = new Error(`API Error ${response.status}: ${errText}`);
+      (err as any).status = response.status;
+      const isHtmlError =
+        contentType.includes('text/html') || /^\s*<(?:!doctype|html)\b/i.test(errText);
+      const isRouteMismatchStatus =
+        response.status === 404 || response.status === 405 || response.status === 501;
+      if (hasNextCandidate && (isRouteMismatchStatus || isHtmlError)) {
+        lastError = err;
+        continue;
+      }
+      throw err;
+    }
+
+    try {
+      return await consumeChatCompletionResponse(response);
+    } catch (err: any) {
+      if (hasNextCandidate && err instanceof NonJsonResponseError) {
+        lastError = err;
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  throw lastError || new Error('API request failed');
+}
+
 export class AiService {
   // Safe chunk size to avoid context limits (approx 3000 chars)
   private CHUNK_SIZE = 3000;
   private config: AppConfig;
   private defaultFootnotePool = new FootnotePool();
   private onUsage?: (usage: TokenUsage) => void;
+  private supportsStreamOptions = true;
+  private supportsStreaming = true;
 
   constructor(config: AppConfig, onUsage?: (usage: TokenUsage) => void) {
     this.config = config;
@@ -639,47 +940,106 @@ export class AiService {
   }
 
   /**
-   * Generic OpenAI-Compatible Chat Completion
+   * Generic OpenAI-Compatible Chat Completion (SSE streaming with graceful downgrade)
    */
   private async generate(
       prompt: string, 
       systemInstruction: string, 
       temperature: number = 0.3
   ): Promise<{ translation: string; glossary?: string; usage?: TokenUsage }> {
+      const STREAM_OPTIONS_REJECT_RE =
+        /stream_options|include_usage|unrecognized.*(?:arg|param|field)|unknown.*(?:arg|param|field)|extra_forbidden|extra inputs are not permitted|additional properties/i;
+      const STREAM_REJECT_RE = /\bstream(?:ing)?\b/i;
+
       const operation = async () => {
         if (!this.config.apiKey) throw new Error("API Key is required.");
         if (!this.config.baseUrl) throw new Error("Base URL is required.");
 
-        const body = {
+        const buildInit = (useStream: boolean, useStreamOptions: boolean): RequestInit => {
+          const body: Record<string, unknown> = {
             model: this.config.modelName,
             messages: [
-                { role: "system", content: systemInstruction },
-                { role: "user", content: prompt }
+              { role: "system", content: systemInstruction },
+              { role: "user", content: prompt }
             ],
             temperature: temperature
-        };
+          };
+          if (useStream) {
+            body.stream = true;
+            if (useStreamOptions) {
+              body.stream_options = { include_usage: true };
+            }
+          }
 
-        const headers: Record<string, string> = {
+          const headers: Record<string, string> = {
             "Content-Type": "application/json",
             "Authorization": `Bearer ${this.config.apiKey}`
-        };
+          };
+          if (useStream) {
+            headers["Accept"] = "text/event-stream, application/json";
+          }
 
-        const data = await requestJsonFromCandidates(
-          this.config.baseUrl,
-          'chat/completions',
-          {
+          return {
             method: "POST",
             headers,
             body: JSON.stringify(body)
-          }
-        );
-        const content = data.choices?.[0]?.message?.content;
+          };
+        };
 
-        if (!content) {
-             throw new Error("Received empty response from API");
+        let result: ChatCompletionResult;
+        try {
+          result = await requestChatCompletionFromCandidates(
+            this.config.baseUrl,
+            buildInit(this.supportsStreaming, this.supportsStreamOptions)
+          );
+        } catch (err: any) {
+          const status = typeof err?.status === 'number' ? err.status : undefined;
+          const msg = String(err?.message || err || '');
+          const isBadParamStatus = status === 400 || status === 422;
+
+          if (
+            isBadParamStatus &&
+            this.supportsStreaming &&
+            this.supportsStreamOptions &&
+            STREAM_OPTIONS_REJECT_RE.test(msg)
+          ) {
+            try {
+              result = await requestChatCompletionFromCandidates(
+                this.config.baseUrl,
+                buildInit(true, false)
+              );
+              this.supportsStreamOptions = false;
+            } catch (err2: any) {
+              const status2 = typeof err2?.status === 'number' ? err2.status : undefined;
+              const msg2 = String(err2?.message || err2 || '');
+              if ((status2 === 400 || status2 === 422) && STREAM_REJECT_RE.test(msg2)) {
+                result = await requestChatCompletionFromCandidates(
+                  this.config.baseUrl,
+                  buildInit(false, false)
+                );
+                this.supportsStreaming = false;
+                this.supportsStreamOptions = false;
+              } else {
+                throw err2;
+              }
+            }
+          } else if (isBadParamStatus && this.supportsStreaming && STREAM_REJECT_RE.test(msg)) {
+            result = await requestChatCompletionFromCandidates(
+              this.config.baseUrl,
+              buildInit(false, false)
+            );
+            this.supportsStreaming = false;
+            this.supportsStreamOptions = false;
+          } else {
+            throw err;
+          }
         }
 
-        const usage = extractTokenUsage(data);
+        const { content, usage } = result;
+        if (!content) {
+          throw new Error("Received empty response from API");
+        }
+
         if (usage && this.onUsage) {
           this.onUsage(usage);
         }

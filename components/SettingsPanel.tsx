@@ -599,7 +599,7 @@ const SettingsPanel: React.FC<SettingsPanelProps> = ({ config, setConfig, disabl
 
           {/* Feature Toggles */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 p-3 bg-neutral-50 rounded-none border border-neutral-200 shadow-none transition-all">
-            <label className="flex items-center gap-3 p-3 rounded-none bg-white border border-neutral-200 hover:border-black shadow-none transition-all cursor-pointer group" title="初译后执行二轮审校润色（与轻量翻译互斥）">
+            <label className="flex items-center gap-3 p-3 rounded-none bg-white border border-neutral-200 hover:border-black shadow-none transition-all cursor-pointer group" title="初译后执行二轮审校润色（与Lit翻译互斥）">
                 <div className="relative flex items-center shrink-0">
                     <input 
                         type="checkbox" 
@@ -626,7 +626,7 @@ const SettingsPanel: React.FC<SettingsPanelProps> = ({ config, setConfig, disabl
                 </div>
             </label>
 
-            <label className="flex items-center gap-3 p-3 rounded-none bg-white border border-neutral-200 hover:border-black shadow-none transition-all cursor-pointer group" title="轻量化单Pass翻译提示词（与两步翻译互斥）">
+            <label className="flex items-center gap-3 p-3 rounded-none bg-white border border-neutral-200 hover:border-black shadow-none transition-all cursor-pointer group" title="Lit单Pass翻译提示词（与两步翻译互斥）">
                 <div className="relative flex items-center shrink-0">
                     <input 
                         type="checkbox" 
@@ -649,7 +649,7 @@ const SettingsPanel: React.FC<SettingsPanelProps> = ({ config, setConfig, disabl
                 </div>
                 <div className="flex items-center gap-1.5 font-bold text-xs text-black font-mono select-none">
                     <Sparkles className="w-3.5 h-3.5 shrink-0 text-black" />
-                    <span>轻量翻译</span>
+                    <span>Lit翻译</span>
                 </div>
             </label>
 

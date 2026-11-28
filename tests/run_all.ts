@@ -16,6 +16,7 @@ const TESTS = [
   'tests/verify_language_detection.ts',
   'tests/verify_math_svg.ts',
   'tests/verify_skip_and_reference.ts',
+  'tests/verify_sse_streaming.ts',
   'tests/verify_style_classifier.ts',
 ];
 

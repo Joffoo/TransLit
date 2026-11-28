@@ -125,10 +125,19 @@ function attachApiProxyMiddleware(middlewares: {
       forwardHeaders['x-api-key'] = req.headers['x-api-key'] as string;
     }
 
+    const upstreamAbort = new AbortController();
+    const onResponseClose = () => {
+      if (!res.writableEnded) {
+        upstreamAbort.abort();
+      }
+    };
+    res.on('close', onResponseClose);
+
     const baseFetchInit: RequestInit = {
       method,
       headers: forwardHeaders,
       body: method === 'POST' && body.length > 0 ? body : undefined,
+      signal: upstreamAbort.signal,
     };
 
     try {
@@ -140,20 +149,64 @@ function attachApiProxyMiddleware(middlewares: {
             ...baseFetchInit,
             dispatcher,
           } as RequestInit);
-        } catch {
+        } catch (dispatchErr) {
+          if (upstreamAbort.signal.aborted) throw dispatchErr;
           apiRes = await fetch(parsedUrl.toString(), baseFetchInit);
         }
       } else {
         apiRes = await fetch(parsedUrl.toString(), baseFetchInit);
       }
 
-      res.writeHead(apiRes.status, {
+      const upstreamContentType = apiRes.headers.get('content-type') || 'application/json';
+      const responseHeaders: Record<string, string> = {
         ...baseHeaders,
-        'content-type': apiRes.headers.get('content-type') || 'application/json',
-      });
-      const text = await apiRes.text();
-      res.end(text);
+        'content-type': upstreamContentType,
+      };
+      if (upstreamContentType.toLowerCase().includes('text/event-stream')) {
+        responseHeaders['cache-control'] = 'no-cache, no-transform';
+        responseHeaders['connection'] = 'keep-alive';
+        responseHeaders['x-accel-buffering'] = 'no';
+      }
+
+      res.writeHead(apiRes.status, responseHeaders);
+      if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders();
+      }
+
+      if (!apiRes.body) {
+        res.end();
+        return;
+      }
+
+      const reader = apiRes.body.getReader();
+      try {
+        while (true) {
+          if (res.writableEnded || res.destroyed) {
+            await reader.cancel().catch(() => {});
+            break;
+          }
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value && value.byteLength > 0) {
+            const canContinue = res.write(Buffer.from(value));
+            if (!canContinue && !res.writableEnded && !res.destroyed) {
+              await new Promise<void>((resolve) => res.once('drain', resolve));
+            }
+          }
+        }
+        if (!res.writableEnded) {
+          res.end();
+        }
+      } finally {
+        reader.releaseLock();
+      }
     } catch (err: any) {
+      if (res.headersSent) {
+        if (!res.writableEnded) {
+          res.end();
+        }
+        return;
+      }
       const causeMsg = err?.cause?.code || err?.cause?.message || '';
       const baseMsg = String(err?.message ?? err);
       const detail = causeMsg ? `${baseMsg} (${causeMsg})` : baseMsg;
@@ -164,6 +217,8 @@ function attachApiProxyMiddleware(middlewares: {
         'access-control-expose-headers': 'x-translit-proxy, x-translit-proxy-error',
       });
       res.end(JSON.stringify({ error: 'Proxy error', detail }));
+    } finally {
+      res.off('close', onResponseClose);
     }
   });
 }

@@ -149,11 +149,13 @@ export async function handleApiProxyRequest(request: Request): Promise<Response>
       redirect: 'follow',
     });
 
+    const upstreamContentType = apiRes.headers.get('content-type') || 'application/json';
     const responseHeaders = new Headers(baseHeaders);
-    responseHeaders.set(
-      'content-type',
-      apiRes.headers.get('content-type') || 'application/json'
-    );
+    responseHeaders.set('content-type', upstreamContentType);
+    if (upstreamContentType.toLowerCase().includes('text/event-stream')) {
+      responseHeaders.set('cache-control', 'no-cache, no-transform');
+      responseHeaders.set('x-accel-buffering', 'no');
+    }
 
     return new Response(apiRes.body, {
       status: apiRes.status,
